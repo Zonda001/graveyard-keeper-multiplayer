@@ -1286,6 +1286,83 @@ public static class SteamNetwork
     public const float MENU_BLOCK_DURATION = 15f;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Синхронізація ігрового часу між хостом і клієнтом.
+// День: GameSave.day (int). Час доби: EnvironmentEngine._cur_time (float).
+// Модель "максимум перемагає": приймач переймає час лише якщо віддалений
+// попереду — так стрибок дня від сну будь-кого пошириться на іншого, а звичайний
+// дрейф годинників вирівнюється до лідера.
+// ─────────────────────────────────────────────────────────────────────────────
+public static class GameTimeSync
+{
+    private static FieldInfo _saveField;     // MainGame.save
+    private static FieldInfo _dayField;      // GameSave.day
+    private static FieldInfo _curTimeField;  // EnvironmentEngine._cur_time
+    private static bool _ready;
+    private static object _envCache;
+
+    private static void EnsureReflection()
+    {
+        if (_ready) return;
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        _saveField    = AccessTools.TypeByName("MainGame")?.GetField("save", flags);
+        _dayField     = AccessTools.TypeByName("GameSave")?.GetField("day", flags);
+        _curTimeField = AccessTools.TypeByName("EnvironmentEngine")?.GetField("_cur_time", flags);
+        _ready = _saveField != null && _dayField != null && _curTimeField != null;
+    }
+
+    private static object GetSave()
+    {
+        var mgType = AccessTools.TypeByName("MainGame");
+        var me = mgType?.GetField("me", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            ?.GetValue(null);
+        return me != null ? _saveField?.GetValue(me) : null;
+    }
+
+    private static object GetEnv()
+    {
+        // EnvironmentEngine — компонент сцени; кешуємо, перешукуємо якщо знищено
+        if (_envCache != null && (_envCache as UnityEngine.Object) != null)
+            return _envCache;
+        var envType = AccessTools.TypeByName("EnvironmentEngine");
+        if (envType == null) return null;
+        var found = UnityEngine.Object.FindObjectsOfType(envType);
+        _envCache = found.Length > 0 ? found[0] : null;
+        return _envCache;
+    }
+
+    public static bool TryRead(out int day, out float curTime)
+    {
+        day = 0; curTime = 0f;
+        EnsureReflection();
+        if (!_ready) return false;
+        var save = GetSave();
+        var env  = GetEnv();
+        if (save == null || env == null) return false;
+        try
+        {
+            day     = (int)_dayField.GetValue(save);
+            curTime = (float)_curTimeField.GetValue(env);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    public static void Apply(int day, float curTime)
+    {
+        EnsureReflection();
+        if (!_ready) return;
+        var save = GetSave();
+        var env  = GetEnv();
+        try
+        {
+            if (save != null) _dayField.SetValue(save, day);
+            if (env  != null) _curTimeField.SetValue(env, curTime);
+        }
+        catch { }
+    }
+}
+
 public class SteamManager : MonoBehaviour
 {
     private ManualLogSource _logger;
@@ -1300,6 +1377,9 @@ public class SteamManager : MonoBehaviour
 
     private float _sendTimer = 0f;
     private const float SEND_INTERVAL = 0.05f; // 20 разів/сек
+
+    private float _timeSyncTimer = 0f;
+    private const float TIME_SYNC_INTERVAL = 2f; // синхронізація часу — раз на 2с
 
     // ── Кешовані reflection-об'єкти (ініціалізуються один раз) ───────────────
     // Замість того щоб кожен кадр шукати типи/методи через reflection
@@ -1660,8 +1740,8 @@ public class SteamManager : MonoBehaviour
             _cachedSendP2PPacket.Invoke(null,
                 new object[] { _cachedRemoteSteamId, data, (uint)data.Length, _cachedSendReliable, channel });
 
-            // Логуємо тільки службові пакети (не позицію і не анімацію)
-            if (data.Length > 0 && data[0] != 0x06 && data[0] != 0x07)
+            // Логуємо тільки службові пакети (не позицію, анімацію, час)
+            if (data.Length > 0 && data[0] != 0x06 && data[0] != 0x07 && data[0] != 0x08)
                 _logger.LogInfo($"[P2P] SendPacket to {targetSteamId}: type=0x{data[0]:X2} dataLen={data.Length}");
         }
         catch (System.Exception e) { _logger.LogError($"[P2P] Send помилка: {e.Message}"); }
@@ -1823,8 +1903,8 @@ public class SteamManager : MonoBehaviour
         {
             var packet = ReadPacket();
             if (packet == null || packet.Length == 0) break;
-            // Логуємо тільки службові пакети (не позицію і не анімацію)
-            if (packet[0] != 0x06 && packet[0] != 0x07)
+            // Логуємо тільки службові пакети (не позицію, анімацію, час)
+            if (packet[0] != 0x06 && packet[0] != 0x07 && packet[0] != 0x08)
                 _logger.LogInfo($"[P2P] Отримано пакет {packet.Length} байт, type={packet[0]}");
             OnPacketReceived(packet);
         }
@@ -1838,7 +1918,26 @@ public class SteamManager : MonoBehaviour
                 _sendTimer = 0f;
                 SendMyPosition();
             }
+
+            _timeSyncTimer += Time.deltaTime;
+            if (_timeSyncTimer >= TIME_SYNC_INTERVAL)
+            {
+                _timeSyncTimer = 0f;
+                SendTimeSync();
+            }
         }
+    }
+
+    // Пакет 0x08: type(1) + day(4 int) + cur_time(4 float) = 9 байт
+    private readonly byte[] _timePacket = new byte[9];
+
+    private void SendTimeSync()
+    {
+        if (!GameTimeSync.TryRead(out int day, out float curTime)) return;
+        _timePacket[0] = 0x08;
+        System.BitConverter.GetBytes(day).CopyTo(_timePacket, 1);
+        System.BitConverter.GetBytes(curTime).CopyTo(_timePacket, 5);
+        SendPacket(SteamNetwork.RemoteID, _timePacket);
     }
 
     private void PollLobbyMembers()
@@ -2002,6 +2101,25 @@ public class SteamManager : MonoBehaviour
 
             // Оновлюємо позицію і анімацію клону
             Multiplayer.Instance?.UpdateRemotePlayer(remotePos, angle, state, dirX, dirY);
+        }
+        else if (type == 0x08)
+        {
+            // ── Синхронізація ігрового часу ──────────────────────────────────
+            if (data.Length < 9) return;
+            int   remoteDay  = BitConverter.ToInt32 (data, 1);
+            float remoteTime = BitConverter.ToSingle(data, 5);
+
+            if (!GameTimeSync.TryRead(out int localDay, out float localTime)) return;
+
+            // Переймаємо час лише якщо віддалений попереду (день головніший).
+            bool remoteAhead = remoteDay > localDay
+                            || (remoteDay == localDay && remoteTime > localTime);
+            if (remoteAhead)
+            {
+                GameTimeSync.Apply(remoteDay, remoteTime);
+                if (remoteDay != localDay)
+                    _logger.LogInfo($"[TIME] Синхронізовано: день {localDay}→{remoteDay}, час {remoteTime:F2}");
+            }
         }
     }
 
