@@ -61,6 +61,12 @@ public static class UpdatePlayerPatch
 
     static bool Prefix(MonoBehaviour __instance, float delta_time)
     {
+        // Мережевий клон керується RemotePlayerController (позиція з мережі).
+        // Якщо дати грі обробити UpdatePlayer — клон почне рухатись інпутом
+        // локального гравця і копіювати його рухи. Блокуємо повністю.
+        if (__instance.gameObject.name == "RemotePlayer_Clone")
+            return false;
+
         if (MultiplayerState.Player2 == null ||
             __instance.gameObject != MultiplayerState.Player2)
             return true;
@@ -120,6 +126,33 @@ public static class SmartAnimPatch
 
         // Порівнюємо кореневий transform напряму — без GetComponentInParent
         return __instance.transform.root != _p2RootCache;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Дубль-гравець на клієнті: SaveSlotsMenuGUI.StartPlayingGame викликається двічі —
+// наш кастомний флоу завантаження сейву хоста накладається на природний флоу гри.
+// Кожен виклик спавнить окремий Player(Clone). Блокуємо всі виклики після першого
+// в межах сесії клієнта. Прапор скидається при переході в меню.
+// ─────────────────────────────────────────────────────────────────────────────
+[HarmonyPatch]
+static class StartPlayingGameGuardPatch
+{
+    internal static bool AlreadyStarted = false;
+
+    static MethodBase TargetMethod() =>
+        AccessTools.Method(AccessTools.TypeByName("SaveSlotsMenuGUI"), "StartPlayingGame");
+
+    static bool Prefix()
+    {
+        if (SteamNetwork.Role != NetworkRole.Client) return true;
+        if (AlreadyStarted)
+        {
+            Multiplayer.Log?.LogInfo("[SPAWN] Повторний StartPlayingGame заблоковано — запобігання дублю гравця ✓");
+            return false;
+        }
+        AlreadyStarted = true;
+        return true;
     }
 }
 
@@ -236,6 +269,7 @@ public class Multiplayer : BaseUnityPlugin
                 // Скидаємо guards для наступної сесії
                 SteamManager._unlockAlreadyDone = false;
                 OnGameStartedPlayingPatch.Reset();
+                StartPlayingGameGuardPatch.AlreadyStarted = false;
             }
         };
     }
@@ -432,11 +466,36 @@ public class Multiplayer : BaseUnityPlugin
         var p1Materials   = SnapshotMaterials(p1);
         var p1ChildScales = SnapshotScales(p1);
 
-        _remotePlayerGO = Instantiate(p1);
+        // Інстанціюємо клон всередині НЕАКТИВНОГО контейнера. Поки об'єкт
+        // неактивний у ієрархії, Unity не викликає Awake/OnEnable/Start.
+        // Це критично: PlayerComponent.Awake() на копії гравця змушує гру
+        // заспавнити ще одного повноцінного дубль-гравця, а WorldGameObject.Awake()
+        // реєструє клон у GameAwakenerEngine. Знімаємо ці компоненти ДО Awake.
+        var cloneHolder = new GameObject("mp_clone_holder");
+        cloneHolder.SetActive(false);
+
+        _remotePlayerGO = Instantiate(p1, cloneHolder.transform);
         _remotePlayerGO.name = "RemotePlayer_Clone";
-        _remotePlayerGO.transform.position = startPos;
+
+        int strippedComps = 0;
+        foreach (var comp in _remotePlayerGO.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (comp == null) continue;
+            var n = comp.GetType().Name;
+            if (n == "PlayerComponent" || n == "WorldGameObject" || n == "BaseCharacterComponent")
+            {
+                Object.DestroyImmediate(comp);
+                strippedComps++;
+            }
+        }
+        Logger.LogInfo($"[REMOTE] Знято {strippedComps} геймплейних компонентів до Awake ✓");
+
+        // Виймаємо з контейнера — клон стає активним, Awake спрацює тільки для
+        // решти (візуальних) компонентів. PlayerComponent уже немає → дубль не спавниться.
         _remotePlayerGO.transform.SetParent(null);
+        _remotePlayerGO.transform.position = startPos;
         _remotePlayerGO.SetActive(true);
+        Object.Destroy(cloneHolder);
 
         yield return null;
         yield return null;
@@ -761,9 +820,6 @@ public class Multiplayer : BaseUnityPlugin
             "PixelPerfect",
             "DynamicLight", "GroundLight", "LightFlicker", "RandomCoordinate",
             "ObjectDynamicShadow", "ObjectDynamicShadowChild",
-            // WorldGameObject вимикаємо щоб GameAwakenerEngine не реєстрував клон
-            // і не викликав Restore → дублікат клону при рубці/копанні
-            "WorldGameObject",
             // Вимикаємо компоненти управління гравцем — інакше гра рухає клон
             // тим самим інпутом що і локального гравця
             "PlayerComponent", "BaseCharacterComponent",
@@ -820,26 +876,10 @@ public class Multiplayer : BaseUnityPlugin
         Logger.LogInfo($"[P2] Layer: {LayerMask.LayerToName(obj.layer)}");
     }
 
-    // Версія для мережевого клону іншого гравця.
-    // _is_player = FALSE — інакше гра вважає клон локальним гравцем і рухає його.
+    // Копіює шари рендерингу на мережевий клон.
+    // WorldGameObject вже знищено в SpawnRemotePlayerCoroutine — налаштовувати нічого.
     private void SetupRemoteWorldObject(GameObject obj)
     {
-        foreach (var b in obj.GetComponents<MonoBehaviour>())
-        {
-            if (b.GetType().Name != "WorldGameObject") continue;
-            try
-            {
-                var type = b.GetType();
-                SetField(b, type, "_obj_id", "remote_player_clone");
-                SetField(b, type, "_is_player", false); // ← критично: НЕ гравець з точки зору гри
-                SetField(b, type, "_saved_position", obj.transform.position);
-            }
-            catch (System.Exception e)
-            {
-                Logger.LogWarning($"[REMOTE] WorldGameObject: {e.Message}");
-            }
-        }
-
         // Беремо шари від першого знайденого локального гравця
         var localPlayer = FindObjectsOfType<GameObject>(true)
             .FirstOrDefault(o => o.activeSelf &&
