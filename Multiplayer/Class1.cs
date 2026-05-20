@@ -1898,6 +1898,17 @@ public class SteamManager : MonoBehaviour
     {
         byte type = data[0];
 
+        // Сейв хоста завантажується рівно один раз при підключенні. Якщо клієнт
+        // уже в грі — ігноруємо повторний трансфер сейву (0x02-0x04). Інакше
+        // LoadSaveFromHost перезавантажить сцену посеред гри, і таймери гри
+        // (GJTimer/FlowCanvas) спрацюють у знищені об'єкти → FATAL NullReferenceException.
+        if ((type == 0x02 || type == 0x03 || type == 0x04) && SteamNetwork.IsInGame)
+        {
+            if (type == 0x02)
+                _logger.LogInfo("[P2P] Повторний трансфер сейву проігноровано — клієнт уже в грі ✓");
+            return;
+        }
+
         if (type == 0x01)
         {
             if (SteamNetwork.Role == NetworkRole.Host)
