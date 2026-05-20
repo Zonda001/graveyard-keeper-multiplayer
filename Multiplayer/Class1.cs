@@ -240,7 +240,6 @@ public class Multiplayer : BaseUnityPlugin
         };
     }
 
-    private MethodInfo _setControl;
     private bool _hadPlayer2 = false;
     private int _p1InstanceId = 0;
     private float _p1MissingTimer = 0f;
@@ -945,7 +944,6 @@ public class Multiplayer : BaseUnityPlugin
     {
         private Rigidbody2D _rb;
         private FieldInfo _velocityField;
-        private int _lateFrame;
         private Dictionary<string, Vector3> _p1Scales = new Dictionary<string, Vector3>();
         private Animator _animator;
         private ManualLogSource _logger;
@@ -953,7 +951,6 @@ public class Multiplayer : BaseUnityPlugin
         private Transform _p1Transform;
         private Vector3 _p1LastPos;
         private int _frameCounter;
-        private float _smoothedP1Speed = 500f;
         private float _baseScale = 80f;
         private MonoBehaviour _p1CharComp;
         private float _p1velocity_cached = 0f;
@@ -1255,7 +1252,6 @@ public class SteamManager : MonoBehaviour
     private bool _loadingInProgress = false;
     public static SteamManager Instance;
     private bool _initialized = false;
-    private bool _gameStartedWasTrue = false;
 
     private System.Type _steamMatchmaking;
     private System.Type _steamNetworking;
@@ -1279,7 +1275,6 @@ public class SteamManager : MonoBehaviour
     // Кешований локальний гравець для SendMyPosition — щоб не робити FindObjectsOfType кожні 50мс
     private GameObject  _cachedLocalPlayer;
     private Animator    _cachedLocalAnimator;
-    private RemotePlayerController _cachedRemoteCtrl;
 
     public void Init(ManualLogSource logger)
     {
@@ -2488,7 +2483,6 @@ public class SteamManager : MonoBehaviour
     }
 
     private object _lobbyCreatedCallback;
-    private object _lobbyCreatedCallResult;
 
     private void OnLobbyCreatedDispatch(object result)
     {
@@ -2618,7 +2612,6 @@ public class SteamManager : MonoBehaviour
 
         try
         {
-            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance;
             var asm = _steamMatchmaking?.Assembly;
 
             var nativeMethods = asm?.GetType("Steamworks.NativeMethods");
