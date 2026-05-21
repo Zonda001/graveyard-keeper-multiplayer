@@ -61,6 +61,12 @@ public static class UpdatePlayerPatch
 
     static bool Prefix(MonoBehaviour __instance, float delta_time)
     {
+        // Об'єкт міг бути знищений (напр. дубль-гравець під час підключення),
+        // але ще лишитись у списку CustomUpdateManager — тоді .gameObject кидає
+        // нативний краш. Unity operator bool ловить знищений стан без винятку.
+        if (__instance == null || !(bool)(UnityEngine.Object)__instance)
+            return false;
+
         // Мережевий клон керується RemotePlayerController (позиція з мережі).
         // Якщо дати грі обробити UpdatePlayer — клон почне рухатись інпутом
         // локального гравця і копіювати його рухи. Блокуємо повністю.
@@ -179,6 +185,11 @@ public class Multiplayer : BaseUnityPlugin
         Log = Logger;
         Instance = this;
 
+        // Без цього Unity зупиняє весь ігровий цикл, коли вікно гри неактивне —
+        // мод перестає слати/приймати пакети, і синк «замерзає» для гравця, що
+        // перемкнувся в інше вікно. З runInBackground цикл працює завжди.
+        Application.runInBackground = true;
+
         try
         {
             var harmony = new Harmony("com.denys.multiplayer");
@@ -270,6 +281,7 @@ public class Multiplayer : BaseUnityPlugin
                 SteamManager._unlockAlreadyDone = false;
                 OnGameStartedPlayingPatch.Reset();
                 StartPlayingGameGuardPatch.AlreadyStarted = false;
+                ChopSync.Reset();
             }
         };
     }
@@ -407,6 +419,20 @@ public class Multiplayer : BaseUnityPlugin
             Logger.LogInfo($"[STEAM] Connected={SteamNetwork.IsConnected}");
             Logger.LogInfo($"[STEAM] IsInGame={SteamNetwork.IsInGame}");
             Logger.LogInfo($"[STEAM] RemotePlayerSpawned={SteamNetwork.RemotePlayerSpawned}");
+        }
+
+        // ── Розвідка рубки дерева ────────────────────────────────────────────
+        // F6 — стати біля дерева, захопити його як ціль і дампнути всі поля.
+        //      Натиснути ще раз після кількох ударів → diff знайде поле HP.
+        // F5 — увімк/вимк трасування методів WorldGameObject для цілі;
+        //      потім рубай і дивись [RECON-TRACE] у логах — це назви методів.
+        if (Input.GetKeyDown(KeyCode.F6))
+            ChopRecon.CaptureNearestTree();
+
+        if (Input.GetKeyDown(KeyCode.F5))
+        {
+            ChopRecon.TraceEnabled = !ChopRecon.TraceEnabled;
+            Logger.LogInfo($"[RECON] Трасування методів: {(ChopRecon.TraceEnabled ? "УВІМК" : "вимк")}");
         }
     }
 
@@ -1606,11 +1632,10 @@ public class SteamManager : MonoBehaviour
 
             _logger.LogInfo($"[STEAM] LobbyChatUpdate: user={userChanged}, state={stateChange}");
 
-            ulong changedId = System.Convert.ToUInt64(
-                userChanged?.GetType()
-                    .GetField("m_SteamID",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                    ?.GetValue(userChanged) ?? 0UL);
+            // m_ulSteamIDUserChanged — це ulong, а не CSteamID. Беремо значення
+            // напряму (раніше код шукав поле m_SteamID на ulong → завжди 0,
+            // а AcceptP2PSessionWithUser падав, бо хотів CSteamID).
+            ulong changedId = userChanged != null ? System.Convert.ToUInt64(userChanged) : 0UL;
 
             uint state = System.Convert.ToUInt32(stateChange ?? 0);
             if (state == 1 && SteamNetwork.Role == NetworkRole.Host)
@@ -1618,10 +1643,16 @@ public class SteamManager : MonoBehaviour
                 SteamNetwork.RemoteID = changedId;
                 _logger.LogInfo($"[STEAM] Клієнт приєднався! RemoteID={SteamNetwork.RemoteID}");
 
-                _steamNetworking
-                    ?.GetMethod("AcceptP2PSessionWithUser", BindingFlags.Public | BindingFlags.Static)
-                    ?.Invoke(null, new[] { userChanged });
-                _logger.LogInfo("[P2P] AcceptP2PSessionWithUser для клієнта ✓");
+                var steamIdType = _steamNetworking?.Assembly.GetType("Steamworks.CSteamID");
+                var csid = steamIdType != null && changedId != 0
+                    ? System.Activator.CreateInstance(steamIdType, changedId) : null;
+                if (csid != null)
+                {
+                    _steamNetworking
+                        ?.GetMethod("AcceptP2PSessionWithUser", BindingFlags.Public | BindingFlags.Static)
+                        ?.Invoke(null, new[] { csid });
+                    _logger.LogInfo("[P2P] AcceptP2PSessionWithUser для клієнта ✓");
+                }
             }
 
             // Вихід/відключення/кік/бан іншого гравця — прибираємо застряглий клон.
@@ -1932,8 +1963,20 @@ public class SteamManager : MonoBehaviour
                 _timeSyncTimer = 0f;
                 SendTimeSync();
             }
+
+            // Дерева, зрубані поки ми були в іншій локації — пробуємо знищити,
+            // коли гравець дійде до них і вони завантажаться.
+            _chopRetryTimer += Time.deltaTime;
+            if (_chopRetryTimer >= CHOP_RETRY_INTERVAL)
+            {
+                _chopRetryTimer = 0f;
+                ChopSync.RetryPendingDestroys();
+            }
         }
     }
+
+    private float _chopRetryTimer = 0f;
+    private const float CHOP_RETRY_INTERVAL = 2f;
 
     // Пакет 0x08: type(1) + day(4 int) + cur_time(4 float) = 9 байт
     private readonly byte[] _timePacket = new byte[9];
@@ -2133,6 +2176,25 @@ public class SteamManager : MonoBehaviour
                 if (remoteDay != localDay)
                     _logger.LogInfo($"[TIME] Синхронізовано: день {localDay}→{remoteDay}, час {remoteTime:F2}");
             }
+        }
+        else if (type == 0x09)
+        {
+            // ── Синхронізація рубки дерева ────────────────────────────────────
+            if (data.Length < 13) { _logger.LogWarning($"[CHOP] 0x09 замалий: {data.Length}б"); return; }
+            float tx     = BitConverter.ToSingle(data, 1);
+            float ty     = BitConverter.ToSingle(data, 5);
+            float amount = BitConverter.ToSingle(data, 9);
+            _logger.LogInfo($"[CHOP] Віддалений удар: дерево @({tx:F1},{ty:F1}) amount={amount:F3}");
+            ChopSync.ApplyRemoteChop(tx, ty, amount);
+        }
+        else if (type == 0x0A)
+        {
+            // ── Дерево зрубане на іншій машині ────────────────────────────────
+            if (data.Length < 9) { _logger.LogWarning($"[CHOP] 0x0A замалий: {data.Length}б"); return; }
+            float tx = BitConverter.ToSingle(data, 1);
+            float ty = BitConverter.ToSingle(data, 5);
+            _logger.LogInfo($"[CHOP] Віддалене знищення дерева @({tx:F1},{ty:F1})");
+            ChopSync.ApplyRemoteDestroy(tx, ty);
         }
     }
 
@@ -3106,3 +3168,476 @@ public static class MainMenuGUIOpenPatch
 
 // MainMenuDiagPatch видалено — патчив кожен метод MainMenuGUI і писав лог
 // на кожен виклик, що додавало overhead. Більше не потрібен після стабілізації.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// РОЗВІДКА РУБКИ ДЕРЕВА (тимчасовий код — прибрати після Фази 0)
+// Мета: знайти без сирців гри (а) поле HP/ударів дерева, (б) назви методів
+// WorldGameObject, що спрацьовують при ударі та знищенні.
+// Робочий процес:
+//   1. Стань впритул до дерева, натисни F6 — у лог піде [RECON] ЗНІМОК.
+//   2. Натисни F5 (трасування УВІМК), удар по дереву — дивись [RECON-TRACE].
+//   3. Удар ще пару разів, знову F6 — порівняй два ЗНІМКИ, змінене поле = HP.
+// ─────────────────────────────────────────────────────────────────────────────
+public static class ChopRecon
+{
+    public static MonoBehaviour Tracked;
+    public static bool TraceEnabled;
+    private static FieldInfo _objIdField;
+
+    public static void CaptureNearestTree()
+    {
+        try
+        {
+            var wgoType = AccessTools.TypeByName("WorldGameObject");
+            if (wgoType == null) { Multiplayer.Log?.LogWarning("[RECON] Тип WorldGameObject не знайдено"); return; }
+
+            var playerGO = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>()
+                .FirstOrDefault(mb => mb.GetType().Name == "PlayerComponent"
+                                      && mb.gameObject.name != "RemotePlayer_Clone"
+                                      && mb.gameObject.name != "Player2_Clone")?.gameObject;
+            if (playerGO == null) { Multiplayer.Log?.LogWarning("[RECON] Локального гравця не знайдено"); return; }
+            Vector3 origin = playerGO.transform.position;
+
+            if (_objIdField == null)
+                _objIdField = wgoType.GetField("_obj_id",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            // Збираємо всі WGO з дистанцією до гравця
+            var candidates = new List<(MonoBehaviour mb, float dist, string objId, bool isTree)>();
+            foreach (var comp in UnityEngine.Object.FindObjectsOfType(wgoType))
+            {
+                var mb = comp as MonoBehaviour;
+                if (mb == null) continue;
+                string n = mb.gameObject.name;
+                if (n == "RemotePlayer_Clone" || n == "Player2_Clone" ||
+                    n == "Player(Clone)" || n == "Player") continue;
+
+                string objId = _objIdField?.GetValue(mb) as string ?? "";
+                float dist = Vector3.Distance(mb.transform.position, origin);
+                bool isTree = n.ToLower().Contains("tree") || objId.ToLower().Contains("tree");
+                candidates.Add((mb, dist, objId, isTree));
+            }
+
+            if (candidates.Count == 0) { Multiplayer.Log?.LogWarning("[RECON] WGO поблизу не знайдено"); return; }
+            candidates.Sort((a, b) => a.dist.CompareTo(b.dist));
+
+            Multiplayer.Log?.LogInfo("[RECON] 8 найближчих WGO (щоб звірити назви/obj_id):");
+            foreach (var c in candidates.Take(8))
+                Multiplayer.Log?.LogInfo($"[RECON]   {c.dist,6:F1}  {c.mb.gameObject.name}  obj_id='{c.objId}'  tree={c.isTree}");
+
+            // Ціль — найближче дерево; якщо дерев нема — просто найближчий WGO
+            var pick = candidates.FirstOrDefault(c => c.isTree);
+            if (pick.mb == null) pick = candidates[0];
+
+            Tracked = pick.mb;
+            DoActionProbePatch.Reset();
+            Multiplayer.Log?.LogInfo($"[RECON] ═══ ЦІЛЬ: {pick.mb.gameObject.name} " +
+                $"obj_id='{pick.objId}' dist={pick.dist:F1} ═══");
+            DumpState("ЗНІМОК");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] CaptureNearestTree: {e}"); }
+    }
+
+    // Дамп будь-якого об'єкта (для проби аргументів DoAction)
+    public static void DumpAny(object obj, string label)
+    {
+        if (obj == null) { Multiplayer.Log?.LogInfo($"[RECON] {label}: null"); return; }
+        string n = obj is MonoBehaviour mb ? mb.gameObject.name : obj.GetType().Name;
+        Multiplayer.Log?.LogInfo($"[RECON] ─── {label}: {n} ───");
+        DumpFields(obj, 0, "");
+    }
+
+    public static void DumpState(string label)
+    {
+        if (Tracked == null) { Multiplayer.Log?.LogWarning("[RECON] Ціль не захоплено — спершу F6"); return; }
+        Multiplayer.Log?.LogInfo($"[RECON] ─── {label}: {Tracked.gameObject.name} ───");
+
+        Multiplayer.Log?.LogInfo("[RECON] Компоненти на GameObject:");
+        foreach (var mb in Tracked.gameObject.GetComponents<MonoBehaviour>())
+            if (mb != null) Multiplayer.Log?.LogInfo($"[RECON]   - {mb.GetType().Name}");
+
+        DumpFields(Tracked, 0, "");
+    }
+
+    // Дамп полів об'єкта по ієрархії його ігрових типів (без Unity-бази).
+    private static void DumpFields(object obj, int depth, string prefix)
+    {
+        if (obj == null || depth > 1) return;
+        var seen = new HashSet<string>();
+        for (var t = obj.GetType(); t != null; t = t.BaseType)
+        {
+            if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) break;
+            if (t == typeof(object)) break;
+
+            foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic |
+                                          BindingFlags.Instance | BindingFlags.DeclaredOnly))
+            {
+                if (!seen.Add(f.Name)) continue;
+                object val;
+                try { val = f.GetValue(obj); } catch { val = "<помилка читання>"; }
+                Multiplayer.Log?.LogInfo($"[RECON]   {prefix}{f.Name} ({f.FieldType.Name}) = {Format(val)}");
+                if (depth == 0 && ShouldRecurse(f, val))
+                    DumpFields(val, depth + 1, prefix + f.Name + ".");
+            }
+        }
+    }
+
+    private static bool ShouldRecurse(FieldInfo f, object val)
+    {
+        if (val == null) return false;
+        var ft = val.GetType();
+        if (ft.IsPrimitive || ft.IsEnum || ft == typeof(string)) return false;
+        if (val is UnityEngine.Object || val is System.Collections.IEnumerable) return false;
+        string fn = f.Name.ToLower();
+        return fn == "data" || fn == "obj_data" || fn.Contains("savedata")
+            || ft.Name.IndexOf("Data", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static string Format(object val)
+    {
+        if (val == null) return "null";
+        if (val is string s) return $"\"{s}\"";
+        var t = val.GetType();
+        if (t.IsPrimitive || t.IsEnum) return val.ToString();
+        if (val is UnityEngine.Object uo) return uo == null ? "null(знищено)" : $"{uo.name} <{t.Name}>";
+        if (val is System.Collections.ICollection col) return $"<{t.Name} count={col.Count}>";
+        try { string r = val.ToString(); return r.Length > 120 ? r.Substring(0, 120) + "…" : r; }
+        catch { return $"<{t.Name}>"; }
+    }
+}
+
+// Трасує методи WorldGameObject, схожі на взаємодію/удар/знищення, але логує
+// тільки для захопленої цілі (ChopRecon.Tracked) і лише коли трасування увімкнено.
+[HarmonyPatch]
+public static class WGOChopTracePatch
+{
+    static readonly string[] Keywords =
+    {
+        "hit", "damage", "destroy", "break", "multi", "interact",
+        "action", "work", "take", "remove", "chop", "harvest", "spawn", "die",
+        "drop", "give", "loot", "resource", "kill", "death", "dead",
+        "reward", "drain", "consume", "progress",
+    };
+
+    static IEnumerable<MethodBase> TargetMethods()
+    {
+        var wgoType = AccessTools.TypeByName("WorldGameObject");
+        if (wgoType == null) yield break;
+
+        var flags = BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        foreach (var m in wgoType.GetMethods(flags))
+        {
+            if (m.IsAbstract || m.IsGenericMethodDefinition) continue;
+            if (m.GetMethodBody() == null) continue;
+            string ln = m.Name.ToLower();
+            if (ln.StartsWith("get_") || ln.StartsWith("set_")) continue;
+            if (Keywords.Any(k => ln.Contains(k)))
+                yield return m;
+        }
+    }
+
+    static void Prefix(MonoBehaviour __instance, MethodBase __originalMethod, object[] __args)
+    {
+        if (!ChopRecon.TraceEnabled || __instance == null) return;
+        if (__instance != ChopRecon.Tracked) return;
+        string args = __args != null && __args.Length > 0
+            ? string.Join(", ", __args.Select(a => a?.ToString() ?? "null"))
+            : "";
+        Multiplayer.Log?.LogInfo($"[RECON-TRACE] {__originalMethod.Name}({args})");
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// Проба DoAction(WorldGameObject player, float amount): дампить аргумент-гравця
+// до і після виклику для захопленої цілі — щоб побачити, чи DoAction мутує
+// об'єкт гравця (енергія/стан) на віддаленій машині при реплікації.
+// Один раз на ціль (скидається при F6).
+[HarmonyPatch]
+public static class DoActionProbePatch
+{
+    private static bool _done;
+    public static void Reset() => _done = false;
+
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DoAction"
+                              && m.GetParameters().Length == 2
+                              && m.GetParameters()[1].ParameterType == typeof(float));
+    }
+
+    static void Prefix(MonoBehaviour __instance, object[] __args)
+    {
+        if (_done || __instance == null || __instance != ChopRecon.Tracked) return;
+        Multiplayer.Log?.LogInfo($"[RECON-PROBE] ═══ DoAction ДО, amount={__args.ElementAtOrDefault(1)} ═══");
+        ChopRecon.DumpAny(__args.ElementAtOrDefault(0), "ГРАВЕЦЬ-АРГ ДО");
+    }
+
+    static void Postfix(MonoBehaviour __instance, object[] __args)
+    {
+        if (_done || __instance == null || __instance != ChopRecon.Tracked) return;
+        _done = true;
+        ChopRecon.DumpAny(__args.ElementAtOrDefault(0), "ГРАВЕЦЬ-АРГ ПІСЛЯ");
+        Multiplayer.Log?.LogInfo("[RECON-PROBE] ═══ DoAction готово (порівняй ДО/ПІСЛЯ) ═══");
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ФАЗА 1 — СИНХРОНІЗАЦІЯ РУБКИ ДЕРЕВА
+// Лічильник «скільки лишилось рубати» — НЕ на дереві (розвідка: поля дерева не
+// змінювались між ударами), а в роботі гравця. Тому повтор DoAction/OnWorkFinished
+// на чужій машині не може звалити дерево. Модель:
+//   0x09 — удар: повторюємо DoAction → дерево трясеться (косметика).
+//   0x0A — дерево зрубане: коли на машині рубача спрацьовує DropItems (= дерево
+//          впало й кинуло лут), транслюємо знищення; приймач прибирає своє дерево.
+// Дерево ідентифікуємо за позицією (unique_id різний на кожній машині). Лут
+// падає лише в того, хто реально рубав — приймач просто видаляє обʼєкт.
+// ═════════════════════════════════════════════════════════════════════════════
+public static class ChopSync
+{
+    // Поріг збігу позиції — трохи менше відстані між сусідніми деревами.
+    private const float POSITION_EPSILON = 2f;
+
+    // Echo guard навколо нашого власного повтору DoAction.
+    public static bool ApplyingRemoteChop;
+
+    private static Type       _wgoType;
+    private static FieldInfo  _objIdField;
+    private static FieldInfo  _isPlayerField;
+    private static MethodInfo _doActionMethod;
+    private static bool       _ready;
+
+    private static MonoBehaviour _cachedLocalPlayerWgo;
+
+    // Дерева, зрубані іншим гравцем, поки ця машина була в іншій локації —
+    // вони ще не «розбуджені» тут. Знищуємо їх, коли гравець підійде й вони
+    // завантажаться (RetryPendingDestroys).
+    private static readonly List<Vector2> _pendingDestroys = new List<Vector2>();
+
+    private static void EnsureReflection()
+    {
+        if (_ready || _wgoType != null) return;
+        _wgoType = AccessTools.TypeByName("WorldGameObject");
+        if (_wgoType == null) return;
+        var f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        _objIdField     = _wgoType.GetField("_obj_id", f);
+        _isPlayerField  = _wgoType.GetField("_is_player", f);
+        _doActionMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DoAction"
+                              && m.GetParameters().Length == 2
+                              && m.GetParameters()[1].ParameterType == typeof(float));
+        _ready = _objIdField != null && _doActionMethod != null;
+        if (!_ready)
+            Multiplayer.Log?.LogWarning("[CHOP] Рефлексію не ініціалізовано — синк рубки вимкнено");
+    }
+
+    public static void Reset() => _pendingDestroys.Clear();
+
+    private static bool IsTree(MonoBehaviour wgo)
+    {
+        EnsureReflection();
+        if (!_ready || wgo == null) return false;
+        var id = _objIdField.GetValue(wgo) as string;
+        return id != null && id.StartsWith("tree");
+    }
+
+    private static bool IsPlayerActor(MonoBehaviour actor)
+    {
+        if (actor == null) return false;
+        EnsureReflection();
+        if (_isPlayerField != null)
+        {
+            try { if ((bool)_isPlayerField.GetValue(actor)) return true; } catch { }
+        }
+        return actor.gameObject.name.StartsWith("Player");
+    }
+
+    private static bool Connected() =>
+        SteamNetwork.IsConnected && SteamNetwork.IsInGame && SteamNetwork.RemoteID != 0;
+
+    // type(1) + x(4) + y(4) + amount(4) = 13 байт (amount не використовується для 0x0A)
+    private static void SendTreePacket(byte type, float x, float y, float amount)
+    {
+        var packet = new byte[13];
+        packet[0] = type;
+        BitConverter.GetBytes(x).CopyTo(packet, 1);
+        BitConverter.GetBytes(y).CopyTo(packet, 5);
+        BitConverter.GetBytes(amount).CopyTo(packet, 9);
+        SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+    }
+
+    // ── Відправка: локальний гравець ударив дерево (з DoActionSyncPatch) ─────
+    public static void OnLocalChop(MonoBehaviour tree, MonoBehaviour actor, float amount)
+    {
+        if (ApplyingRemoteChop || !Connected()) return;
+        if (!IsTree(tree) || !IsPlayerActor(actor)) return;
+        var p = tree.transform.position;
+        SendTreePacket(0x09, p.x, p.y, amount);
+    }
+
+    // ── Відправка: дерево впало (DropItems на дереві = воно зрубане) ─────────
+    public static void OnTreeFelled(MonoBehaviour tree)
+    {
+        if (ApplyingRemoteChop || !Connected()) return;
+        if (!IsTree(tree)) return;
+        var p = tree.transform.position;
+        SendTreePacket(0x0A, p.x, p.y, 0f);
+        Multiplayer.Log?.LogInfo($"[CHOP] Дерево зрубане @({p.x:F1},{p.y:F1}) — транслюємо знищення");
+    }
+
+    // ── Прийом 0x09: повторити удар (косметика — трясіння) ──────────────────
+    public static void ApplyRemoteChop(float x, float y, float amount)
+    {
+        EnsureReflection();
+        if (!_ready) return;
+
+        var tree = FindTreeNear(x, y, out float dist);
+        if (tree == null || dist > POSITION_EPSILON)
+        {
+            Multiplayer.Log?.LogWarning($"[CHOP] Дерево @({x:F1},{y:F1}) не знайдено " +
+                $"(найближче: {(tree != null ? dist.ToString("F1") : "немає")})");
+            return;
+        }
+
+        var localPlayer = GetLocalPlayerWgo();
+        if (localPlayer == null) { Multiplayer.Log?.LogWarning("[CHOP] WGO гравця не знайдено"); return; }
+
+        ApplyingRemoteChop = true;
+        try { _doActionMethod.Invoke(tree, new object[] { localPlayer, amount }); }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] DoAction впав: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+    }
+
+    // ── Прийом 0x0A: дерево зрубане — прибираємо його тут ───────────────────
+    public static void ApplyRemoteDestroy(float x, float y)
+    {
+        EnsureReflection();
+        if (!_ready) return;
+
+        var tree = FindTreeNear(x, y, out float dist);
+        if (tree == null || dist > POSITION_EPSILON)
+        {
+            // Дерево ще не «розбуджене» — гравець у іншій локації. Запам'ятовуємо,
+            // знищимо в RetryPendingDestroys, коли він підійде й воно завантажиться.
+            var pos = new Vector2(x, y);
+            if (!_pendingDestroys.Any(p => Vector2.Distance(p, pos) < POSITION_EPSILON))
+            {
+                _pendingDestroys.Add(pos);
+                Multiplayer.Log?.LogInfo($"[CHOP] Дерево @({x:F1},{y:F1}) ще не завантажене " +
+                    $"— у чергу відкладених ({_pendingDestroys.Count})");
+            }
+            return;
+        }
+        Multiplayer.Log?.LogInfo($"[CHOP] Знищуємо дерево @({x:F1},{y:F1}) ✓");
+        UnityEngine.Object.Destroy(tree.gameObject);
+    }
+
+    // Періодично пробуємо знищити дерева з черги — коли гравець доходить до
+    // локації, дерево «прокидається» як WorldGameObject і стає знаходимим.
+    public static void RetryPendingDestroys()
+    {
+        if (_pendingDestroys.Count == 0) return;
+        EnsureReflection();
+        if (!_ready) return;
+
+        for (int i = _pendingDestroys.Count - 1; i >= 0; i--)
+        {
+            var pos = _pendingDestroys[i];
+            var tree = FindTreeNear(pos.x, pos.y, out float dist);
+            if (tree != null && dist <= POSITION_EPSILON)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] Відкладене знищення дерева @({pos.x:F1},{pos.y:F1}) ✓");
+                UnityEngine.Object.Destroy(tree.gameObject);
+                _pendingDestroys.RemoveAt(i);
+            }
+        }
+    }
+
+    // Найближче дерево до точки (x,y) серед активних WorldGameObject
+    private static MonoBehaviour FindTreeNear(float x, float y, out float bestDist)
+    {
+        bestDist = float.MaxValue;
+        EnsureReflection();
+        if (!_ready) return null;
+
+        MonoBehaviour best = null;
+        var target = new Vector2(x, y);
+        foreach (var comp in UnityEngine.Object.FindObjectsOfType(_wgoType))
+        {
+            var mb = comp as MonoBehaviour;
+            if (mb == null || !IsTree(mb)) continue;
+            var p = mb.transform.position;
+            float d = Vector2.Distance(new Vector2(p.x, p.y), target);
+            if (d < bestDist) { bestDist = d; best = mb; }
+        }
+        return best;
+    }
+
+    private static MonoBehaviour GetLocalPlayerWgo()
+    {
+        if (_cachedLocalPlayerWgo != null && _cachedLocalPlayerWgo.gameObject.activeInHierarchy)
+            return _cachedLocalPlayerWgo;
+
+        var playerGo = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>()
+            .FirstOrDefault(mb => mb.GetType().Name == "PlayerComponent"
+                                  && mb.gameObject.name != "RemotePlayer_Clone"
+                                  && mb.gameObject.name != "Player2_Clone")?.gameObject;
+        if (playerGo == null) return null;
+
+        foreach (var mb in playerGo.GetComponents<MonoBehaviour>())
+            if (mb.GetType().Name == "WorldGameObject") { _cachedLocalPlayerWgo = mb; break; }
+        return _cachedLocalPlayerWgo;
+    }
+}
+
+// Відправка: кожен DoAction по дереву від локального гравця → пакет 0x09.
+[HarmonyPatch]
+public static class DoActionSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DoAction"
+                              && m.GetParameters().Length == 2
+                              && m.GetParameters()[1].ParameterType == typeof(float));
+    }
+
+    static void Postfix(MonoBehaviour __instance, object[] __args)
+    {
+        if (__args == null || __args.Length < 2) return;
+        float amount;
+        try { amount = Convert.ToSingle(__args[1]); } catch { return; }
+        ChopSync.OnLocalChop(__instance, __args[0] as MonoBehaviour, amount);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// Відправка: DropItems на дереві = воно зрубане → транслюємо знищення (0x0A).
+// Postfix не міняє поведінку — звичайна рубка гравця лишається недоторканою.
+[HarmonyPatch]
+public static class DropItemsBroadcastPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DropItems");
+    }
+
+    static void Postfix(MonoBehaviour __instance)
+    {
+        ChopSync.OnTreeFelled(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
