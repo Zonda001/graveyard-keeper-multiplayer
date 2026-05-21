@@ -1403,49 +1403,6 @@ public class SteamManager : MonoBehaviour
         StartCoroutine(InitDelayed());
     }
 
-    private void OnLobbyCreated(object param)
-    {
-        try
-        {
-            var flags   = BindingFlags.Public | BindingFlags.Instance;
-            var eResult = param.GetType().GetField("m_eResult", flags)?.GetValue(param);
-            var lobbyId = param.GetType().GetField("m_ulSteamIDLobby", flags)?.GetValue(param);
-
-            _logger.LogInfo($"[STEAM] OnLobbyCreated! result={eResult} id={lobbyId}");
-
-            if (eResult?.ToString() == "k_EResultOK")
-            {
-                SteamNetwork.LobbyID = System.Convert.ToUInt64(lobbyId ?? 0UL);
-                SteamNetwork.Role    = NetworkRole.Host;
-                _logger.LogInfo($"[STEAM] ✓ Ти ХОСТ! LobbyID={SteamNetwork.LobbyID}");
-            }
-        }
-        catch (System.Exception e)
-        {
-            _logger.LogError($"[STEAM] OnLobbyCreated помилка: {e.Message}");
-        }
-    }
-
-    private void OnLobbyEntered(object param)
-    {
-        try
-        {
-            var flags   = BindingFlags.Public | BindingFlags.Instance;
-            var lobbyId = param.GetType().GetField("m_ulSteamIDLobby", flags)?.GetValue(param);
-
-            SteamNetwork.LobbyID = System.Convert.ToUInt64(lobbyId ?? 0UL);
-            if (SteamNetwork.Role != NetworkRole.Host)
-            {
-                SteamNetwork.Role = NetworkRole.Client;
-                _logger.LogInfo($"[STEAM] ✓ Ти КЛІЄНТ! LobbyID={SteamNetwork.LobbyID}");
-            }
-        }
-        catch (System.Exception e)
-        {
-            _logger.LogError($"[STEAM] OnLobbyEntered помилка: {e.Message}");
-        }
-    }
-
     private object _lobbyEnteredCallback;
     private object _lobbyJoinRequestedCallback;
 
@@ -2048,7 +2005,8 @@ public class SteamManager : MonoBehaviour
         {
             // ── Миттєва подія анімації — без позиції ─────────────────────────
             // Надсилається одразу при зміні global_state або direction
-            if (data.Length < 14)
+            // Формат: type(1) + angle(4) + state(4) + dirX(4) + dirY(4) = 17 байт
+            if (data.Length < 17)
             {
                 _logger.LogWarning($"[ANIM] 0x07 замалий: {data.Length}б");
                 return;
@@ -2653,31 +2611,6 @@ public class SteamManager : MonoBehaviour
 
     private object _lobbyCreatedCallback;
 
-    private void OnLobbyCreatedDispatch(object result)
-    {
-        try
-        {
-            var resultType = result.GetType();
-            var flags = BindingFlags.Public | BindingFlags.Instance;
-
-            var eResult = resultType.GetField("m_eResult", flags)?.GetValue(result);
-            var lobbyId = resultType.GetField("m_ulSteamIDLobby", flags)?.GetValue(result);
-
-            _logger.LogInfo($"[STEAM] OnLobbyCreated! result={eResult}, lobbyID={lobbyId}");
-
-            if (eResult?.ToString() == "k_EResultOK")
-            {
-                SteamNetwork.LobbyID = System.Convert.ToUInt64(lobbyId);
-                SteamNetwork.Role = NetworkRole.Host;
-                _logger.LogInfo($"[STEAM] Лобі створено! ID: {SteamNetwork.LobbyID}");
-            }
-        }
-        catch (System.Exception e)
-        {
-            _logger.LogError($"[STEAM] OnLobbyCreated помилка: {e.Message}");
-        }
-    }
-
     private void OnLobbyCreatedRaw(object param)
     {
         try
@@ -2775,52 +2708,6 @@ public class SteamManager : MonoBehaviour
         }
     }
 
-    private IEnumerator RegisterLobbyCallback()
-    {
-        yield return new WaitForSeconds(0.5f);
-
-        try
-        {
-            var asm = _steamMatchmaking?.Assembly;
-
-            var nativeMethods = asm?.GetType("Steamworks.NativeMethods");
-            var callbackBase  = asm?.GetType("Steamworks.CCallbackBase");
-
-            _logger.LogInfo($"[STEAM] NativeMethods: {(nativeMethods != null ? "✓" : "✗")}");
-            _logger.LogInfo($"[STEAM] CCallbackBase: {(callbackBase != null ? "✓" : "✗")}");
-
-            var steamApiCallResult = asm?.GetType("Steamworks.CallResult`1");
-            _logger.LogInfo($"[STEAM] CallResult: {(steamApiCallResult != null ? "✓" : "✗")}");
-
-            var callbackTypes = asm?.GetTypes()
-                .Where(t => t.Name.Contains("Callback") && !t.Name.Contains("Identity"))
-                .Select(t => t.Name)
-                .Take(10);
-            foreach (var name in callbackTypes ?? System.Linq.Enumerable.Empty<string>())
-                _logger.LogInfo($"[STEAM] Type: {name}");
-        }
-        catch (System.Exception e)
-        {
-            _logger.LogError($"[STEAM] RegisterCallback помилка: {e.Message}");
-        }
-    }
-}
-
-public static class PendingSave
-{
-    public static object Data = null;
-}
-
-[System.Serializable]
-public struct NetworkPacket
-{
-    public byte type;
-    public float x;
-    public float y;
-    public float dirAngle;
-    public int globalState;
-    public float inputH;
-    public float inputV;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2988,35 +2875,12 @@ public static class OnGameLoadedPatch
         AccessTools.TypeByName("MainGame")
             ?.GetMethod("OnGameLoaded", BindingFlags.NonPublic | BindingFlags.Instance);
 
-    static void Postfix(object __instance)
+    static void Postfix()
     {
         Multiplayer.Log?.LogInfo($"[TUT] OnGameLoaded Postfix! IsClientMode={SteamNetwork.IsClientMode}");
         if (!SteamNetwork.IsClientMode) return;
-        {
-            SteamManager.ForceSkipTutorialParams(Multiplayer.Log);
-            Multiplayer.Log?.LogInfo("[TUT] OnGameLoaded: туторіал скіпнуто ✓");
-        }
-
-        if (PendingSave.Data == null) return;
-
-        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-        var mainGameType = __instance.GetType();
-
-        mainGameType.GetField("save", flags)?.SetValue(__instance, PendingSave.Data);
-        PendingSave.Data = null;
-        Multiplayer.Log.LogInfo("[CLIENT] PendingSave ін'єктовано ✓");
-
-        var saveObj = mainGameType.GetField("save", flags)?.GetValue(__instance);
-        if (saveObj != null)
-        {
-            var mapField = saveObj.GetType()
-                .GetField("map", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            var mapObj = mapField?.GetValue(saveObj);
-            mapObj?.GetType()
-                .GetMethod("RestoreScene", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                ?.Invoke(mapObj, null);
-            Multiplayer.Log.LogInfo("[CLIENT] RestoreScene викликано ✓");
-        }
+        SteamManager.ForceSkipTutorialParams(Multiplayer.Log);
+        Multiplayer.Log?.LogInfo("[TUT] OnGameLoaded: туторіал скіпнуто ✓");
     }
 }
 
