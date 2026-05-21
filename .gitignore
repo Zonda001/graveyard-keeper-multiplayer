@@ -3,3 +3,19 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+
+# IDE / редактор
+.idea/
+*.DotSettings.user
+
+# Claude Code — локальні файли
+.claude/settings.local.json
+memory/
+
+# Логи
+*.log
+
+# Скріншоти / зображення
+*.png
+*.jpg
+*.jpeg
