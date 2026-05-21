@@ -1421,6 +1421,8 @@ public class SteamManager : MonoBehaviour
 
     private object _lobbyEnteredCallback;
     private object _lobbyJoinRequestedCallback;
+    private object _lobbyChatUpdateCallback;
+    private object _p2pSessionRequestCallback;
 
     private IEnumerator InitDelayed()
     {
@@ -1494,11 +1496,14 @@ public class SteamManager : MonoBehaviour
                         Expression.Convert(param, typeof(object)));
                     var del = Expression.Lambda(delegateType, call, param).Compile();
 
-                    var cb = cbConcrete
+                    // Колбек МАЄ зберігатись у полі — інакше GC збере об'єкт
+                    // Callback<T>, його фіналайзер відпише колбек і виходи гравця
+                    // перестануть приходити в OnLobbyChatUpdateRaw.
+                    _lobbyChatUpdateCallback = cbConcrete
                         .GetMethod("Create", BindingFlags.Public | BindingFlags.Static)
                         ?.Invoke(null, new object[] { del });
 
-                    _logger.LogInfo($"[STEAM] LobbyChatUpdate колбек: {(cb != null ? "✓" : "✗")}");
+                    _logger.LogInfo($"[STEAM] LobbyChatUpdate колбек: {(_lobbyChatUpdateCallback != null ? "✓" : "✗")}");
                 }
 
                 var p2pRequestType = asm2.GetType("Steamworks.P2PSessionRequest_t");
@@ -1518,11 +1523,11 @@ public class SteamManager : MonoBehaviour
                         Expression.Convert(param, typeof(object)));
                     var del = Expression.Lambda(delegateType, call, param).Compile();
 
-                    var cb = cbConcrete
+                    _p2pSessionRequestCallback = cbConcrete
                         .GetMethod("Create", BindingFlags.Public | BindingFlags.Static)
                         ?.Invoke(null, new object[] { del });
 
-                    _logger.LogInfo($"[STEAM] P2PSessionRequest колбек: {(cb != null ? "✓" : "✗")}");
+                    _logger.LogInfo($"[STEAM] P2PSessionRequest колбек: {(_p2pSessionRequestCallback != null ? "✓" : "✗")}");
                 }
 
                 _initialized = true;
@@ -1874,6 +1879,12 @@ public class SteamManager : MonoBehaviour
 
     private int _lastLobbyMemberCount = 0;
 
+    // Час останнього отриманого пакета. Якщо клон є, а пакети зникли надовго —
+    // інший гравець вийшов/вилетів/розрив мережі. Працює для обох ролей,
+    // на відміну від колбека LobbyChatUpdate, який у цій грі не дисpatchиться.
+    private float _lastRemotePacketTime = 0f;
+    private const float REMOTE_PACKET_TIMEOUT = 5f;
+
     void Update()
     {
         if (!_initialized) return;
@@ -1890,10 +1901,19 @@ public class SteamManager : MonoBehaviour
         {
             var packet = ReadPacket();
             if (packet == null || packet.Length == 0) break;
+            _lastRemotePacketTime = Time.time;
             // Логуємо тільки службові пакети (не позицію, анімацію, час)
             if (packet[0] != 0x06 && packet[0] != 0x07 && packet[0] != 0x08)
                 _logger.LogInfo($"[P2P] Отримано пакет {packet.Length} байт, type={packet[0]}");
             OnPacketReceived(packet);
+        }
+
+        // Клон заспавнений, але пакети від іншого гравця зникли — він вийшов
+        if (SteamNetwork.RemotePlayerSpawned &&
+            Time.time - _lastRemotePacketTime > REMOTE_PACKET_TIMEOUT)
+        {
+            _logger.LogInfo($"[STEAM] Пакети від іншого гравця зникли на {REMOTE_PACKET_TIMEOUT}с — прибираємо клон");
+            Multiplayer.Instance?.DespawnRemotePlayer();
         }
 
         // Надсилаємо свою позицію якщо з'єднані і в грі
@@ -1943,7 +1963,12 @@ public class SteamManager : MonoBehaviour
             _logger.LogInfo($"[STEAM] Членів лобі: {count}");
             _lastLobbyMemberCount = count;
 
-            if (count < 2) return;
+            if (count < 2)
+            {
+                // Клієнт вийшов із лобі — миттєво прибираємо клон (не чекаємо таймаут)
+                Multiplayer.Instance?.DespawnRemotePlayer();
+                return;
+            }
 
             var clientSteamId = _steamMatchmaking
                 ?.GetMethod("GetLobbyMemberByIndex", flags)
