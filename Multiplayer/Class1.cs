@@ -548,6 +548,22 @@ public class Multiplayer : BaseUnityPlugin
         _cachedRemoteController?.SetTargetData(pos, angle, state, dirX, dirY);
     }
 
+    // Знищує клон коли інший гравець вийшов із лобі — інакше він застрягає
+    // в світі назавжди. RemotePlayerSpawned скидається в false, тож якщо друг
+    // повернеться, наступний пакет 0x06 заспавнить клон знову.
+    public void DespawnRemotePlayer()
+    {
+        if (_remotePlayerGO != null)
+        {
+            Destroy(_remotePlayerGO);
+            Logger.LogInfo("[REMOTE] Клон видалено — інший гравець вийшов ✓");
+        }
+        _remotePlayerGO = null;
+        _cachedRemoteController = null;
+        _spawnCoroutineRunning = false;
+        SteamNetwork.RemotePlayerSpawned = false;
+    }
+
     private void ResetP2()
     {
         if (player2 != null) Destroy(player2);
@@ -1585,20 +1601,34 @@ public class SteamManager : MonoBehaviour
 
             _logger.LogInfo($"[STEAM] LobbyChatUpdate: user={userChanged}, state={stateChange}");
 
+            ulong changedId = System.Convert.ToUInt64(
+                userChanged?.GetType()
+                    .GetField("m_SteamID",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?.GetValue(userChanged) ?? 0UL);
+
             uint state = System.Convert.ToUInt32(stateChange ?? 0);
             if (state == 1 && SteamNetwork.Role == NetworkRole.Host)
             {
-                var rawId = userChanged?.GetType()
-                    .GetField("m_SteamID",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                    ?.GetValue(userChanged);
-                SteamNetwork.RemoteID = System.Convert.ToUInt64(rawId ?? 0UL);
+                SteamNetwork.RemoteID = changedId;
                 _logger.LogInfo($"[STEAM] Клієнт приєднався! RemoteID={SteamNetwork.RemoteID}");
 
                 _steamNetworking
                     ?.GetMethod("AcceptP2PSessionWithUser", BindingFlags.Public | BindingFlags.Static)
                     ?.Invoke(null, new[] { userChanged });
                 _logger.LogInfo("[P2P] AcceptP2PSessionWithUser для клієнта ✓");
+            }
+
+            // Вихід/відключення/кік/бан іншого гравця — прибираємо застряглий клон.
+            // Біти EChatMemberStateChange: Left=2, Disconnected=4, Kicked=8, Banned=16.
+            const uint leftMask = 0x0002 | 0x0004 | 0x0008 | 0x0010;
+            if ((state & leftMask) != 0 &&
+                changedId != 0 && changedId == SteamNetwork.RemoteID)
+            {
+                _logger.LogInfo($"[STEAM] Інший гравець вийшов (id={changedId}, state={state}) — прибираємо клон");
+                Multiplayer.Instance?.DespawnRemotePlayer();
+                SteamNetwork.RemoteID = 0;
+                _lastLobbyMemberCount = 0; // щоб PollLobbyMembers підхопив нового гравця
             }
         }
         catch (System.Exception e) { _logger.LogError($"[STEAM] LobbyChatUpdate помилка: {e.Message}"); }
