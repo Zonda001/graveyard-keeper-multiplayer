@@ -18,6 +18,13 @@ using Object = UnityEngine.Object;
 public static class MultiplayerState
 {
     public static GameObject Player2;
+
+    // BaseCharacterComponent (рантайм-тип PlayerComponent) split-screen дубля P2.
+    // Патчі порівнюють __instance саме з цим посиланням через ReferenceEquals —
+    // це суто керована перевірка, нативну пам'ять не чіпає, тож безпечна навіть
+    // для знищеного компонента. Звернення до .gameObject знищеного компонента
+    // (напр. гравець під час респавну) дає нативний краш — тому його уникаємо.
+    public static MonoBehaviour Player2Char;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -35,8 +42,9 @@ public static class PlayerControlPatch
 
     static bool Prefix(MonoBehaviour __instance, ref bool __result)
     {
-        if (MultiplayerState.Player2 != null &&
-            __instance.gameObject == MultiplayerState.Player2)
+        // ReferenceEquals замість __instance.gameObject — не торкаємось нативної
+        // пам'яті, тож безпечно навіть якщо компонент знищено (див. MultiplayerState).
+        if (ReferenceEquals(__instance, MultiplayerState.Player2Char))
         {
             __result = false;
             return false;
@@ -61,20 +69,15 @@ public static class UpdatePlayerPatch
 
     static bool Prefix(MonoBehaviour __instance, float delta_time)
     {
-        // Об'єкт міг бути знищений (напр. дубль-гравець під час підключення),
-        // але ще лишитись у списку CustomUpdateManager — тоді .gameObject кидає
-        // нативний краш. Unity operator bool ловить знищений стан без винятку.
-        if (__instance == null || !(bool)(UnityEngine.Object)__instance)
-            return false;
-
-        // Мережевий клон керується RemotePlayerController (позиція з мережі).
-        // Якщо дати грі обробити UpdatePlayer — клон почне рухатись інпутом
-        // локального гравця і копіювати його рухи. Блокуємо повністю.
-        if (__instance.gameObject.name == "RemotePlayer_Clone")
-            return false;
-
-        if (MultiplayerState.Player2 == null ||
-            __instance.gameObject != MultiplayerState.Player2)
+        // Патч керує лише split-screen дублем P2 (дебаг, F9). Для всіх інших,
+        // включно зі справжнім гравцем, нічого не робимо й НЕ торкаємось
+        // __instance.gameObject: під час респавну гравця компонент може бути
+        // знищений, і звернення до .gameObject дає нативний краш (підтверджено
+        // Player.log: краш на get_gameObject одразу після gd_player_respawn).
+        // ReferenceEquals — чиста керована перевірка, нативну пам'ять не чіпає.
+        // Мережевий клон сюди не потрапляє — у RemotePlayer_Clone узагалі
+        // знятий BaseCharacterComponent (стрипається при спавні клону).
+        if (!ReferenceEquals(__instance, MultiplayerState.Player2Char))
             return true;
 
         float h = 0f, v = 0f;
@@ -327,6 +330,7 @@ public class Multiplayer : BaseUnityPlugin
                 Destroy(oldP2);
                 player2 = null;
                 MultiplayerState.Player2 = null;
+                MultiplayerState.Player2Char = null;
                 Logger.LogInfo("[MP] Старий Player2_Clone знищено");
             }
 
@@ -596,6 +600,7 @@ public class Multiplayer : BaseUnityPlugin
         player2 = null;
         player = null;
         MultiplayerState.Player2 = null;
+        MultiplayerState.Player2Char = null;
         _hadPlayer2 = false;
         _p1InstanceId = 0;
 
@@ -711,6 +716,10 @@ public class Multiplayer : BaseUnityPlugin
             }
             if (charComp == null) { Logger.LogWarning("[P2] PlayerComponent не знайдено!"); return; }
             Logger.LogInfo($"[P2] charComp runtime type: {charComp.GetType().FullName}");
+
+            // Кешуємо компонент P2 — патчі UpdatePlayer/PlayerControlIsDisabled
+            // звіряють __instance із ним через ReferenceEquals.
+            MultiplayerState.Player2Char = charComp;
 
             var tr = Traverse.Create(charComp);
             tr.Field("_control_enabled").SetValue(true);
