@@ -2657,22 +2657,14 @@ public class SteamManager : MonoBehaviour
             _logger.LogWarning($"[CLIENT] Туторіал скіп: {e.Message}");
         }
 
-        try
-        {
-            var modBinary = (byte[])newSave.GetType()
-                .GetMethod("ToBinary", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                ?.Invoke(newSave, null);
-
-            if (modBinary != null)
-            {
-                System.IO.File.WriteAllBytes(savePath, modBinary);
-                _logger.LogInfo($"[CLIENT] 3.dat перезаписано ({modBinary.Length} байт) ✓");
-            }
-        }
-        catch (Exception e)
-        {
-            _logger.LogWarning($"[CLIENT] Re-serialize не вдалось: {e.Message}");
-        }
+        // НЕ серіалізуємо сейв назад у файл через рефлексію. Round-trip
+        // GameSave.FromBinary → ToBinary втрачав DLC-обʼєкти (табір біженців):
+        // сейв роздувався на ~150 КБ, а RefugeesCampEngine.Init() падав з NRE
+        // → вічна загрузка в клієнта. 3.dat лишається сирими байтами хоста
+        // (записані вище) — рівно той сейв, що завантажує хост. Правки вище
+        // лишаються на обʼєкті newSave (він іде в linked_save як запасний шлях);
+        // на випадок завантаження з файлу їх доганяє пост-завантажувальна
+        // логіка — ClientTutorialWatcher та UnlockPlayerAfterLoad.
 
         yield return null;
         yield return null;
