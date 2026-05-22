@@ -3240,16 +3240,18 @@ public static class ChopRecon
         catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] CaptureNearestTree: {e}"); }
     }
 
-    // Розвідка зрубування: дамп obj_def цілі + методи-кандидати на заміну
-    // дерева пеньком (ReplaceWithObject тощо) з сигнатурами. З F6 разом зі ЗНІМКОМ.
-    public static void DumpFellingInfo()
-    {
-        if (Tracked == null) return;
-        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+    private static bool IsFellingCandidate(string ln) =>
+        ln.Contains("replace") || ln.Contains("reborn") || ln.Contains("morph")
+        || ln.Contains("destroy") || ln.Contains("object") || ln.Contains("dead")
+        || ln.Contains("stump") || ln.Contains("anim") || ln.Contains("dying")
+        || ln.Contains("fall") || ln.Contains("play") || ln.Contains("tween");
 
-        Multiplayer.Log?.LogInfo("[RECON] ─── Методи-кандидати (replace/object/destroy/reborn/morph/dead/stump) ───");
-        var seen = new HashSet<string>();
-        for (var t = Tracked.GetType(); t != null; t = t.BaseType)
+    // Дамп методів-кандидатів (заміна/анімація/падіння) по ієрархії типу obj.
+    private static void DumpCandidateMethods(object obj, string tag,
+                                             HashSet<string> seen, BindingFlags flags)
+    {
+        Multiplayer.Log?.LogInfo($"[RECON] ─── Методи-кандидати {tag} ({obj.GetType().Name}) ───");
+        for (var t = obj.GetType(); t != null; t = t.BaseType)
         {
             if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) break;
             if (t == typeof(object)) break;
@@ -3257,15 +3259,28 @@ public static class ChopRecon
             {
                 string ln = m.Name.ToLower();
                 if (ln.StartsWith("get_") || ln.StartsWith("set_")) continue;
-                if (!(ln.Contains("replace") || ln.Contains("reborn") || ln.Contains("morph")
-                      || ln.Contains("destroy") || ln.Contains("object") || ln.Contains("dead")
-                      || ln.Contains("stump"))) continue;
+                if (!IsFellingCandidate(ln)) continue;
                 var ps = string.Join(", ", m.GetParameters()
                     .Select(p => p.ParameterType.Name + " " + p.Name));
-                if (seen.Add($"{m.Name}|{ps}"))
+                if (seen.Add($"{tag}|{m.Name}|{ps}"))
                     Multiplayer.Log?.LogInfo($"[RECON]   {t.Name}.{m.Name}({ps})");
             }
         }
+    }
+
+    // Розвідка зрубування: дамп obj_def цілі + методи-кандидати на заміну/анімацію
+    // (ReplaceWithObject, падіння тощо) з сигнатурами. З F6 разом зі ЗНІМКОМ.
+    public static void DumpFellingInfo()
+    {
+        if (Tracked == null) return;
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+        var seen = new HashSet<string>();
+        DumpCandidateMethods(Tracked, "WGO", seen, flags);
+
+        // wop (WorldObjectPart) — візуальна частина обʼєкта; анімація падіння тут.
+        var wop = Tracked.GetType().GetField("wop", flags)?.GetValue(Tracked);
+        if (wop != null) DumpCandidateMethods(wop, "wop", seen, flags);
 
         var objDef = Tracked.GetType().GetField("obj_def", flags)?.GetValue(Tracked);
         if (objDef != null)
@@ -3297,6 +3312,61 @@ public static class ChopRecon
             else Multiplayer.Log?.LogInfo("[RECON] after_hp_0 = null");
         }
         else Multiplayer.Log?.LogInfo("[RECON] obj_def = null");
+
+        DumpAnimators();
+    }
+
+    // Дамп компонентів дерева (включно з дітьми) та всіх Animator-ів зі станами,
+    // кліпами й параметрами — шукаємо анімацію падіння/смерті дерева.
+    private static void DumpAnimators()
+    {
+        if (Tracked == null) return;
+        try
+        {
+            Multiplayer.Log?.LogInfo("[RECON] ─── Компоненти (дерево + діти) ───");
+            foreach (var c in Tracked.GetComponentsInChildren<Component>(true))
+            {
+                if (c == null) continue;
+                Multiplayer.Log?.LogInfo($"[RECON]   {c.gameObject.name} : {c.GetType().Name}");
+            }
+
+            foreach (var anim in Tracked.GetComponentsInChildren<Animator>(true))
+            {
+                var rac = anim.runtimeAnimatorController;
+                Multiplayer.Log?.LogInfo($"[RECON] ─── Animator '{anim.gameObject.name}' " +
+                    $"(controller={(rac != null ? rac.name : "null")}) ───");
+                if (rac != null)
+                    foreach (var clip in rac.animationClips)
+                        Multiplayer.Log?.LogInfo($"[RECON]   кліп: {clip.name} ({clip.length:F2}с)");
+                foreach (var p in anim.parameters)
+                    Multiplayer.Log?.LogInfo($"[RECON]   параметр: {p.name} ({p.type})");
+            }
+
+            // API компонентів анімації дерева — методи й поля.
+            var flags = BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.Instance | BindingFlags.DeclaredOnly;
+            var dumped = new HashSet<string>();
+            foreach (var c in Tracked.GetComponentsInChildren<Component>(true))
+            {
+                if (c == null) continue;
+                var ct = c.GetType();
+                var tn = ct.Name;
+                if (!(tn.Contains("Tree") || tn.Contains("Fall")
+                      || tn.Contains("Disappear") || tn.Contains("Chop"))) continue;
+                if (!dumped.Add(tn)) continue;
+                Multiplayer.Log?.LogInfo($"[RECON] ─── {tn} методи+поля ───");
+                foreach (var m in ct.GetMethods(flags))
+                {
+                    if (m.Name.StartsWith("get_") || m.Name.StartsWith("set_")) continue;
+                    var ps = string.Join(", ", m.GetParameters()
+                        .Select(p => p.ParameterType.Name + " " + p.Name));
+                    Multiplayer.Log?.LogInfo($"[RECON]   метод: {m.Name}({ps}) -> {m.ReturnType.Name}");
+                }
+                foreach (var fld in ct.GetFields(flags))
+                    Multiplayer.Log?.LogInfo($"[RECON]   поле: {fld.Name} ({fld.FieldType.Name})");
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] DumpAnimators: {e.Message}"); }
     }
 
     // Дамп будь-якого об'єкта (для проби аргументів DoAction)
@@ -3378,6 +3448,7 @@ public static class WGOChopTracePatch
         "action", "work", "take", "remove", "chop", "harvest", "spawn", "die",
         "drop", "give", "loot", "resource", "kill", "death", "dead",
         "reward", "drain", "consume", "progress",
+        "anim", "dying", "fall", "play", "tween", "state",
     };
 
     static IEnumerable<MethodBase> TargetMethods()
