@@ -3472,6 +3472,11 @@ public static class ChopSync
     private static FieldInfo  _objIdField;
     private static FieldInfo  _isPlayerField;
     private static MethodInfo _doActionMethod;
+    private static FieldInfo  _objDefField;             // WorldGameObject.obj_def
+    private static FieldInfo  _variationField;          // WorldGameObject.variation
+    private static MethodInfo _replaceWithObjectMethod; // WGO.ReplaceWithObject(string,bool,int)
+    private static FieldInfo  _afterHp0Field;           // ObjectDefinition.after_hp_0
+    private static MethodInfo _afterHp0GetValue;        // ChancedStringValue.GetValue(wgo,char)
     private static bool       _ready;
 
     private static MonoBehaviour _cachedLocalPlayerWgo;
@@ -3493,6 +3498,18 @@ public static class ChopSync
             .FirstOrDefault(m => m.Name == "DoAction"
                               && m.GetParameters().Length == 2
                               && m.GetParameters()[1].ParameterType == typeof(float));
+
+        // Заміна зрубаного обʼєкта наступником (дерево → пеньок). Best-effort:
+        // якщо не зібралось — приймач відкотиться на простий Destroy.
+        _objDefField    = _wgoType.GetField("obj_def", f);
+        _variationField = _wgoType.GetField("variation", f);
+        _replaceWithObjectMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "ReplaceWithObject"
+                              && m.GetParameters().Length == 3);
+        _afterHp0Field   = AccessTools.TypeByName("ObjectDefinition")?.GetField("after_hp_0", f);
+        _afterHp0GetValue = AccessTools.TypeByName("ChancedStringValue")?.GetMethods(f)
+            .FirstOrDefault(m => m.Name == "GetValue" && m.GetParameters().Length == 2);
+
         _ready = _objIdField != null && _doActionMethod != null;
         if (!_ready)
             Multiplayer.Log?.LogWarning("[CHOP] Рефлексію не ініціалізовано — синк рубки вимкнено");
@@ -3602,8 +3619,49 @@ public static class ChopSync
             }
             return;
         }
-        Multiplayer.Log?.LogInfo($"[CHOP] Знищуємо обʼєкт @({x:F1},{y:F1}) ✓");
-        UnityEngine.Object.Destroy(target.gameObject);
+        Multiplayer.Log?.LogInfo($"[CHOP] Прибираємо зрубаний обʼєкт @({x:F1},{y:F1}) ✓");
+        FellTarget(target);
+    }
+
+    // Прибирає зрубаний обʼєкт так само, як гра: якщо в obj_def є after_hp_0
+    // (id наступника, напр. дерево → пеньок) — замінюємо через ReplaceWithObject;
+    // інакше (камінь, готовий пеньок) — просто знищуємо.
+    private static void FellTarget(MonoBehaviour target)
+    {
+        if (!TryMorphViaAfterHp0(target))
+            UnityEngine.Object.Destroy(target.gameObject);
+    }
+
+    private static bool TryMorphViaAfterHp0(MonoBehaviour wgo)
+    {
+        if (_objDefField == null || _replaceWithObjectMethod == null
+            || _afterHp0Field == null || _afterHp0GetValue == null)
+            return false;
+        try
+        {
+            var objDef   = _objDefField.GetValue(wgo);
+            var afterHp0 = objDef != null ? _afterHp0Field.GetValue(objDef) : null;
+            if (afterHp0 == null) return false;
+            var nextId = _afterHp0GetValue.Invoke(afterHp0, new object[] { wgo, null }) as string;
+            if (string.IsNullOrEmpty(nextId)) return false;   // нема наступника → хай знищиться
+
+            int variation = 0;
+            if (_variationField != null)
+                try { variation = Convert.ToInt32(_variationField.GetValue(wgo)); } catch { }
+
+            // ApplyingRemoteChop глушить echo, якщо ReplaceWithObject смикне патчений метод.
+            ApplyingRemoteChop = true;
+            try { _replaceWithObjectMethod.Invoke(wgo, new object[] { nextId, true, variation }); }
+            finally { ApplyingRemoteChop = false; }
+
+            Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт → '{nextId}' (пеньок/наступник) ✓");
+            return true;
+        }
+        catch (Exception e)
+        {
+            Multiplayer.Log?.LogWarning($"[CHOP] ReplaceWithObject не вдалось: {e.Message} — знищуємо обʼєкт");
+            return false;
+        }
     }
 
     // Періодично пробуємо знищити обʼєкти з черги — коли гравець доходить до
@@ -3620,8 +3678,8 @@ public static class ChopSync
             var target = FindTargetNear(pos.x, pos.y, out float dist);
             if (target != null && dist <= POSITION_EPSILON)
             {
-                Multiplayer.Log?.LogInfo($"[CHOP] Відкладене знищення обʼєкта @({pos.x:F1},{pos.y:F1}) ✓");
-                UnityEngine.Object.Destroy(target.gameObject);
+                Multiplayer.Log?.LogInfo($"[CHOP] Відкладене прибирання обʼєкта @({pos.x:F1},{pos.y:F1}) ✓");
+                FellTarget(target);
                 _pendingDestroys.RemoveAt(i);
             }
         }
