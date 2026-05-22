@@ -3235,8 +3235,68 @@ public static class ChopRecon
             Multiplayer.Log?.LogInfo($"[RECON] ═══ ЦІЛЬ: {pick.mb.gameObject.name} " +
                 $"obj_id='{pick.objId}' dist={pick.dist:F1} ═══");
             DumpState("ЗНІМОК");
+            DumpFellingInfo();
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] CaptureNearestTree: {e}"); }
+    }
+
+    // Розвідка зрубування: дамп obj_def цілі + методи-кандидати на заміну
+    // дерева пеньком (ReplaceWithObject тощо) з сигнатурами. З F6 разом зі ЗНІМКОМ.
+    public static void DumpFellingInfo()
+    {
+        if (Tracked == null) return;
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+        Multiplayer.Log?.LogInfo("[RECON] ─── Методи-кандидати (replace/object/destroy/reborn/morph/dead/stump) ───");
+        var seen = new HashSet<string>();
+        for (var t = Tracked.GetType(); t != null; t = t.BaseType)
+        {
+            if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) break;
+            if (t == typeof(object)) break;
+            foreach (var m in t.GetMethods(flags | BindingFlags.DeclaredOnly))
+            {
+                string ln = m.Name.ToLower();
+                if (ln.StartsWith("get_") || ln.StartsWith("set_")) continue;
+                if (!(ln.Contains("replace") || ln.Contains("reborn") || ln.Contains("morph")
+                      || ln.Contains("destroy") || ln.Contains("object") || ln.Contains("dead")
+                      || ln.Contains("stump"))) continue;
+                var ps = string.Join(", ", m.GetParameters()
+                    .Select(p => p.ParameterType.Name + " " + p.Name));
+                if (seen.Add($"{m.Name}|{ps}"))
+                    Multiplayer.Log?.LogInfo($"[RECON]   {t.Name}.{m.Name}({ps})");
+            }
+        }
+
+        var objDef = Tracked.GetType().GetField("obj_def", flags)?.GetValue(Tracked);
+        if (objDef != null)
+        {
+            Multiplayer.Log?.LogInfo($"[RECON] ─── obj_def ({objDef.GetType().Name}) поля ───");
+            DumpFields(objDef, 1, "obj_def.");
+
+            // after_hp_0 — на що обʼєкт перетворюється після зрубування (id пенька).
+            var ahp = objDef.GetType()
+                .GetField("after_hp_0", flags)?.GetValue(objDef);
+            if (ahp != null)
+            {
+                Multiplayer.Log?.LogInfo($"[RECON] ─── after_hp_0 ({ahp.GetType().Name}) поля+методи ───");
+                DumpFields(ahp, 1, "after_hp_0.");
+                foreach (var m in ahp.GetType()
+                    .GetMethods(flags | BindingFlags.DeclaredOnly))
+                {
+                    if (m.Name.StartsWith("get_") || m.Name.StartsWith("set_")) continue;
+                    var ps = string.Join(", ", m.GetParameters()
+                        .Select(p => p.ParameterType.Name + " " + p.Name));
+                    Multiplayer.Log?.LogInfo($"[RECON]   метод: {m.Name}({ps}) -> {m.ReturnType.Name}");
+                }
+                try
+                {
+                    Multiplayer.Log?.LogInfo($"[RECON]   after_hp_0.ToString() = \"{ahp}\"");
+                }
+                catch { }
+            }
+            else Multiplayer.Log?.LogInfo("[RECON] after_hp_0 = null");
+        }
+        else Multiplayer.Log?.LogInfo("[RECON] obj_def = null");
     }
 
     // Дамп будь-якого об'єкта (для проби аргументів DoAction)
