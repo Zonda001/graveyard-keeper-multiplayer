@@ -3440,12 +3440,18 @@ public static class ChopSync
 
     public static void Reset() => _pendingDestroys.Clear();
 
-    private static bool IsTree(MonoBehaviour wgo)
+    // Обʼєкти, рубку/розбивання яких синхронізуємо: дерева (tree*) і наземні
+    // камені (stone_N). Обидва після обробки зникають. ЖИЛИ В ШАХТАХ виключаємо
+    // — вони не зникають, їх руйнувати не можна. Розвідка показала жили
+    // stone_ore (камінна) і steep_coal (вугільна) — фільтруємо за ore/coal.
+    private static bool IsSyncTarget(MonoBehaviour wgo)
     {
         EnsureReflection();
         if (!_ready || wgo == null) return false;
         var id = _objIdField.GetValue(wgo) as string;
-        return id != null && id.StartsWith("tree");
+        if (id == null) return false;
+        if (id.Contains("ore") || id.Contains("coal")) return false;   // жили шахт
+        return id.StartsWith("tree") || id.StartsWith("stone");
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
@@ -3473,23 +3479,24 @@ public static class ChopSync
         SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
     }
 
-    // ── Відправка: локальний гравець ударив дерево (з DoActionSyncPatch) ─────
-    public static void OnLocalChop(MonoBehaviour tree, MonoBehaviour actor, float amount)
+    // ── Відправка: локальний гравець ударив дерево/камінь (з DoActionSyncPatch) ─
+    public static void OnLocalChop(MonoBehaviour wgo, MonoBehaviour actor, float amount)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsTree(tree) || !IsPlayerActor(actor)) return;
-        var p = tree.transform.position;
+        if (!IsSyncTarget(wgo) || !IsPlayerActor(actor)) return;
+        var p = wgo.transform.position;
         SendTreePacket(0x09, p.x, p.y, amount);
     }
 
-    // ── Відправка: дерево впало (DropItems на дереві = воно зрубане) ─────────
-    public static void OnTreeFelled(MonoBehaviour tree)
+    // ── Відправка: обʼєкт зрубано/розбито (DropItems = він відпрацьований) ───
+    // Фільтр IsSyncTarget пускає лише дерева й камені — жила в шахті не сюди.
+    public static void OnTreeFelled(MonoBehaviour wgo)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsTree(tree)) return;
-        var p = tree.transform.position;
+        if (!IsSyncTarget(wgo)) return;
+        var p = wgo.transform.position;
         SendTreePacket(0x0A, p.x, p.y, 0f);
-        Multiplayer.Log?.LogInfo($"[CHOP] Дерево зрубане @({p.x:F1},{p.y:F1}) — транслюємо знищення");
+        Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт зрубано/розбито @({p.x:F1},{p.y:F1}) — транслюємо знищення");
     }
 
     // ── Прийом 0x09: повторити удар (косметика — трясіння) ──────────────────
@@ -3498,11 +3505,11 @@ public static class ChopSync
         EnsureReflection();
         if (!_ready) return;
 
-        var tree = FindTreeNear(x, y, out float dist);
-        if (tree == null || dist > POSITION_EPSILON)
+        var target = FindTargetNear(x, y, out float dist);
+        if (target == null || dist > POSITION_EPSILON)
         {
-            Multiplayer.Log?.LogWarning($"[CHOP] Дерево @({x:F1},{y:F1}) не знайдено " +
-                $"(найближче: {(tree != null ? dist.ToString("F1") : "немає")})");
+            Multiplayer.Log?.LogWarning($"[CHOP] Обʼєкт @({x:F1},{y:F1}) не знайдено " +
+                $"(найближче: {(target != null ? dist.ToString("F1") : "немає")})");
             return;
         }
 
@@ -3510,37 +3517,37 @@ public static class ChopSync
         if (localPlayer == null) { Multiplayer.Log?.LogWarning("[CHOP] WGO гравця не знайдено"); return; }
 
         ApplyingRemoteChop = true;
-        try { _doActionMethod.Invoke(tree, new object[] { localPlayer, amount }); }
+        try { _doActionMethod.Invoke(target, new object[] { localPlayer, amount }); }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] DoAction впав: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
     }
 
-    // ── Прийом 0x0A: дерево зрубане — прибираємо його тут ───────────────────
+    // ── Прийом 0x0A: обʼєкт зрубано/розбито — прибираємо його тут ────────────
     public static void ApplyRemoteDestroy(float x, float y)
     {
         EnsureReflection();
         if (!_ready) return;
 
-        var tree = FindTreeNear(x, y, out float dist);
-        if (tree == null || dist > POSITION_EPSILON)
+        var target = FindTargetNear(x, y, out float dist);
+        if (target == null || dist > POSITION_EPSILON)
         {
-            // Дерево ще не «розбуджене» — гравець у іншій локації. Запам'ятовуємо,
+            // Обʼєкт ще не «розбуджений» — гравець у іншій локації. Запамʼятовуємо,
             // знищимо в RetryPendingDestroys, коли він підійде й воно завантажиться.
             var pos = new Vector2(x, y);
             if (!_pendingDestroys.Any(p => Vector2.Distance(p, pos) < POSITION_EPSILON))
             {
                 _pendingDestroys.Add(pos);
-                Multiplayer.Log?.LogInfo($"[CHOP] Дерево @({x:F1},{y:F1}) ще не завантажене " +
+                Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт @({x:F1},{y:F1}) ще не завантажений " +
                     $"— у чергу відкладених ({_pendingDestroys.Count})");
             }
             return;
         }
-        Multiplayer.Log?.LogInfo($"[CHOP] Знищуємо дерево @({x:F1},{y:F1}) ✓");
-        UnityEngine.Object.Destroy(tree.gameObject);
+        Multiplayer.Log?.LogInfo($"[CHOP] Знищуємо обʼєкт @({x:F1},{y:F1}) ✓");
+        UnityEngine.Object.Destroy(target.gameObject);
     }
 
-    // Періодично пробуємо знищити дерева з черги — коли гравець доходить до
-    // локації, дерево «прокидається» як WorldGameObject і стає знаходимим.
+    // Періодично пробуємо знищити обʼєкти з черги — коли гравець доходить до
+    // локації, обʼєкт «прокидається» як WorldGameObject і стає знаходимим.
     public static void RetryPendingDestroys()
     {
         if (_pendingDestroys.Count == 0) return;
@@ -3550,18 +3557,18 @@ public static class ChopSync
         for (int i = _pendingDestroys.Count - 1; i >= 0; i--)
         {
             var pos = _pendingDestroys[i];
-            var tree = FindTreeNear(pos.x, pos.y, out float dist);
-            if (tree != null && dist <= POSITION_EPSILON)
+            var target = FindTargetNear(pos.x, pos.y, out float dist);
+            if (target != null && dist <= POSITION_EPSILON)
             {
-                Multiplayer.Log?.LogInfo($"[CHOP] Відкладене знищення дерева @({pos.x:F1},{pos.y:F1}) ✓");
-                UnityEngine.Object.Destroy(tree.gameObject);
+                Multiplayer.Log?.LogInfo($"[CHOP] Відкладене знищення обʼєкта @({pos.x:F1},{pos.y:F1}) ✓");
+                UnityEngine.Object.Destroy(target.gameObject);
                 _pendingDestroys.RemoveAt(i);
             }
         }
     }
 
-    // Найближче дерево до точки (x,y) серед активних WorldGameObject
-    private static MonoBehaviour FindTreeNear(float x, float y, out float bestDist)
+    // Найближчий синхро-обʼєкт (дерево/камінь) до точки (x,y) серед активних WGO
+    private static MonoBehaviour FindTargetNear(float x, float y, out float bestDist)
     {
         bestDist = float.MaxValue;
         EnsureReflection();
@@ -3572,7 +3579,7 @@ public static class ChopSync
         foreach (var comp in UnityEngine.Object.FindObjectsOfType(_wgoType))
         {
             var mb = comp as MonoBehaviour;
-            if (mb == null || !IsTree(mb)) continue;
+            if (mb == null || !IsSyncTarget(mb)) continue;
             var p = mb.transform.position;
             float d = Vector2.Distance(new Vector2(p.x, p.y), target);
             if (d < bestDist) { bestDist = d; best = mb; }
