@@ -3548,6 +3548,9 @@ public static class ChopSync
     private static MethodInfo _replaceWithObjectMethod; // WGO.ReplaceWithObject(string,bool,int)
     private static FieldInfo  _afterHp0Field;           // ObjectDefinition.after_hp_0
     private static MethodInfo _afterHp0GetValue;        // ChancedStringValue.GetValue(wgo,char)
+    private static Type       _treeDisappearType;       // TreeDisappearAnimation (компонент дерева)
+    private static MethodInfo _startAnimationMethod;    // TreeDisappearAnimation.StartAnimation(VoidDelegate)
+    private static Type       _voidDelegateType;        // VoidDelegate (делегат void())
     private static bool       _ready;
 
     private static MonoBehaviour _cachedLocalPlayerWgo;
@@ -3580,6 +3583,12 @@ public static class ChopSync
         _afterHp0Field   = AccessTools.TypeByName("ObjectDefinition")?.GetField("after_hp_0", f);
         _afterHp0GetValue = AccessTools.TypeByName("ChancedStringValue")?.GetMethods(f)
             .FirstOrDefault(m => m.Name == "GetValue" && m.GetParameters().Length == 2);
+
+        // Анімація падіння дерева — компонент TreeDisappearAnimation на дереві.
+        _treeDisappearType = AccessTools.TypeByName("TreeDisappearAnimation");
+        _startAnimationMethod = _treeDisappearType?.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "StartAnimation" && m.GetParameters().Length == 1);
+        _voidDelegateType = AccessTools.TypeByName("VoidDelegate");
 
         _ready = _objIdField != null && _doActionMethod != null;
         if (!_ready)
@@ -3694,45 +3703,97 @@ public static class ChopSync
         FellTarget(target);
     }
 
-    // Прибирає зрубаний обʼєкт так само, як гра: якщо в obj_def є after_hp_0
-    // (id наступника, напр. дерево → пеньок) — замінюємо через ReplaceWithObject;
-    // інакше (камінь, готовий пеньок) — просто знищуємо.
+    // Прибирає зрубаний обʼєкт так само, як гра. Для дерева: спершу програємо
+    // анімацію падіння (TreeDisappearAnimation.StartAnimation), а пеньок ставимо
+    // у колбеку її завершення. Для каменю / готового пенька — одразу.
     private static void FellTarget(MonoBehaviour target)
     {
-        if (!TryMorphViaAfterHp0(target))
-            UnityEngine.Object.Destroy(target.gameObject);
+        string nextId    = ResolveAfterHp0(target);   // дерево → "tree_X_stump"; камінь → ""
+        int    variation = ReadVariation(target);
+
+        if (TryPlayFallAnimation(target, nextId, variation)) return;
+        FinishFell(target, nextId, variation);
     }
 
-    private static bool TryMorphViaAfterHp0(MonoBehaviour wgo)
+    // Зчитує obj_def.after_hp_0 — id обʼєкта-наступника. null/порожнє = наступника нема.
+    private static string ResolveAfterHp0(MonoBehaviour wgo)
     {
-        if (_objDefField == null || _replaceWithObjectMethod == null
-            || _afterHp0Field == null || _afterHp0GetValue == null)
-            return false;
+        if (_objDefField == null || _afterHp0Field == null || _afterHp0GetValue == null)
+            return null;
         try
         {
             var objDef   = _objDefField.GetValue(wgo);
             var afterHp0 = objDef != null ? _afterHp0Field.GetValue(objDef) : null;
-            if (afterHp0 == null) return false;
-            var nextId = _afterHp0GetValue.Invoke(afterHp0, new object[] { wgo, null }) as string;
-            if (string.IsNullOrEmpty(nextId)) return false;   // нема наступника → хай знищиться
+            if (afterHp0 == null) return null;
+            return _afterHp0GetValue.Invoke(afterHp0, new object[] { wgo, null }) as string;
+        }
+        catch { return null; }
+    }
 
-            int variation = 0;
-            if (_variationField != null)
-                try { variation = Convert.ToInt32(_variationField.GetValue(wgo)); } catch { }
+    private static int ReadVariation(MonoBehaviour wgo)
+    {
+        if (_variationField == null) return 0;
+        try { return Convert.ToInt32(_variationField.GetValue(wgo)); }
+        catch { return 0; }
+    }
 
-            // ApplyingRemoteChop глушить echo, якщо ReplaceWithObject смикне патчений метод.
-            ApplyingRemoteChop = true;
-            try { _replaceWithObjectMethod.Invoke(wgo, new object[] { nextId, true, variation }); }
-            finally { ApplyingRemoteChop = false; }
+    // Дерево: запускаємо анімацію падіння; коли вона завершиться — колбек
+    // FinishFell поставить пеньок. true = анімація стартувала (FellTarget виходить).
+    private static bool TryPlayFallAnimation(MonoBehaviour wgo, string nextId, int variation)
+    {
+        if (_treeDisappearType == null || _startAnimationMethod == null
+            || _voidDelegateType == null)
+            return false;
+        try
+        {
+            // Каменю/пенька цього компонента нема — тоді не дерево, анімації не буде.
+            var anim = wgo.GetComponentInChildren(_treeDisappearType, true);
+            if (anim == null) return false;
 
-            Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт → '{nextId}' (пеньок/наступник) ✓");
+            var completion = new FellCompletion { Wgo = wgo, NextId = nextId, Variation = variation };
+            var onDone = Delegate.CreateDelegate(_voidDelegateType, completion,
+                typeof(FellCompletion).GetMethod(nameof(FellCompletion.OnFallDone)));
+            _startAnimationMethod.Invoke(anim, new object[] { onDone });
+            Multiplayer.Log?.LogInfo($"[CHOP] Анімація падіння дерева запущена → потім '{nextId}'");
             return true;
         }
         catch (Exception e)
         {
-            Multiplayer.Log?.LogWarning($"[CHOP] ReplaceWithObject не вдалось: {e.Message} — знищуємо обʼєкт");
+            Multiplayer.Log?.LogWarning($"[CHOP] Анімація падіння не вдалась: {e.Message}");
             return false;
         }
+    }
+
+    // Фінал зрубування: пеньок через ReplaceWithObject; нема наступника → Destroy.
+    private static void FinishFell(MonoBehaviour wgo, string nextId, int variation)
+    {
+        if (wgo == null) return;
+        try
+        {
+            if (!string.IsNullOrEmpty(nextId) && _replaceWithObjectMethod != null)
+            {
+                // ApplyingRemoteChop глушить echo, якщо ReplaceWithObject смикне патч.
+                ApplyingRemoteChop = true;
+                try { _replaceWithObjectMethod.Invoke(wgo, new object[] { nextId, true, variation }); }
+                finally { ApplyingRemoteChop = false; }
+                Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт → '{nextId}' (пеньок) ✓");
+            }
+            else
+            {
+                UnityEngine.Object.Destroy(wgo.gameObject);
+                Multiplayer.Log?.LogInfo("[CHOP] Обʼєкт знищено ✓");
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] FinishFell: {e.Message}"); }
+    }
+
+    // Контекст для VoidDelegate-колбека завершення анімації падіння дерева.
+    private class FellCompletion
+    {
+        public MonoBehaviour Wgo;
+        public string        NextId;
+        public int           Variation;
+        public void OnFallDone() => FinishFell(Wgo, NextId, Variation);
     }
 
     // Періодично пробуємо знищити обʼєкти з черги — коли гравець доходить до
