@@ -3236,15 +3236,105 @@ public static class ChopRecon
                 $"obj_id='{pick.objId}' dist={pick.dist:F1} ═══");
             DumpState("ЗНІМОК");
             DumpFellingInfo();
+            DumpNearestGroundItem();
+            DumpEverythingNearby();
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] CaptureNearestTree: {e}"); }
+    }
+
+    // Дамп УСІХ GameObject біля гравця (будь-який тип) з їхніми компонентами —
+    // щоб знайти обʼєкти, що не є WorldGameObject (напр. колода). З F6.
+    public static void DumpEverythingNearby()
+    {
+        try
+        {
+            var playerGO = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>()
+                .FirstOrDefault(mb => mb.GetType().Name == "PlayerComponent"
+                                      && mb.gameObject.name != "RemotePlayer_Clone"
+                                      && mb.gameObject.name != "Player2_Clone")?.gameObject;
+            if (playerGO == null) return;
+            Vector3 origin = playerGO.transform.position;
+
+            var hits = new List<KeyValuePair<float, GameObject>>();
+            foreach (var go in UnityEngine.Object.FindObjectsOfType<GameObject>())
+            {
+                float d = Vector3.Distance(go.transform.position, origin);
+                if (d <= 250f) hits.Add(new KeyValuePair<float, GameObject>(d, go));
+            }
+            hits.Sort((a, b) => a.Key.CompareTo(b.Key));
+
+            Multiplayer.Log?.LogInfo($"[RECON] ─── Усі GameObject в радіусі 250 ({hits.Count}), топ-30 ───");
+            foreach (var h in hits.Take(30))
+            {
+                var comps = string.Join(", ", h.Value.GetComponents<Component>()
+                    .Where(c => c != null).Select(c => c.GetType().Name));
+                Multiplayer.Log?.LogInfo($"[RECON]   {h.Key,6:F1}  '{h.Value.name}'  [{comps}]");
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] DumpEverythingNearby: {e}"); }
+    }
+
+    // Розвідка впалого луту: знаходить найближчий ItemOnGround і дампить його
+    // компоненти, поля й методи (синк дропу/підбирання). З F6.
+    public static void DumpNearestGroundItem()
+    {
+        try
+        {
+            var t = AccessTools.TypeByName("DropResGameObject");
+            if (t == null) { Multiplayer.Log?.LogInfo("[RECON] тип DropResGameObject не знайдено"); return; }
+
+            var playerGO = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>()
+                .FirstOrDefault(mb => mb.GetType().Name == "PlayerComponent"
+                                      && mb.gameObject.name != "RemotePlayer_Clone"
+                                      && mb.gameObject.name != "Player2_Clone")?.gameObject;
+            if (playerGO == null) return;
+            Vector3 origin = playerGO.transform.position;
+
+            MonoBehaviour nearest = null; float best = float.MaxValue;
+            foreach (var c in UnityEngine.Object.FindObjectsOfType(t))
+            {
+                var mb = c as MonoBehaviour;
+                if (mb == null) continue;
+                float d = Vector3.Distance(mb.transform.position, origin);
+                if (d < best) { best = d; nearest = mb; }
+            }
+            if (nearest == null)
+            {
+                Multiplayer.Log?.LogInfo("[RECON] DropResGameObject поблизу нема — спершу зруби дерево");
+                return;
+            }
+
+            Multiplayer.Log?.LogInfo($"[RECON] ═══ DropResGameObject '{nearest.gameObject.name}' @ {best:F1} ═══");
+            Multiplayer.Log?.LogInfo("[RECON] Компоненти:");
+            foreach (var comp in nearest.gameObject.GetComponents<Component>())
+                if (comp != null) Multiplayer.Log?.LogInfo($"[RECON]   - {comp.GetType().Name}");
+
+            DumpFields(nearest, 0, "");
+
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            Multiplayer.Log?.LogInfo("[RECON] Методи:");
+            for (var ty = nearest.GetType(); ty != null; ty = ty.BaseType)
+            {
+                if (ty.Namespace != null && ty.Namespace.StartsWith("UnityEngine")) break;
+                if (ty == typeof(object)) break;
+                foreach (var m in ty.GetMethods(flags | BindingFlags.DeclaredOnly))
+                {
+                    if (m.Name.StartsWith("get_") || m.Name.StartsWith("set_")) continue;
+                    var ps = string.Join(", ", m.GetParameters()
+                        .Select(p => p.ParameterType.Name + " " + p.Name));
+                    Multiplayer.Log?.LogInfo($"[RECON]   {ty.Name}.{m.Name}({ps}) -> {m.ReturnType.Name}");
+                }
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] DumpNearestGroundItem: {e}"); }
     }
 
     private static bool IsFellingCandidate(string ln) =>
         ln.Contains("replace") || ln.Contains("reborn") || ln.Contains("morph")
         || ln.Contains("destroy") || ln.Contains("object") || ln.Contains("dead")
         || ln.Contains("stump") || ln.Contains("anim") || ln.Contains("dying")
-        || ln.Contains("fall") || ln.Contains("play") || ln.Contains("tween");
+        || ln.Contains("fall") || ln.Contains("play") || ln.Contains("tween")
+        || ln.Contains("drop");
 
     // Дамп методів-кандидатів (заміна/анімація/падіння) по ієрархії типу obj.
     private static void DumpCandidateMethods(object obj, string tag,
