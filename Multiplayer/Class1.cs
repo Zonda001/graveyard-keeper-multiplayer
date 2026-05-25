@@ -1980,6 +1980,7 @@ public class SteamManager : MonoBehaviour
             {
                 _chopRetryTimer = 0f;
                 ChopSync.RetryPendingDestroys();
+                ChopSync.RetryPendingDrops();
             }
         }
     }
@@ -2204,6 +2205,18 @@ public class SteamManager : MonoBehaviour
             float ty = BitConverter.ToSingle(data, 5);
             _logger.LogInfo($"[CHOP] Віддалене знищення дерева @({tx:F1},{ty:F1})");
             ChopSync.ApplyRemoteDestroy(tx, ty);
+        }
+        else if (type == 0x0B)
+        {
+            // ── Лут від зрубаного обʼєкта на іншій машині ────────────────────
+            if (!ChopSync.ParseDropPacket(data, out float dx, out float dy,
+                                          out object items, out object dir))
+            {
+                _logger.LogWarning($"[CHOP] 0x0B некоректний (len={data.Length})");
+                return;
+            }
+            _logger.LogInfo($"[CHOP] Віддалений лут @({dx:F1},{dy:F1})");
+            ChopSync.ApplyRemoteDrop(dx, dy, items, dir);
         }
     }
 
@@ -3641,6 +3654,12 @@ public static class ChopSync
     private static Type       _treeDisappearType;       // TreeDisappearAnimation (компонент дерева)
     private static MethodInfo _startAnimationMethod;    // TreeDisappearAnimation.StartAnimation(VoidDelegate)
     private static Type       _voidDelegateType;        // VoidDelegate (делегат void())
+    private static Type       _itemType;                // Item (id, value)
+    private static ConstructorInfo _itemCtor;           // new Item(string id, int value)
+    private static FieldInfo  _itemIdField;             // Item.id (string)
+    private static FieldInfo  _itemValueField;          // Item.value (int)
+    private static Type       _directionType;           // Direction (enum)
+    private static MethodInfo _dropItemsMethod;         // WGO.DropItems(List<Item>, Direction)
     private static bool       _ready;
 
     private static MonoBehaviour _cachedLocalPlayerWgo;
@@ -3649,6 +3668,11 @@ public static class ChopSync
     // вони ще не «розбуджені» тут. Знищуємо їх, коли гравець підійде й вони
     // завантажаться (RetryPendingDestroys).
     private static readonly List<Vector2> _pendingDestroys = new List<Vector2>();
+
+    // Лут, що випав у іншого гравця, поки WGO ще не завантажений тут.
+    // Зберігаємо координати + готовий List<Item> + Direction. RetryPendingDrops.
+    private struct PendingDrop { public Vector2 Pos; public object Items; public object Direction; }
+    private static readonly List<PendingDrop> _pendingDrops = new List<PendingDrop>();
 
     private static void EnsureReflection()
     {
@@ -3680,12 +3704,22 @@ public static class ChopSync
             .FirstOrDefault(m => m.Name == "StartAnimation" && m.GetParameters().Length == 1);
         _voidDelegateType = AccessTools.TypeByName("VoidDelegate");
 
+        // Item/Direction/DropItems — для синку луту (0x0B). Best-effort: без них
+        // лут не реплеїтиметься, але все інше працює.
+        _itemType        = AccessTools.TypeByName("Item");
+        _itemCtor        = _itemType?.GetConstructor(new[] { typeof(string), typeof(int) });
+        _itemIdField     = _itemType?.GetField("id", f);
+        _itemValueField  = _itemType?.GetField("value", f);
+        _directionType   = AccessTools.TypeByName("Direction");
+        _dropItemsMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DropItems" && m.GetParameters().Length == 2);
+
         _ready = _objIdField != null && _doActionMethod != null;
         if (!_ready)
             Multiplayer.Log?.LogWarning("[CHOP] Рефлексію не ініціалізовано — синк рубки вимкнено");
     }
 
-    public static void Reset() => _pendingDestroys.Clear();
+    public static void Reset() { _pendingDestroys.Clear(); _pendingDrops.Clear(); }
 
     // Обʼєкти, рубку/розбивання яких синхронізуємо: дерева (tree*) і наземні
     // камені (stone_N). Обидва після обробки зникають. ЖИЛИ В ШАХТАХ виключаємо
@@ -3907,6 +3941,152 @@ public static class ChopSync
         }
     }
 
+    // ── СИНК ЛУТА (0x0B) ─────────────────────────────────────────────────────
+    // Локальний DropItems → відсилка 0x0B (список Item-ів + Direction + координати).
+    // На приймачі — реплей того ж DropItems під ApplyingRemoteChop echo-guard.
+    // Кожна машина матиме локальний DropResGameObject; коли буде синк інвентаря,
+    // подія підбирання видалить локальний дроп без додавання предметів.
+    private static bool DropReflectionReady() =>
+        _itemType != null && _itemIdField != null && _itemValueField != null
+        && _directionType != null && _dropItemsMethod != null;
+
+    // Серіалізація: type(1) + x(4) + y(4) + dir(1) + count(1)
+    //               + N * { idLen(1) + id(utf8) + value(4) }
+    public static void OnLocalDropItems(MonoBehaviour wgo, object itemsList, object direction)
+    {
+        if (ApplyingRemoteChop || !Connected()) return;
+        if (!IsSyncTarget(wgo)) return;
+        EnsureReflection();
+        if (!DropReflectionReady() || itemsList == null) return;
+
+        try
+        {
+            var list = itemsList as System.Collections.IList;
+            if (list == null || list.Count == 0) return;
+
+            // Збір (id, value) — мовчки пропускаємо порожні id (мало б не бути).
+            var triples = new List<KeyValuePair<byte[], int>>(list.Count);
+            int payload = 0;
+            foreach (var it in list)
+            {
+                if (it == null) continue;
+                var id = _itemIdField.GetValue(it) as string;
+                if (string.IsNullOrEmpty(id)) continue;
+                int val = Convert.ToInt32(_itemValueField.GetValue(it));
+                var idBytes = System.Text.Encoding.UTF8.GetBytes(id);
+                if (idBytes.Length > 255) continue;       // id невеликі (як wood/branch)
+                triples.Add(new KeyValuePair<byte[], int>(idBytes, val));
+                payload += 1 + idBytes.Length + 4;
+            }
+            if (triples.Count == 0 || triples.Count > 255) return;
+
+            var p = wgo.transform.position;
+            byte dir = (byte)Convert.ToInt32(direction);
+
+            var packet = new byte[11 + payload];
+            packet[0] = 0x0B;
+            BitConverter.GetBytes(p.x).CopyTo(packet, 1);
+            BitConverter.GetBytes(p.y).CopyTo(packet, 5);
+            packet[9]  = dir;
+            packet[10] = (byte)triples.Count;
+            int off = 11;
+            foreach (var kv in triples)
+            {
+                packet[off++] = (byte)kv.Key.Length;
+                Buffer.BlockCopy(kv.Key, 0, packet, off, kv.Key.Length); off += kv.Key.Length;
+                BitConverter.GetBytes(kv.Value).CopyTo(packet, off); off += 4;
+            }
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            Multiplayer.Log?.LogInfo($"[CHOP] Лут @({p.x:F1},{p.y:F1}) → {triples.Count} item(ів), dir={dir}");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalDropItems: {e.Message}"); }
+    }
+
+    // Розбирає 0x0B → готує List<Item> і Direction. Повертає false якщо щось не так.
+    public static bool ParseDropPacket(byte[] data, out float x, out float y,
+                                       out object itemsList, out object direction)
+    {
+        x = y = 0f; itemsList = null; direction = null;
+        EnsureReflection();
+        if (!DropReflectionReady() || data == null || data.Length < 11) return false;
+        try
+        {
+            x = BitConverter.ToSingle(data, 1);
+            y = BitConverter.ToSingle(data, 5);
+            byte dir   = data[9];
+            int  count = data[10];
+            int off    = 11;
+
+            var listType = typeof(List<>).MakeGenericType(_itemType);
+            var list = (System.Collections.IList)Activator.CreateInstance(listType);
+            for (int i = 0; i < count; i++)
+            {
+                if (off + 1 > data.Length) return false;
+                int idLen = data[off++];
+                if (off + idLen + 4 > data.Length) return false;
+                string id = System.Text.Encoding.UTF8.GetString(data, off, idLen); off += idLen;
+                int val = BitConverter.ToInt32(data, off); off += 4;
+                list.Add(_itemCtor.Invoke(new object[] { id, val }));
+            }
+            itemsList = list;
+            direction = Enum.ToObject(_directionType, (int)dir);
+            return true;
+        }
+        catch (Exception e)
+        {
+            Multiplayer.Log?.LogError($"[CHOP] ParseDropPacket: {e.Message}");
+            return false;
+        }
+    }
+
+    public static void ApplyRemoteDrop(float x, float y, object itemsList, object direction)
+    {
+        EnsureReflection();
+        if (!_ready || !DropReflectionReady() || itemsList == null) return;
+
+        var target = FindTargetNear(x, y, out float dist);
+        if (target == null || dist > POSITION_EPSILON)
+        {
+            // Обʼєкт ще не «розбуджений» — у чергу. Спробуємо коли підійде.
+            var pos = new Vector2(x, y);
+            if (!_pendingDrops.Any(d => Vector2.Distance(d.Pos, pos) < POSITION_EPSILON))
+            {
+                _pendingDrops.Add(new PendingDrop { Pos = pos, Items = itemsList, Direction = direction });
+                Multiplayer.Log?.LogInfo($"[CHOP] Лут @({x:F1},{y:F1}) відкладено ({_pendingDrops.Count})");
+            }
+            return;
+        }
+        InvokeDropItems(target, itemsList, direction);
+    }
+
+    private static void InvokeDropItems(MonoBehaviour target, object itemsList, object direction)
+    {
+        ApplyingRemoteChop = true;
+        try { _dropItemsMethod.Invoke(target, new[] { itemsList, direction }); }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] DropItems впав: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+        Multiplayer.Log?.LogInfo("[CHOP] Лут реплеєно локально ✓");
+    }
+
+    public static void RetryPendingDrops()
+    {
+        if (_pendingDrops.Count == 0) return;
+        EnsureReflection();
+        if (!_ready) return;
+
+        for (int i = _pendingDrops.Count - 1; i >= 0; i--)
+        {
+            var d = _pendingDrops[i];
+            var target = FindTargetNear(d.Pos.x, d.Pos.y, out float dist);
+            if (target != null && dist <= POSITION_EPSILON)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] Відкладений лут @({d.Pos.x:F1},{d.Pos.y:F1}) ✓");
+                InvokeDropItems(target, d.Items, d.Direction);
+                _pendingDrops.RemoveAt(i);
+            }
+        }
+    }
+
     // Найближчий синхро-обʼєкт (дерево/камінь) до точки (x,y) серед активних WGO
     private static MonoBehaviour FindTargetNear(float x, float y, out float bestDist)
     {
@@ -3982,9 +4162,11 @@ public static class DropItemsBroadcastPatch
             .FirstOrDefault(m => m.Name == "DropItems");
     }
 
-    static void Postfix(MonoBehaviour __instance)
+    static void Postfix(MonoBehaviour __instance, object[] __args)
     {
         ChopSync.OnTreeFelled(__instance);
+        if (__args != null && __args.Length >= 2)
+            ChopSync.OnLocalDropItems(__instance, __args[0], __args[1]);
     }
 
     static Exception Finalizer(Exception __exception) => null;
