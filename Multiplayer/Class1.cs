@@ -3239,8 +3239,11 @@ public static class ChopRecon
             foreach (var c in candidates.Take(8))
                 Multiplayer.Log?.LogInfo($"[RECON]   {c.dist,6:F1}  {c.mb.gameObject.name}  obj_id='{c.objId}'  tree={c.isTree}");
 
-            // Ціль — найближче дерево; якщо дерев нема — просто найближчий WGO
-            var pick = candidates.FirstOrDefault(c => c.isTree);
+            // Ціль — дерево, якщо стоїмо біля нього впритул (≤30); інакше просто
+            // найближчий WGO. Без цього радіуса F6 в шахті матчив дерева за
+            // 500м замість жили за 80м.
+            const float CLOSE_TREE_RADIUS = 30f;
+            var pick = candidates.FirstOrDefault(c => c.isTree && c.dist <= CLOSE_TREE_RADIUS);
             if (pick.mb == null) pick = candidates[0];
 
             Tracked = pick.mb;
@@ -3721,18 +3724,29 @@ public static class ChopSync
 
     public static void Reset() { _pendingDestroys.Clear(); _pendingDrops.Clear(); }
 
-    // Обʼєкти, рубку/розбивання яких синхронізуємо: дерева (tree*) і наземні
-    // камені (stone_N). Обидва після обробки зникають. ЖИЛИ В ШАХТАХ виключаємо
-    // — вони не зникають, їх руйнувати не можна. Розвідка показала жили
-    // stone_ore (камінна) і steep_coal (вугільна) — фільтруємо за ore/coal.
-    private static bool IsSyncTarget(MonoBehaviour wgo)
+    // Обʼєкти, ЗНИЩЕННЯ яких синхронізуємо (пакети 0x09 удар, 0x0A знищення):
+    // дерева (tree*) і наземні камені (stone_N). Жили шахт (steep_*) НЕ сюди —
+    // вони не зникають, реплей DoAction/ReplaceWithObject поламає стан.
+    private static bool IsDestroySyncTarget(MonoBehaviour wgo)
     {
         EnsureReflection();
         if (!_ready || wgo == null) return false;
         var id = _objIdField.GetValue(wgo) as string;
         if (id == null) return false;
-        if (id.Contains("ore") || id.Contains("coal")) return false;   // жили шахт
         return id.StartsWith("tree") || id.StartsWith("stone");
+    }
+
+    // Обʼєкти, ЛУТ яких синхронізуємо (пакет 0x0B): + жили шахт (steep_*).
+    // Розвідка показала: гра викликає WGO.DropItems на жилі при ударі, але
+    // сама жила не зникає — для синку луту достатньо реплею DropItems
+    // локально (без 0x09/0x0A).
+    private static bool IsLootSyncTarget(MonoBehaviour wgo)
+    {
+        EnsureReflection();
+        if (!_ready || wgo == null) return false;
+        var id = _objIdField.GetValue(wgo) as string;
+        if (id == null) return false;
+        return id.StartsWith("tree") || id.StartsWith("stone") || id.StartsWith("steep");
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
@@ -3764,17 +3778,18 @@ public static class ChopSync
     public static void OnLocalChop(MonoBehaviour wgo, MonoBehaviour actor, float amount)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsSyncTarget(wgo) || !IsPlayerActor(actor)) return;
+        if (!IsDestroySyncTarget(wgo) || !IsPlayerActor(actor)) return;
         var p = wgo.transform.position;
         SendTreePacket(0x09, p.x, p.y, amount);
     }
 
     // ── Відправка: обʼєкт зрубано/розбито (DropItems = він відпрацьований) ───
-    // Фільтр IsSyncTarget пускає лише дерева й камені — жила в шахті не сюди.
+    // IsDestroySyncTarget пускає лише дерева й камені — жилу в шахті не сюди
+    // (вона не зникає, синк її луту окремо через 0x0B / IsLootSyncTarget).
     public static void OnTreeFelled(MonoBehaviour wgo)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsSyncTarget(wgo)) return;
+        if (!IsDestroySyncTarget(wgo)) return;
         var p = wgo.transform.position;
         SendTreePacket(0x0A, p.x, p.y, 0f);
         Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт зрубано/розбито @({p.x:F1},{p.y:F1}) — транслюємо знищення");
@@ -3955,7 +3970,7 @@ public static class ChopSync
     public static void OnLocalDropItems(MonoBehaviour wgo, object itemsList, object direction)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsSyncTarget(wgo)) return;
+        if (!IsLootSyncTarget(wgo)) return;
         EnsureReflection();
         if (!DropReflectionReady() || itemsList == null) return;
 
@@ -4044,7 +4059,7 @@ public static class ChopSync
         EnsureReflection();
         if (!_ready || !DropReflectionReady() || itemsList == null) return;
 
-        var target = FindTargetNear(x, y, out float dist);
+        var target = FindTargetNear(x, y, out float dist, IsLootSyncTarget);
         if (target == null || dist > POSITION_EPSILON)
         {
             // Обʼєкт ще не «розбуджений» — у чергу. Спробуємо коли підійде.
@@ -4077,7 +4092,7 @@ public static class ChopSync
         for (int i = _pendingDrops.Count - 1; i >= 0; i--)
         {
             var d = _pendingDrops[i];
-            var target = FindTargetNear(d.Pos.x, d.Pos.y, out float dist);
+            var target = FindTargetNear(d.Pos.x, d.Pos.y, out float dist, IsLootSyncTarget);
             if (target != null && dist <= POSITION_EPSILON)
             {
                 Multiplayer.Log?.LogInfo($"[CHOP] Відкладений лут @({d.Pos.x:F1},{d.Pos.y:F1}) ✓");
@@ -4087,19 +4102,23 @@ public static class ChopSync
         }
     }
 
-    // Найближчий синхро-обʼєкт (дерево/камінь) до точки (x,y) серед активних WGO
-    private static MonoBehaviour FindTargetNear(float x, float y, out float bestDist)
+    // Найближчий синхро-обʼєкт до точки (x,y) серед активних WGO. Predicate
+    // визначає тип цілі: IsDestroySyncTarget для 0x09/0x0A, IsLootSyncTarget
+    // для 0x0B (ширший — пускає й жили).
+    private static MonoBehaviour FindTargetNear(float x, float y, out float bestDist,
+                                                Func<MonoBehaviour, bool> filter = null)
     {
         bestDist = float.MaxValue;
         EnsureReflection();
         if (!_ready) return null;
+        if (filter == null) filter = IsDestroySyncTarget;
 
         MonoBehaviour best = null;
         var target = new Vector2(x, y);
         foreach (var comp in UnityEngine.Object.FindObjectsOfType(_wgoType))
         {
             var mb = comp as MonoBehaviour;
-            if (mb == null || !IsSyncTarget(mb)) continue;
+            if (mb == null || !filter(mb)) continue;
             var p = mb.transform.position;
             float d = Vector2.Distance(new Vector2(p.x, p.y), target);
             if (d < bestDist) { bestDist = d; best = mb; }
