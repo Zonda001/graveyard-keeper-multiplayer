@@ -129,6 +129,37 @@ P2P-пакети (перший байт — тип):
 
 ---
 
+## Траблшутинг
+
+### Гра крашить на старті — білий екран, «Не відповідає»
+
+**Причина:** конфлікт свіжих NVIDIA-драйверів (серія 32.x, з кінця 2025)
+з Unity-стеком гри. Краш відбувається **до** завантаження BepInEx — мод
+тут ні до чого, та сама поведінка й без нього. У стек-трейсі
+`Player-prev.log` видно `NvPresent64.NVP_Init_Vulkan` → `dxgi.CreateDXGIFactory2`.
+
+**Фікси, від найшвидшого:**
+
+1. **Перемкнути гру на iGPU** (ноутбуки з гібридною графікою — найшвидший
+   воркараунд). NVIDIA Control Panel → Manage 3D Settings → Program
+   Settings → знайти `Graveyard Keeper.exe` → *Preferred graphics
+   processor* = **Integrated**. Гра не вимоглива, на iGPU йде нормально.
+2. **Вимкнути overlay-фічі NVIDIA**. NVIDIA App → Settings → Graphics:
+   вимкнути *Smooth Motion*, *Frame Generation*, *Game Filters*,
+   *Overlay*. Закрити Discord/GeForce Experience перед запуском.
+3. **Відкат драйвера через DDU** (найнадійніше). Завантажити старший
+   Game Ready Driver (серії 5xx, осінь 2025) з
+   [nvidia.com/Download](https://www.nvidia.com/Download/Find.aspx),
+   завантажити [DDU](https://www.guru3d.com/download/display-driver-uninstaller-download/),
+   у Safe Mode зробити Clean and restart, потім поставити завантажений
+   драйвер вручну (БЕЗ NVIDIA App / GeForce Experience — щоб не
+   автооновився назад).
+
+Якщо жоден з фіксів не допомагає — є шанс що проблема в чомусь іншому,
+відкрий issue з файлами `Player.log` і `Player-prev.log` з папки гри.
+
+---
+
 ## Технічне
 
 - **Рушій:** Unity 2020.3, .NET Framework 4.7.2
