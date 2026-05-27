@@ -3736,17 +3736,26 @@ public static class ChopSync
         return id.StartsWith("tree") || id.StartsWith("stone");
     }
 
-    // Обʼєкти, ЛУТ яких синхронізуємо (пакет 0x0B): + жили шахт (steep_*).
-    // Розвідка показала: гра викликає WGO.DropItems на жилі при ударі, але
-    // сама жила не зникає — для синку луту достатньо реплею DropItems
-    // локально (без 0x09/0x0A).
+    // Обʼєкти, ЛУТ яких синхронізуємо (пакет 0x0B). Ширше за IsDestroySyncTarget —
+    // сюди йде все що при DoAction викликає WGO.DropItems, незалежно від того
+    // чи обʼєкт зникає, трансформується чи залишається:
+    //   tree*/stone*   — дерева й наземні камені (зникають → синк з 0x09/0x0A)
+    //   steep*         — жили шахт (не зникають, "respawn себе")
+    //   grave*/garden* — могили на цвинтарі й грядки на фермі (ексгумація дає
+    //                    body/lifeforce, копання дає камінь). Розвідка
+    //                    2026-05-27 підтвердила той самий шлях DoAction →
+    //                    RewardForWork → DropItems.
+    // Реплей DropItems на приймачі безпечний для будь-якого WGO (просто
+    // створює лут на землі біля цілі, не чіпає стан самого обʼєкта).
     private static bool IsLootSyncTarget(MonoBehaviour wgo)
     {
         EnsureReflection();
         if (!_ready || wgo == null) return false;
         var id = _objIdField.GetValue(wgo) as string;
         if (id == null) return false;
-        return id.StartsWith("tree") || id.StartsWith("stone") || id.StartsWith("steep");
+        return id.StartsWith("tree") || id.StartsWith("stone") ||
+               id.StartsWith("steep") || id.StartsWith("grave") ||
+               id.StartsWith("garden");
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
