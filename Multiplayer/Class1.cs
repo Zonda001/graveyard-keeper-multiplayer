@@ -4022,6 +4022,11 @@ public static class ChopSync
             }
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
             Multiplayer.Log?.LogInfo($"[CHOP] Лут @({p.x:F1},{p.y:F1}) → {triples.Count} item(ів), dir={dir}");
+            // Тимчасова розвідка: які саме предмети шлемо (для body/риби/шкіри — чи
+            // приходять до приймача й чи нормально рендеряться)
+            var dbgIds = string.Join(", ",
+                triples.Select(kv => System.Text.Encoding.UTF8.GetString(kv.Key) + "=" + kv.Value));
+            Multiplayer.Log?.LogInfo($"[CHOP-DBG] send items: {dbgIds}");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalDropItems: {e.Message}"); }
     }
@@ -4043,6 +4048,7 @@ public static class ChopSync
 
             var listType = typeof(List<>).MakeGenericType(_itemType);
             var list = (System.Collections.IList)Activator.CreateInstance(listType);
+            var dbgIds = new List<string>(count);
             for (int i = 0; i < count; i++)
             {
                 if (off + 1 > data.Length) return false;
@@ -4051,9 +4057,12 @@ public static class ChopSync
                 string id = System.Text.Encoding.UTF8.GetString(data, off, idLen); off += idLen;
                 int val = BitConverter.ToInt32(data, off); off += 4;
                 list.Add(_itemCtor.Invoke(new object[] { id, val }));
+                dbgIds.Add(id + "=" + val);
             }
             itemsList = list;
             direction = Enum.ToObject(_directionType, (int)dir);
+            // Тимчасова розвідка (пара до [CHOP-DBG] send items на відправнику)
+            Multiplayer.Log?.LogInfo($"[CHOP-DBG] recv items @({x:F1},{y:F1}): {string.Join(", ", dbgIds)}");
             return true;
         }
         catch (Exception e)
