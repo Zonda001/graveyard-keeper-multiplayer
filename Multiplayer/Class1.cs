@@ -2199,11 +2199,11 @@ public class SteamManager : MonoBehaviour
         }
         else if (type == 0x0A)
         {
-            // ── Дерево зрубане на іншій машині ────────────────────────────────
+            // ── Обʼєкт відпрацьований на іншій машині (дерево/камінь/могила/грядка) ─
             if (data.Length < 9) { _logger.LogWarning($"[CHOP] 0x0A замалий: {data.Length}б"); return; }
             float tx = BitConverter.ToSingle(data, 1);
             float ty = BitConverter.ToSingle(data, 5);
-            _logger.LogInfo($"[CHOP] Віддалене знищення дерева @({tx:F1},{ty:F1})");
+            _logger.LogInfo($"[CHOP] Віддалена зміна стану обʼєкта @({tx:F1},{ty:F1})");
             ChopSync.ApplyRemoteDestroy(tx, ty);
         }
         else if (type == 0x0B)
@@ -3736,6 +3736,29 @@ public static class ChopSync
         return id.StartsWith("tree") || id.StartsWith("stone");
     }
 
+    // Обʼєкти, ЗМІНУ СТАНУ яких синхронізуємо (пакет 0x0A — перехід after_hp_0
+    // або знищення). Ширше за IsDestroySyncTarget: крім дерев і каменів сюди
+    // йдуть грядки (garden*) — лайв-тест 2026-06-01 підтвердив, що збір врожаю
+    // (одностадійний hp→0) трансформується на приймачі чисто.
+    // МОГИЛИ (grave*) НАВМИСНО ВИКЛЮЧЕНІ: вони багатостадійні (частини падають
+    // окремими DropItems), і форс ReplaceWithObject/Destroy на приймачі знищував
+    // цілу могилу замість переходу на наступну стадію (лайв-тест 2026-06-01:
+    // "могила просто пропала" + у гробаря завис work-стан / череп). Лут могил
+    // далі синкається через 0x0B; їх трансформацію треба робити окремим, точним
+    // шляхом (знати game-метод стадійного переходу — окрема розвідка).
+    // Жили шахт (steep_*) — теж НЕ сюди: вони не зникають, ReplaceWithObject
+    // зламав би стан (синк лише їх луту через 0x0B / IsLootSyncTarget).
+    // 0x09 (косметичний удар) лишається вужчим — лише IsDestroySyncTarget.
+    private static bool IsTransformSyncTarget(MonoBehaviour wgo)
+    {
+        EnsureReflection();
+        if (!_ready || wgo == null) return false;
+        var id = _objIdField.GetValue(wgo) as string;
+        if (id == null) return false;
+        return id.StartsWith("tree") || id.StartsWith("stone") ||
+               id.StartsWith("garden") || IsNatureGatherTarget(id);
+    }
+
     // Обʼєкти, ЛУТ яких синхронізуємо (пакет 0x0B). Ширше за IsDestroySyncTarget —
     // сюди йде все що при DoAction викликає WGO.DropItems, незалежно від того
     // чи обʼєкт зникає, трансформується чи залишається:
@@ -3755,7 +3778,21 @@ public static class ChopSync
         if (id == null) return false;
         return id.StartsWith("tree") || id.StartsWith("stone") ||
                id.StartsWith("steep") || id.StartsWith("grave") ||
-               id.StartsWith("garden");
+               id.StartsWith("garden") || IsNatureGatherTarget(id);
+    }
+
+    // Природні «збиральні» обʼєкти: квіти (flower_small_*), гриби (mushroom_*),
+    // кущі (bush_*). Збираються як грядка — одностадійний hp→0 → DropItems →
+    // after_hp_0/знищення, тож синкаємо і трансформацію (0x0A), і лут (0x0B).
+    // СПАВНЕРИ ВИКЛЮЧЕНІ (flower_spawner / mushroom_spawner) — це невидимі точки
+    // респавну, чіпати їх не можна, інакше зламаємо відновлення природи.
+    // Ризику фрізу як у могил нема: _linked_worker=null (RECON 2026-06-01) і ми
+    // НЕ кладемо їх у 0x09-удар (IsDestroySyncTarget), лише transform+loot.
+    private static bool IsNatureGatherTarget(string id)
+    {
+        if (id == null || id.Contains("spawner")) return false;
+        return id.StartsWith("flower") || id.StartsWith("mushroom") ||
+               id.StartsWith("bush");
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
@@ -3792,16 +3829,17 @@ public static class ChopSync
         SendTreePacket(0x09, p.x, p.y, amount);
     }
 
-    // ── Відправка: обʼєкт зрубано/розбито (DropItems = він відпрацьований) ───
-    // IsDestroySyncTarget пускає лише дерева й камені — жилу в шахті не сюди
-    // (вона не зникає, синк її луту окремо через 0x0B / IsLootSyncTarget).
+    // ── Відправка: обʼєкт відпрацьований (DropItems) — транслюємо зміну стану ──
+    // IsTransformSyncTarget: дерева, камені, могили, грядки — усе що переходить
+    // у after_hp_0 (пеньок / grave_empty / garden_empty). Жили (steep_*) не сюди
+    // — вони не зникають, синк лише їх луту через 0x0B.
     public static void OnTreeFelled(MonoBehaviour wgo)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsDestroySyncTarget(wgo)) return;
+        if (!IsTransformSyncTarget(wgo)) return;
         var p = wgo.transform.position;
         SendTreePacket(0x0A, p.x, p.y, 0f);
-        Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт зрубано/розбито @({p.x:F1},{p.y:F1}) — транслюємо знищення");
+        Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт відпрацьовано @({p.x:F1},{p.y:F1}) — транслюємо зміну стану");
     }
 
     // ── Прийом 0x09: повторити удар (косметика — трясіння) ──────────────────
@@ -3833,7 +3871,7 @@ public static class ChopSync
         EnsureReflection();
         if (!_ready) return;
 
-        var target = FindTargetNear(x, y, out float dist);
+        var target = FindTargetNear(x, y, out float dist, IsTransformSyncTarget);
         if (target == null || dist > POSITION_EPSILON)
         {
             // Обʼєкт ще не «розбуджений» — гравець у іншій локації. Запамʼятовуємо,
@@ -3955,7 +3993,7 @@ public static class ChopSync
         for (int i = _pendingDestroys.Count - 1; i >= 0; i--)
         {
             var pos = _pendingDestroys[i];
-            var target = FindTargetNear(pos.x, pos.y, out float dist);
+            var target = FindTargetNear(pos.x, pos.y, out float dist, IsTransformSyncTarget);
             if (target != null && dist <= POSITION_EPSILON)
             {
                 Multiplayer.Log?.LogInfo($"[CHOP] Відкладене прибирання обʼєкта @({pos.x:F1},{pos.y:F1}) ✓");
@@ -4201,9 +4239,14 @@ public static class DropItemsBroadcastPatch
 
     static void Postfix(MonoBehaviour __instance, object[] __args)
     {
-        ChopSync.OnTreeFelled(__instance);
+        // Порядок важливий: ЛУТ (0x0B) шлемо ПЕРШИМ, зміну стану (0x0A) — другою.
+        // Пакети reliable+ordered (k_EP2PSendReliable), тож приймач застосує лут
+        // поки обʼєкт ще на місці, і лише тоді його трансформує. Інакше для природи
+        // (flower→flower_spawner) лут не знаходив дроппера: квітка ставала спавнером
+        // (виключений з лут-цілей) → лут зависав у _pendingDrops (лайв-тест 2026-06-01).
         if (__args != null && __args.Length >= 2)
             ChopSync.OnLocalDropItems(__instance, __args[0], __args[1]);
+        ChopSync.OnTreeFelled(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
