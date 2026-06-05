@@ -1981,7 +1981,6 @@ public class SteamManager : MonoBehaviour
                 _chopRetryTimer = 0f;
                 ChopSync.RetryPendingDestroys();
                 ChopSync.RetryPendingDrops();
-                ChopSync.DespawnExpiredRemoteDrops();
             }
         }
     }
@@ -3688,7 +3687,6 @@ public static class ChopSync
     private static FieldInfo  _itemValueField;          // Item.value (int)
     private static Type       _directionType;           // Direction (enum)
     private static MethodInfo _dropItemsMethod;         // WGO.DropItems(List<Item>, Direction)
-    private static Type       _dropResType;             // DropResGameObject (впалий лут на землі)
     private static bool       _ready;
 
     private static MonoBehaviour _cachedLocalPlayerWgo;
@@ -3703,23 +3701,9 @@ public static class ChopSync
     private struct PendingDrop { public Vector2 Pos; public object Items; public object Direction; }
     private static readonly List<PendingDrop> _pendingDrops = new List<PendingDrop>();
 
-    // Анти-дюп: лут, реплеєний від напарника (0x0B). Локально НЕВИДБІРНИЙ
-    // (DropCollectBlockPatch блокує його збір) — інакше кожен підбирав би свою
-    // копію = дюп. Зникає сам через REMOTE_DROP_TTL (власник свій лут уже зібрав).
-    // Ключ — instanceID DropResGameObject; значення — час, коли його прибрати.
-    private class RemoteDropInfo { public MonoBehaviour Drop; public float Expiry; }
-    private static readonly Dictionary<int, RemoteDropInfo> _remoteDrops =
-        new Dictionary<int, RemoteDropInfo>();
-    private const float REMOTE_DROP_TTL = 4f;
-
-    // СПІЛЬНИЙ ЛУТ: true = обидва гравці отримують лут (інвентарі окремі, тож це
-    // не розсинхрон — просто команда має 2× матеріалів за дерево). При true нічого
-    // не тегуємо → _remoteDrops порожній → блок-патчі пропускають збір → приймач
-    // бере свою копію. false = модель «лут власника» (анти-дюп, тільки хто рубає).
-    // Перемикач Zonda 2026-06-05: він хоче щоб лут діставався обом гравцям.
-    // static readonly (а не const), щоб гілки «лут власника» не рахувались мертвим
-    // кодом — обидві гілки лишаються валідними при перемиканні.
-    private static readonly bool SHARED_LOOT = true;
+    // СПІЛЬНИЙ ЛУТ: реплей 0x0B спавнить лут і на приймачі, той збирає свою копію.
+    // Інвентарі окремі, тож це не дюп — обидва гравці отримують лут (рішення
+    // Zonda 2026-06-05, протестовано лайв-тестом). Жодного анти-дюпу/тегування.
 
     private static void EnsureReflection()
     {
@@ -3761,17 +3745,12 @@ public static class ChopSync
         _dropItemsMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
             .FirstOrDefault(m => m.Name == "DropItems" && m.GetParameters().Length == 2);
 
-        // DropResGameObject — впалий лут на землі. Для анти-дюпу: реплеєний від
-        // напарника лут позначаємо «чужим» (_remoteDrops) і блокуємо його збір
-        // локально (DropCollectBlockPatch), щоб напарник не дублював предмет.
-        _dropResType = AccessTools.TypeByName("DropResGameObject");
-
         _ready = _objIdField != null && _doActionMethod != null;
         if (!_ready)
             Multiplayer.Log?.LogWarning("[CHOP] Рефлексію не ініціалізовано — синк рубки вимкнено");
     }
 
-    public static void Reset() { _pendingDestroys.Clear(); _pendingDrops.Clear(); _remoteDrops.Clear(); }
+    public static void Reset() { _pendingDestroys.Clear(); _pendingDrops.Clear(); }
 
     // Обʼєкти, ЗНИЩЕННЯ яких синхронізуємо (пакети 0x09 удар, 0x0A знищення):
     // дерева (tree*) і наземні камені (stone_N). Жили шахт (steep_*) НЕ сюди —
@@ -4181,44 +4160,14 @@ public static class ChopSync
 
     private static void InvokeDropItems(MonoBehaviour target, object itemsList, object direction)
     {
-        // Тегування чужого луту — у DropTagPatch (Postfix на DoDrop), поки активне
-        // ApplyingRemoteChop. ТІЛЬКИ синхронно: часове вікно після Invoke прибрано,
-        // бо воно тегувало й ВЛАСНИЙ лут гравця, створений у ті ж 0.3с (втрата свого
-        // луту при одночасній рубці). Якщо DoDrop виявиться асинхронним — лог нижче
-        // покаже «тегнуто 0 з N»; тоді повернемось до точкового (по WGO) тегування.
-        int countBefore = _remoteDrops.Count;
+        // Реплей чужого DropItems під echo-guard ApplyingRemoteChop (щоб приймач не
+        // транслював його назад). Лут спільний — приймач збирає свою копію.
         int expected = (itemsList as System.Collections.IList)?.Count ?? -1;
         ApplyingRemoteChop = true;
         try { _dropItemsMethod.Invoke(target, new[] { itemsList, direction }); }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] DropItems впав: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
-        int tagged = _remoteDrops.Count - countBefore;
-        if (SHARED_LOOT)
-        {
-            Multiplayer.Log?.LogInfo($"[CHOP] Лут реплеєно ✓ (спільний режим: обидва отримують ~{expected} item(ів))");
-        }
-        else
-        {
-            Multiplayer.Log?.LogInfo($"[CHOP] Лут реплеєно локально ✓ (тегнуто {tagged} з ~{expected} item(ів))");
-            if (tagged == 0 && expected != 0)
-                Multiplayer.Log?.LogWarning("[CHOP] ⚠ Жодного дропу не тегнуто синхронно — можливо DoDrop асинхронний (ризик дюпу). Перевір у грі.");
-        }
-    }
-
-    // Прапор для DropTagPatch: поки активне — кожен новий DropResGameObject (DoDrop)
-    // вважаємо чужим лутом (створюється синхронно під час реплею 0x0B). Часове вікно
-    // прибрано — воно ловило й власний лут гравця за ті ж кадри (втрата свого луту).
-    // При SHARED_LOOT нічого не тегуємо → обидва гравці збирають свою копію.
-    public static bool IsTaggingRemoteLoot => !SHARED_LOOT && ApplyingRemoteChop;
-
-    // Позначає дроп чужим (невидбірним) + ставить на авто-зникнення. З DropTagPatch.
-    public static void MarkRemoteDrop(MonoBehaviour drop)
-    {
-        if (drop == null) return;
-        int id = drop.GetInstanceID();
-        if (_remoteDrops.ContainsKey(id)) return;
-        _remoteDrops[id] = new RemoteDropInfo { Drop = drop, Expiry = Time.time + REMOTE_DROP_TTL };
-        Multiplayer.Log?.LogInfo("[CHOP] Чужий дроп позначено невидбірним ✓");
+        Multiplayer.Log?.LogInfo($"[CHOP] Лут реплеєно ✓ (спільний режим: обидва отримують ~{expected} item(ів))");
     }
 
     public static void RetryPendingDrops()
@@ -4237,41 +4186,6 @@ public static class ChopSync
                 InvokeDropItems(target, d.Items, d.Direction);
                 _pendingDrops.RemoveAt(i);
             }
-        }
-    }
-
-    // ── АНТИ-ДЮП ЛУТА: чужий реплеєний лут невидбірний + авто-зникає ─────────
-    // Лут у Graveyard Keeper авто-підбирається (летить до гравця поблизу). Тож
-    // якщо реплеїти лут напарника як звичайний дроп — кожен авто-підбере свою
-    // копію = ДЮП (синку-по-події 0x0C не встигнути — авто-підбір швидший).
-    // Рішення: реплеєний лут (TagNewRemoteDrops) НЕВИДБІРНИЙ локально
-    // (DropCollectBlockPatch блокує CollectDrop), власник отримує свій лут на
-    // своїй машині, а чужа копія зникає сама через REMOTE_DROP_TTL. Без дюпу.
-
-    // Чи це чужий (реплеєний) лут, який локальний гравець НЕ має підбирати.
-    public static bool IsRemoteDrop(MonoBehaviour drop) =>
-        drop != null && _remoteDrops.ContainsKey(drop.GetInstanceID());
-
-    // Прибирає чужі копії дропу, час яких вийшов (власник свій лут уже зібрав).
-    // Викликається з періодичного тіку поряд з RetryPending*.
-    public static void DespawnExpiredRemoteDrops()
-    {
-        if (_remoteDrops.Count == 0) return;
-        float now = Time.time;
-        List<int> dead = null;
-        foreach (var kv in _remoteDrops)
-        {
-            var info = kv.Value;
-            // null Drop = гра вже знищила (вивантаження локації) — теж прибрати з реєстру.
-            if (info.Drop == null || now >= info.Expiry)
-                (dead ?? (dead = new List<int>())).Add(kv.Key);
-        }
-        if (dead == null) return;
-        foreach (var id in dead)
-        {
-            var info = _remoteDrops[id];
-            _remoteDrops.Remove(id);
-            if (info.Drop != null) UnityEngine.Object.Destroy(info.Drop.gameObject);
         }
     }
 
@@ -4365,67 +4279,6 @@ public static class DropItemsBroadcastPatch
             ChopSync.OnLocalDropItems(__instance, __args[0], __args[1]);
         ChopSync.OnTreeFelled(__instance);
     }
-
-    static Exception Finalizer(Exception __exception) => null;
-}
-
-// Анти-дюп: тегуємо чужий лут У МОМЕНТ СТВОРЕННЯ. DoDrop викликається з
-// DropItems під час реплею 0x0B (IsTaggingRemoteLoot=true) — надійніше за
-// знімок FindObjectsOfType (той інколи не бачив щойно створений дроп → 0).
-[HarmonyPatch]
-public static class DropTagPatch
-{
-    static MethodBase TargetMethod()
-    {
-        var t = AccessTools.TypeByName("DropResGameObject");
-        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
-                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(m => m.Name == "DoDrop");
-    }
-
-    static void Postfix(MonoBehaviour __instance)
-    {
-        if (ChopSync.IsTaggingRemoteLoot) ChopSync.MarkRemoteDrop(__instance);
-    }
-
-    static Exception Finalizer(Exception __exception) => null;
-}
-
-// Анти-дюп: блокуємо ЗБІР чужого (реплеєного від напарника) луту. Власник
-// отримує свій лут на своїй машині; тут чужа копія невидбірна й зникне сама.
-// Prefix повертає false → оригінал CollectDrop не виконується (предмет не
-// додається). Свій лут (не в _remoteDrops) збирається як завжди.
-[HarmonyPatch]
-public static class DropCollectBlockPatch
-{
-    static MethodBase TargetMethod()
-    {
-        var t = AccessTools.TypeByName("DropResGameObject");
-        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
-                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(m => m.Name == "CollectDrop");
-    }
-
-    static bool Prefix(MonoBehaviour __instance) => !ChopSync.IsRemoteDrop(__instance);
-
-    static Exception Finalizer(Exception __exception) => null;
-}
-
-// Анти-дюп (доповнення): глушимо й перевірку дальності, щоб чужий лут навіть
-// не летів до гравця — просто лежить і зникає. Без цього він би «прилипав» до
-// ніг на кілька секунд перед зникненням.
-[HarmonyPatch]
-public static class DropRangeCheckBlockPatch
-{
-    static MethodBase TargetMethod()
-    {
-        var t = AccessTools.TypeByName("DropResGameObject");
-        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
-                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(m => m.Name == "ProcessDropCollectorRangeCheck");
-    }
-
-    static bool Prefix(MonoBehaviour __instance) => !ChopSync.IsRemoteDrop(__instance);
 
     static Exception Finalizer(Exception __exception) => null;
 }
