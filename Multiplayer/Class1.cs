@@ -438,6 +438,12 @@ public class Multiplayer : BaseUnityPlugin
             ChopRecon.TraceEnabled = !ChopRecon.TraceEnabled;
             Logger.LogInfo($"[RECON] Трасування методів: {(ChopRecon.TraceEnabled ? "УВІМК" : "вимк")}");
         }
+
+        // F4 — розвідка СТАДІЙ МОГИЛИ (B-2). Стань біля могили, тисни F4 → знімок усіх
+        //      полів (включно з _data). Викопай ОДНУ стадію, знову F4 → diff двох
+        //      знімків покаже поле, що кодує стадію (його й синкатимемо замість 0x0D).
+        if (Input.GetKeyDown(KeyCode.F4))
+            ChopRecon.CaptureNearestGrave();
     }
 
     // ── Спавн клону іншого гравця (мережевий) ────────────────────────────────
@@ -2218,6 +2224,12 @@ public class SteamManager : MonoBehaviour
             _logger.LogInfo($"[CHOP] Віддалений лут @({dx:F1},{dy:F1})");
             ChopSync.ApplyRemoteDrop(dx, dy, items, dir);
         }
+        else if (type == 0x0D)
+        {
+            // ── Візуальна стадія могили на іншій машині (RedrawPart/ReplaceWithObject) ─
+            _logger.LogInfo($"[CHOP] Віддалена стадія могили (0x0D, {data.Length}б)");
+            ChopSync.ParseAndApplyGraveOp(data);
+        }
     }
 
 
@@ -3258,6 +3270,172 @@ public static class ChopRecon
         catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] CaptureNearestTree: {e}"); }
     }
 
+    // B-2: захопити найближчу МОГИЛУ (obj_id починається з "grave") і дампнути всі
+    // поля. Окремо від CaptureNearestTree, бо там логіка «пріоритет дерева ≤30».
+    // Робочий цикл: F4 (знімок) → викопати одну стадію → F4 → diff знімків у логах.
+    public static void CaptureNearestGrave()
+    {
+        try
+        {
+            var wgoType = AccessTools.TypeByName("WorldGameObject");
+            if (wgoType == null) { Multiplayer.Log?.LogWarning("[RECON] Тип WorldGameObject не знайдено"); return; }
+
+            var playerGO = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>()
+                .FirstOrDefault(mb => mb.GetType().Name == "PlayerComponent"
+                                      && mb.gameObject.name != "RemotePlayer_Clone"
+                                      && mb.gameObject.name != "Player2_Clone")?.gameObject;
+            if (playerGO == null) { Multiplayer.Log?.LogWarning("[RECON] Локального гравця не знайдено"); return; }
+            Vector3 origin = playerGO.transform.position;
+
+            if (_objIdField == null)
+                _objIdField = wgoType.GetField("_obj_id",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            MonoBehaviour best = null; float bestDist = float.MaxValue; string bestId = "";
+            foreach (var comp in UnityEngine.Object.FindObjectsOfType(wgoType))
+            {
+                var mb = comp as MonoBehaviour;
+                if (mb == null) continue;
+                string objId = _objIdField?.GetValue(mb) as string ?? "";
+                if (!objId.StartsWith("grave")) continue;
+                float dist = Vector3.Distance(mb.transform.position, origin);
+                if (dist < bestDist) { bestDist = dist; best = mb; bestId = objId; }
+            }
+
+            if (best == null) { Multiplayer.Log?.LogWarning("[RECON] Могилу (grave*) поблизу не знайдено"); return; }
+
+            Tracked = best;
+            DoActionProbePatch.Reset();
+            Multiplayer.Log?.LogInfo($"[RECON] ═══ МОГИЛА: {best.gameObject.name} " +
+                $"obj_id='{bestId}' dist={bestDist:F1} ═══");
+            DumpState("ЗНІМОК-МОГИЛА");
+            DumpFellingInfo();
+            DumpNearestGroundItem();
+            DumpSerializationApi(best);
+            DumpItemSerializationApi(best);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] CaptureNearestGrave: {e}"); }
+    }
+
+    // B-2 підхід A-3: serialize-API самого Item (_data могили). item_data у
+    // SerializableWGO порожній у рантаймі, тож шукаємо ЯК GK серіалізує Item напряму
+    // (методи serial/save/load/string/byte/write/read/json) + GameRes (_params).
+    // Також пробуємо викликати найімовірніший серіалайзер і показуємо результат.
+    public static void DumpItemSerializationApi(MonoBehaviour wgo)
+    {
+        try
+        {
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var dataField = wgo.GetType().GetField("_data", flags);
+            var data = dataField?.GetValue(wgo);
+            if (data == null) { Multiplayer.Log?.LogInfo("[RECON] _data = null"); return; }
+            var itemType = data.GetType();
+
+            Multiplayer.Log?.LogInfo($"[RECON] ─── Item ({itemType.FullName}) serialize-методи ───");
+            bool Match(string ln) => ln.Contains("serial") || ln.Contains("save") || ln.Contains("load")
+                || ln.Contains("tostring") || ln.Contains("byte") || ln.Contains("write")
+                || ln.Contains("read") || ln.Contains("json") || ln.Contains("clone") || ln.Contains("copy");
+            for (var t = itemType; t != null && t != typeof(object); t = t.BaseType)
+            {
+                if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) break;
+                foreach (var m in t.GetMethods(flags | BindingFlags.Static | BindingFlags.DeclaredOnly))
+                {
+                    string ln = m.Name.ToLower();
+                    if (ln.StartsWith("get_") || ln.StartsWith("set_") || !Match(ln)) continue;
+                    var ps = string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name));
+                    Multiplayer.Log?.LogInfo($"[RECON]   {(m.IsStatic ? "static " : "")}{t.Name}.{m.Name}({ps}) -> {m.ReturnType?.Name}");
+                }
+            }
+
+            // GameRes (_params) — стан стадії. Як його перелічити/відтворити?
+            var paramsObj = itemType.GetField("_params", flags)?.GetValue(data);
+            if (paramsObj != null)
+            {
+                var gr = paramsObj.GetType();
+                Multiplayer.Log?.LogInfo($"[RECON] ─── GameRes ({gr.FullName}) поля+методи ───");
+                foreach (var fld in gr.GetFields(flags | BindingFlags.Static))
+                    Multiplayer.Log?.LogInfo($"[RECON]   поле: {fld.Name} ({fld.FieldType.Name})");
+                foreach (var m in gr.GetMethods(flags | BindingFlags.Static | BindingFlags.DeclaredOnly))
+                {
+                    string ln = m.Name.ToLower();
+                    if (ln.StartsWith("get_") || ln.StartsWith("set_")) continue;
+                    var ps = string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name));
+                    Multiplayer.Log?.LogInfo($"[RECON]   {gr.Name}.{m.Name}({ps}) -> {m.ReturnType?.Name}");
+                }
+            }
+
+            // ToJSON(ser_depth) — головний кандидат на транспорт стану. Пробуємо кілька
+            // глибин і ПОКАЗУЄМО повний JSON: треба та глибина, що включає _params
+            // (grave_top_stn_plate_1 тощо) ТА inventory частин. Зворотнє — JsonUtility.
+            var toJson = itemType.GetMethod("ToJSON", flags, null, new[] { typeof(int) }, null);
+            if (toJson != null)
+            {
+                foreach (int depth in new[] { 0, 1, 3, 8 })
+                {
+                    try
+                    {
+                        var r = toJson.Invoke(data, new object[] { depth }) as string;
+                        Multiplayer.Log?.LogInfo($"[RECON]   ToJSON({depth}) len={r?.Length}:");
+                        // лог по шматках ~400 символів (BepInEx ріже довге)
+                        for (int i = 0; r != null && i < r.Length; i += 400)
+                            Multiplayer.Log?.LogInfo($"[RECON]     {r.Substring(i, Math.Min(400, r.Length - i))}");
+                    }
+                    catch (Exception ie) { Multiplayer.Log?.LogInfo($"[RECON]   ToJSON({depth}) впав: {ie.InnerException?.Message ?? ie.Message}"); }
+                }
+            }
+            else Multiplayer.Log?.LogInfo("[RECON]   ToJSON(int) не знайдено");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] DumpItemSerializationApi: {e.Message}"); }
+    }
+
+    // B-2/підхід A: розвідка serialize-API для повної реплікації WGO. Шукаємо як з
+    // WorldGameObject зробити SerializableWGO (для передачі) — інверсію вже знайденого
+    // RestoreFromSerializedObject(SerializableWGO, bool). Дампить: WGO-методи зі словом
+    // "serial" або типом-результату Serializable*; конструктори+поля SerializableWGO;
+    // чи [Serializable] (чи можна гнати через BinaryFormatter як байти по дроту).
+    public static void DumpSerializationApi(MonoBehaviour wgo)
+    {
+        try
+        {
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var wgoType = wgo.GetType();
+
+            Multiplayer.Log?.LogInfo("[RECON] ─── SERIALIZE-API: WGO-методи (serial / →Serializable*) ───");
+            for (var t = wgoType; t != null && t != typeof(object); t = t.BaseType)
+            {
+                if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) break;
+                foreach (var m in t.GetMethods(flags | BindingFlags.DeclaredOnly))
+                {
+                    string ln = m.Name.ToLower();
+                    bool byName = ln.Contains("serial");
+                    bool byRet  = m.ReturnType != null && m.ReturnType.Name.IndexOf("Serializable", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!byName && !byRet) continue;
+                    var ps = string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name));
+                    Multiplayer.Log?.LogInfo($"[RECON]   {t.Name}.{m.Name}({ps}) -> {m.ReturnType?.Name}");
+                }
+            }
+
+            var swType = AccessTools.TypeByName("SerializableWGO");
+            if (swType == null) { Multiplayer.Log?.LogInfo("[RECON] SerializableWGO тип не знайдено"); return; }
+            Multiplayer.Log?.LogInfo($"[RECON] ─── SerializableWGO ({swType.FullName}) ───");
+            Multiplayer.Log?.LogInfo($"[RECON]   [Serializable]={swType.IsSerializable}");
+            foreach (var c in swType.GetConstructors(flags))
+            {
+                var ps = string.Join(", ", c.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name));
+                Multiplayer.Log?.LogInfo($"[RECON]   ctor({ps})");
+            }
+            foreach (var fld in swType.GetFields(flags))
+                Multiplayer.Log?.LogInfo($"[RECON]   поле: {fld.Name} ({fld.FieldType.Name})");
+            // Статичні фабрики/хелпери серіалізації по всьому типу теж корисні
+            foreach (var m in swType.GetMethods(flags | BindingFlags.Static | BindingFlags.DeclaredOnly))
+            {
+                var ps = string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name));
+                Multiplayer.Log?.LogInfo($"[RECON]   static {m.Name}({ps}) -> {m.ReturnType?.Name}");
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[RECON] DumpSerializationApi: {e.Message}"); }
+    }
+
     // Дамп УСІХ GameObject біля гравця (будь-який тип) з їхніми компонентами —
     // щоб знайти обʼєкти, що не є WorldGameObject (напр. колода). З F6.
     public static void DumpEverythingNearby()
@@ -3550,7 +3728,9 @@ public static class ChopRecon
         if (ft.IsPrimitive || ft.IsEnum || ft == typeof(string)) return false;
         if (val is UnityEngine.Object || val is System.Collections.IEnumerable) return false;
         string fn = f.Name.ToLower();
-        return fn == "data" || fn == "obj_data" || fn.Contains("savedata")
+        // Ловимо й `_data` (Item) — RECON 2026-06-05: стадія могили зберігається
+        // ВСЕРЕДИНІ обʼєкта саме тут. Старий `fn == "data"` не матчив підкреслення.
+        return fn.Contains("data")
             || ft.Name.IndexOf("Data", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
@@ -3579,6 +3759,10 @@ public static class WGOChopTracePatch
         "drop", "give", "loot", "resource", "kill", "death", "dead",
         "reward", "drain", "consume", "progress",
         "anim", "dying", "fall", "play", "tween", "state",
+        // B-2: могила — це крафт-інтеракція, а не hp. Ловимо крафт/частини/візуал
+        // та методи перебудови обʼєкта (ReplaceWithObject/SetObject/Reset/Init…).
+        "craft", "part", "wop", "inventory", "object", "reset", "init",
+        "build", "finish", "complete", "step",
     };
 
     static IEnumerable<MethodBase> TargetMethods()
@@ -3661,6 +3845,40 @@ public static class DoActionProbePatch
 // Дерево ідентифікуємо за позицією (unique_id різний на кожній машині). Лут
 // падає лише в того, хто реально рубав — приймач просто видаляє обʼєкт.
 // ═════════════════════════════════════════════════════════════════════════════
+
+// B-2 підхід A: SerializableWGO [Serializable], але містить Unity-структури
+// (Vector3 position/rotation-scale, Vector2 spawner_coords), які BinaryFormatter
+// сам не вміє. Сурогати навчають його (де)серіалізувати ці типи — і весь граф
+// SerializableWGO іде по дроту. Той самий патерн, що в save-системах на Unity.
+[Serializable] sealed class Vector3Surrogate : System.Runtime.Serialization.ISerializationSurrogate
+{
+    public void GetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c)
+    { var v = (Vector3)o; i.AddValue("x", v.x); i.AddValue("y", v.y); i.AddValue("z", v.z); }
+    public object SetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c, System.Runtime.Serialization.ISurrogateSelector s)
+    { return new Vector3(i.GetSingle("x"), i.GetSingle("y"), i.GetSingle("z")); }
+}
+[Serializable] sealed class Vector2Surrogate : System.Runtime.Serialization.ISerializationSurrogate
+{
+    public void GetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c)
+    { var v = (Vector2)o; i.AddValue("x", v.x); i.AddValue("y", v.y); }
+    public object SetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c, System.Runtime.Serialization.ISurrogateSelector s)
+    { return new Vector2(i.GetSingle("x"), i.GetSingle("y")); }
+}
+[Serializable] sealed class QuaternionSurrogate : System.Runtime.Serialization.ISerializationSurrogate
+{
+    public void GetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c)
+    { var q = (Quaternion)o; i.AddValue("x", q.x); i.AddValue("y", q.y); i.AddValue("z", q.z); i.AddValue("w", q.w); }
+    public object SetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c, System.Runtime.Serialization.ISurrogateSelector s)
+    { return new Quaternion(i.GetSingle("x"), i.GetSingle("y"), i.GetSingle("z"), i.GetSingle("w")); }
+}
+[Serializable] sealed class ColorSurrogate : System.Runtime.Serialization.ISerializationSurrogate
+{
+    public void GetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c)
+    { var col = (Color)o; i.AddValue("r", col.r); i.AddValue("g", col.g); i.AddValue("b", col.b); i.AddValue("a", col.a); }
+    public object SetObjectData(object o, System.Runtime.Serialization.SerializationInfo i, System.Runtime.Serialization.StreamingContext c, System.Runtime.Serialization.ISurrogateSelector s)
+    { return new Color(i.GetSingle("r"), i.GetSingle("g"), i.GetSingle("b"), i.GetSingle("a")); }
+}
+
 public static class ChopSync
 {
     // Поріг збігу позиції — трохи менше відстані між сусідніми деревами.
@@ -3676,6 +3894,48 @@ public static class ChopSync
     private static FieldInfo  _objDefField;             // WorldGameObject.obj_def
     private static FieldInfo  _variationField;          // WorldGameObject.variation
     private static MethodInfo _replaceWithObjectMethod; // WGO.ReplaceWithObject(string,bool,int)
+    private static MethodInfo _redrawPartMethod;        // WGO.RedrawPart(WorldObjectPart,string,string,int) — тригер зміни могили
+    // B-2 підхід A — повна реплікація обʼєкта (state replication):
+    private static Type       _serializableWgoType;     // SerializableWGO ([Serializable])
+    private static MethodInfo _fromWgoMethod;           // static SerializableWGO.FromWGO(wgo) → SerializableWGO
+    private static MethodInfo _restoreFromSerializedMethod; // WGO.RestoreFromSerializedObject(SerializableWGO, bool)
+    private static FieldInfo  _uniqueIdField;           // WGO.unique_id (long) — надійний матчинг цілі
+    private static FieldInfo  _swUniqueIdField;         // SerializableWGO.unique_id
+    private static FieldInfo  _swItemDataField;         // SerializableWGO.item_data (String) — компактний стан _data
+    private static FieldInfo  _swItemField;             // SerializableWGO.item (Item) — занулюємо, щоб restore читав item_data
+    private static FieldInfo  _swObjIdField;            // SerializableWGO.obj_id (String)
+    private static FieldInfo  _swVariationField;        // SerializableWGO.variation (Int32)
+    private static FieldInfo  _dataField;               // WGO._data (Item) — стан могили
+    private static MethodInfo _toJsonMethod;            // Item.ToJSON(int ser_depth) → JSON стану
+    private static MethodInfo _fromJsonOverwriteMethod; // UnityEngine.JsonUtility.FromJsonOverwrite(string, object)
+    // Дедуп стану могил за uid (обидва боки): не слати/не застосовувати ідентичний
+    // стан двічі — інакше дубль-тригери дають зайвий RestoreFromSerializedObject = мигання.
+    private static readonly Dictionary<long, string> _lastSentGraveSig = new Dictionary<long, string>();
+    private static readonly Dictionary<long, string> _lastAppliedGraveSig = new Dictionary<long, string>();
+    // DEDUP РЕ-ДРОПУ ЧАСТИН МОГИЛИ (фікс дюпу при co-dig, 2026-06-08): могила легітимно
+    // віддає кожну частину 1× на стадію. Доки набір частин (стадія) той самий, повторний
+    // 0x0B-дроп тієї ж частини = runaway-ре-дроп (restore регідратував _data при co-dig) →
+    // НЕ шлемо. Скидається коли стадія реально змінилась. uid→стадія, uid→вже-надіслані-id.
+    private static readonly Dictionary<long, string> _graveSentStageSig = new Dictionary<long, string>();
+    private static readonly Dictionary<long, HashSet<string>> _graveSentParts = new Dictionary<long, HashSet<string>>();
+    // ГАРД ВЛАСНИКА (2026-06-08): час останньої ГЕНУЇННОЇ локальної зміни стадії могили
+    // (realtimeSinceStartup; ставиться ПІСЛЯ echo-перевірки → луна сюди не пише). Якщо я
+    // нещодавно сам копав цю могилу — НЕ застосовую вхідний restore на неї (він би
+    // регідратував _data моєї активної могили → runaway ре-дроп). Лайв-тест 2026-06-08:
+    // машина слала стан 32763 (рядок 362) і за частку секунди застосувала вхідний (369) →
+    // runaway. Глядач генуїнних змін не робить (його тригери = луна, відсікаються) → вікно
+    // не оновлюється → він застосовує все. Це той самий сигнал, що раніше провалився ЛИШЕ
+    // через баг розташування (мітку ставив після дедуп-return → при стабільній стадії не оновлювалась).
+    private static readonly Dictionary<long, float> _lastLocalGraveDigTime = new Dictionary<long, float>();
+    private const float GRAVE_OWNER_WINDOW = 3f;
+    // АРТЕФАКТ RESTORE (фікс локальної піраміди в ГЛЯДАЧА, 2026-06-08): час останнього
+    // restore ПО uid. Якщо могилу нещодавно регідратували вхідним станом — її локальні
+    // grave-дропи = runaway-артефакт (гра ре-кидає частину після restore). Скасовуємо їх
+    // у Prefix DropItems. Owner-guard не дає restore на могилі яку Я копаю → recent-restore
+    // = я глядач, не копач (тож копачів лут не чіпаємо). Send-dedup був Postfix → локальний
+    // предмет уже спавнився; Prefix скасовує сам виклик гри = піраміди нема.
+    private static readonly Dictionary<long, float> _lastGraveRestoreTime = new Dictionary<long, float>();
+    private const float GRAVE_RESTORE_ARTIFACT_WINDOW = 8f;
     private static FieldInfo  _afterHp0Field;           // ObjectDefinition.after_hp_0
     private static MethodInfo _afterHp0GetValue;        // ChancedStringValue.GetValue(wgo,char)
     private static Type       _treeDisappearType;       // TreeDisappearAnimation (компонент дерева)
@@ -3725,6 +3985,30 @@ public static class ChopSync
         _replaceWithObjectMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
             .FirstOrDefault(m => m.Name == "ReplaceWithObject"
                               && m.GetParameters().Length == 3);
+        // B-2: візуальний перехід стадій могили. Трейс копання (2026-06-07) показав
+        // RedrawPart(WorldObjectPart wop, string id, string path, int n) — для під-частин
+        // wop==null (grave_bot_stn_1_stg_1, "objects/grave parts/"). Прямий метод-ефект,
+        // не потребує робочої сесії (на відміну від DoAction).
+        _redrawPartMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "RedrawPart"
+                              && m.GetParameters().Length == 4
+                              && m.GetParameters()[1].ParameterType == typeof(string));
+
+        // B-2 підхід A: serialize-API (RECON 2026-06-07). FromWGO(wgo) → SerializableWGO
+        // ([Serializable] → BinaryFormatter по дроту), RestoreFromSerializedObject застосовує
+        // ВЕСЬ стан (item/_data + візуал). unique_id для матчингу цілі (краще за позицію).
+        _uniqueIdField = _wgoType.GetField("unique_id", f);
+        _serializableWgoType = AccessTools.TypeByName("SerializableWGO");
+        _fromWgoMethod = _serializableWgoType?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .FirstOrDefault(m => m.Name == "FromWGO" && m.GetParameters().Length == 1);
+        _restoreFromSerializedMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "RestoreFromSerializedObject" && m.GetParameters().Length == 2);
+        _swUniqueIdField  = _serializableWgoType?.GetField("unique_id", f);
+        _swItemDataField  = _serializableWgoType?.GetField("item_data", f);
+        _swItemField      = _serializableWgoType?.GetField("item", f);
+        _swObjIdField     = _serializableWgoType?.GetField("obj_id", f);
+        _swVariationField = _serializableWgoType?.GetField("variation", f);
+        _dataField        = _wgoType.GetField("_data", f);
         _afterHp0Field   = AccessTools.TypeByName("ObjectDefinition")?.GetField("after_hp_0", f);
         _afterHp0GetValue = AccessTools.TypeByName("ChancedStringValue")?.GetMethods(f)
             .FirstOrDefault(m => m.Name == "GetValue" && m.GetParameters().Length == 2);
@@ -3741,6 +4025,10 @@ public static class ChopSync
         _itemCtor        = _itemType?.GetConstructor(new[] { typeof(string), typeof(int) });
         _itemIdField     = _itemType?.GetField("id", f);
         _itemValueField  = _itemType?.GetField("value", f);
+        _toJsonMethod    = _itemType?.GetMethod("ToJSON", f, null, new[] { typeof(int) }, null);
+        _fromJsonOverwriteMethod = AccessTools.TypeByName("UnityEngine.JsonUtility")
+            ?.GetMethod("FromJsonOverwrite", BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(string), typeof(object) }, null);
         _directionType   = AccessTools.TypeByName("Direction");
         _dropItemsMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
             .FirstOrDefault(m => m.Name == "DropItems" && m.GetParameters().Length == 2);
@@ -3823,6 +4111,17 @@ public static class ChopSync
                id.StartsWith("bush");
     }
 
+    // B-2: могили (grave*) — синк ВІЗУАЛУ стадій через 0x0D (реплей RedrawPart /
+    // ReplaceWithObject). Лут (включно з трупом) лишається на 0x0B. Окремо від
+    // transform(0x0A): могилу НЕ можна форс-ReplaceWithObject у after_hp_0 (порожній).
+    private static bool IsGraveTarget(MonoBehaviour wgo)
+    {
+        EnsureReflection();
+        if (!_ready || wgo == null) return false;
+        var id = _objIdField.GetValue(wgo) as string;
+        return id != null && id.StartsWith("grave");
+    }
+
     private static bool IsPlayerActor(MonoBehaviour actor)
     {
         if (actor == null) return false;
@@ -3870,6 +4169,158 @@ public static class ChopSync
         Multiplayer.Log?.LogInfo($"[CHOP] Обʼєкт відпрацьовано @({p.x:F1},{p.y:F1}) — транслюємо зміну стану");
     }
 
+    // ═══ B-2 (підхід A): ПОВНА РЕПЛІКАЦІЯ СТАНУ МОГИЛИ (0x0D) ════════════════════
+    // Тест #2 довів: реплей лише візуал-методу (RedrawPart) НЕ працює — `_data`
+    // приймача незмінний, тож щокадровий UpdateTransparentParts відкочує картинку.
+    // Рішення: серіалізувати ВЕСЬ WGO (FromWGO → SerializableWGO, [Serializable])
+    // і на приймачі RestoreFromSerializedObject — стан (item/_data) стає ідентичним,
+    // і та сама щокадрова перемалювка тепер малює ПРАВИЛЬНО (стає союзником). Той
+    // самий принцип, що передача сейву, але для 1 обʼєкта. Лут лишається на 0x0B.
+    // Тригер — RedrawPart/ReplaceWithObject (зміна стадії могили). Ідемпотентно:
+    // повторне відновлення того ж стану нешкідливе, тож дублі тригерів не страшні.
+    // Формат 0x0D: type(1) uid(8) x(4) y(4) blobLen(4) blob(BinaryFormatter SerializableWGO)
+    private static bool GraveStateReflectionReady() =>
+        _fromWgoMethod != null && _restoreFromSerializedMethod != null && _uniqueIdField != null
+        && _swObjIdField != null && _swItemField != null
+        && _dataField != null && _toJsonMethod != null;
+
+    // РОЗВІДКА ВЛАСНИКА (2026-06-08, ВІДКИНУТО): worker-поля WGO (_linked_worker/
+    // _has_linked_worker/linked_worker_unique_id/worker_unique_id) виявились ЗАВЖДИ
+    // порожні при тригері (лайв-тест: 0 непорожніх на обох машинах), а резолв uid
+    // гравця давав 0 → ідентичність як сигнал власності НЕ годиться. Лік дюпу зроблено
+    // інакше — echo-приглушення по підпису стадії (нижче), власник не потрібен.
+
+    // === ПІДПИС СТАДІЇ МОГИЛИ (2026-06-08) ===
+    // Сирий json має per-frame шум (для ОДНІЄЇ стадії: 13587/13587/13602… → копач слав
+    // 14 станів/могилу, глядач робив 13 RestoreFromSerializedObject = мигання рамки).
+    // Реальна стадія = obj_id + набір частин у _params (_res_type — ключі, _res_v —
+    // значення 1→0 коли частину викопано). Дедуп+echo-чек по цьому підпису: 1 відправка
+    // + 1 застосування на РЕАЛЬНУ стадію. Фолбек на повний json якщо _params не знайдено.
+    private static string GraveStageSig(string objId, string json)
+    {
+        string rt = ExtractJsonArray(json, "_res_type");
+        if (rt == null) return (objId ?? "") + "|" + json;  // фолбек: _params не знайдено
+        // Лишаємо ЛИШЕ ключі частин могили (grave*), відкидаємо волатильні параметри
+        // (decay/hp/hp_inited/inventory_size) + _res_v значення. Лайв-тест 2026-06-08
+        // довів: повний _res_type/_res_v нестабільний (decay міняється щомиті й по-різному
+        // на машинах) → DIAG-ECHO=0, дедуп/echo-приглушення не спрацьовували. Набір
+        // grave-частин СТАБІЛЬНИЙ у межах стадії й ОДНАКОВИЙ на обох машинах; викопано
+        // частину → ключ зникає (GameRes.RemoveZeroValues). Це і є справжня стадія.
+        var parts = new List<string>();
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(rt, "\"(grave[^\"]*)\""))
+            parts.Add(m.Groups[1].Value);
+        parts.Sort();
+        return (objId ?? "") + "|" + string.Join(",", parts);
+    }
+
+    // Витягує "[...]" одразу після ключа (перше входження). _res_type/_res_v — плоскі
+    // масиви (рядки/інти), без вкладених дужок, тож перша ']' закриває. null якщо нема.
+    private static string ExtractJsonArray(string json, string key)
+    {
+        if (string.IsNullOrEmpty(json)) return null;
+        int k = json.IndexOf(key, StringComparison.Ordinal);
+        if (k < 0) return null;
+        int open = json.IndexOf('[', k);
+        if (open < 0) return null;
+        int close = json.IndexOf(']', open);
+        if (close < 0) return null;
+        return json.Substring(open, close - open + 1);
+    }
+
+    // === МОНОТОННІСТЬ СТАДІЙ МОГИЛИ (2026-06-08, фікс leak B / дюпу) ===
+    // Копання могили НЕОБОРОТНЕ й завжди йде ВПЕРЕД: grave_ground (всі частини) → частини
+    // зникають по одній → grave_exhume → grave_empty. Тож вхідний стан, що ДОДАЄ частину
+    // назад або знижує obj_id, — це стейл/луна; його застосування регідратує _data
+    // активної могили → гра ре-кидає частину щокадру (лайв-тест 2026-06-08: 66 ре-дропів
+    // однієї плити = піраміда дюпу). Відхиляємо такі «назад»-стани на ЗАСТОСУВАННІ.
+    private static int GraveObjRank(string objId)
+    {
+        if (string.IsNullOrEmpty(objId)) return 0;
+        if (objId.StartsWith("grave_empty")) return 2;
+        if (objId.StartsWith("grave_exhume")) return 1;
+        return 0; // grave_ground та інші ранні під-стадії
+    }
+
+    // Набір ключів частин могили (grave_*) із сирого json стану (через _res_type).
+    private static HashSet<string> GraveParts(string json)
+    {
+        var set = new HashSet<string>();
+        string rt = ExtractJsonArray(json, "_res_type");
+        if (rt == null) return set;
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(rt, "\"(grave[^\"]*)\""))
+            set.Add(m.Groups[1].Value);
+        return set;
+    }
+
+    // Тригер зміни стадії могили → шлемо СТАН як JSON. Транспорт = Item.ToJSON(0)
+    // (RECON 2026-06-07: depth 0 = повний стан _data — _params частин + inventory;
+    // стискається зі стадіями 13587→...→732). Зворотнє на приймачі — JsonUtility.
+    // FromJsonOverwrite у локальний Item (типи/формули цілі лишаються валідні).
+    // Формат 0x0D: type(1) uid(8) x(4) y(4) variation(4) objIdLen(2) objId jsonLen(4) json
+    public static void OnLocalGraveStateChanged(MonoBehaviour wgo)
+    {
+        if (ApplyingRemoteChop || !Connected()) return;
+        if (!IsGraveTarget(wgo)) return;
+        EnsureReflection();
+        if (!GraveStateReflectionReady()) return;
+        try
+        {
+            var data = _dataField.GetValue(wgo);
+            if (data == null) return;
+            string json  = _toJsonMethod.Invoke(data, new object[] { 0 }) as string ?? "";
+            if (json.Length == 0) return;
+            string objId = _objIdField.GetValue(wgo) as string ?? "";
+            long uid     = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+
+            // Підпис СТАДІЇ (не сирий json — він має per-frame шум, лайв-тест 2026-06-08).
+            string sig = GraveStageSig(objId, json);
+
+            // ECHO-ПРИГЛУШЕННЯ (фікс дюпу): якщо це РІВНО та стадія, яку ми щойно отримали
+            // й застосували для цього uid — це наша ж луна (ми глядач), НЕ власна зміна.
+            // Не шлемо назад → петля копач↔глядач рветься в корені. Дюп луту (24 плити в
+            // месивному тесті) був НАСЛІДКОМ цієї петлі: копач застосовував відлунений стан
+            // на свою активну могилу → ре-кидав плиту. Echo-guard тут безсилий (луна =
+            // окремий мережевий пакет, не ре-ентрі в тім же кадрі). Лайв-тест 2026-06-08:
+            // глядач відлунював 1 стан, копач застосовував 1 — латентна петля, каскадила в месиві.
+            if (_lastAppliedGraveSig.TryGetValue(uid, out var appliedSig) && appliedSig == sig)
+                return;  // echo-приглушення: це наша ж луна (ми застосували цей стан як глядач)
+
+            // Сюди доходить лише ГЕНУЇННА локальна зміна (луну відсік echo-чек вище) → я
+            // активно копаю цю могилу. Оновлюємо вікно власника ЩОРАЗУ (до дедупу нижче, бо
+            // при стабільній стадії дедуп виходить раніше й мітка б протухала — це й був баг).
+            _lastLocalGraveDigTime[uid] = UnityEngine.Time.realtimeSinceStartup;
+
+            // ДЕДУП стадії: тригерів кілька (RedrawPart/OnWorkFinished/OnCraftStateChanged),
+            // частина ловить стейлову/проміжну стадію з мікро-різницею json. Шлемо лише коли
+            // РЕАЛЬНА стадія змінилась → 1 відправка/стадія (було ~14/могилу = мигання рамки).
+            if (_lastSentGraveSig.TryGetValue(uid, out var prev) && prev == sig) return;
+            _lastSentGraveSig[uid] = sig;
+
+            var p = wgo.transform.position;
+
+            var idB   = System.Text.Encoding.UTF8.GetBytes(objId);
+            var dataB = System.Text.Encoding.UTF8.GetBytes(json);
+            if (idB.Length > 65535) return;
+
+            var packet = new byte[25 + idB.Length + 4 + dataB.Length];
+            packet[0] = 0x0D;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            BitConverter.GetBytes(p.x).CopyTo(packet, 9);
+            BitConverter.GetBytes(p.y).CopyTo(packet, 13);
+            BitConverter.GetBytes(0).CopyTo(packet, 17);          // variation (резерв)
+            int off = 21;
+            BitConverter.GetBytes((ushort)idB.Length).CopyTo(packet, off); off += 2;
+            Buffer.BlockCopy(idB, 0, packet, off, idB.Length); off += idB.Length;
+            BitConverter.GetBytes(dataB.Length).CopyTo(packet, off); off += 4;
+            Buffer.BlockCopy(dataB, 0, packet, off, dataB.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            Multiplayer.Log?.LogInfo($"[CHOP] Могила uid={uid} obj={objId} — синк СТАНУ (json={dataB.Length}б)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalGraveStateChanged: {e.Message}"); }
+    }
+
     // ── Прийом 0x09: повторити удар (косметика — трясіння) ──────────────────
     public static void ApplyRemoteChop(float x, float y, float amount)
     {
@@ -3891,6 +4342,164 @@ public static class ChopSync
         try { _doActionMethod.Invoke(target, new object[] { localPlayer, amount }); }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] DoAction впав: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
+    }
+
+    // Пошук WGO за unique_id (надійніше за позицію — без epsilon-промахів). Кеш скану.
+    private static MonoBehaviour FindWgoByUniqueId(long uid)
+    {
+        EnsureReflection();
+        if (!_ready || _uniqueIdField == null) return null;
+        foreach (var comp in ScanWgosCached())
+        {
+            var mb = comp as MonoBehaviour;
+            if (mb == null) continue;
+            try { if (Convert.ToInt64(_uniqueIdField.GetValue(mb)) == uid) return mb; } catch { }
+        }
+        return null;
+    }
+
+    // ── Прийом 0x0D: реплікація стану могили через item_data ─────────────────────
+    // Знаходимо могилу за unique_id (fallback — позиція). Беремо ЛОКАЛЬНУ
+    // SerializableWGO цілі (FromWGO — з валідними формулами/посиланнями цієї машини),
+    // підміняємо лише item_data/obj_id/variation на отримані, item занулюємо (щоб
+    // restore відбудував _data з item_data), і RestoreFromSerializedObject. Echo-guard
+    // глушить зворотну трансляцію (restore смикне RedrawPart → Postfix вийде рано).
+    public static void ApplyRemoteGraveState(long uid, float x, float y,
+                                             string objId, int variation, string json)
+    {
+        EnsureReflection();
+        if (!_ready || !GraveStateReflectionReady()) return;
+
+        // ЗАХИСТ від псування: НЕ застосовуємо порожній стан (порожнім ми вже стирали
+        // _data → «No data» / порожні ями, лайв-тест 2026-06-07). Краще нічого.
+        if (string.IsNullOrEmpty(json))
+        {
+            Multiplayer.Log?.LogWarning($"[CHOP] 0x0D: json ПОРОЖНІЙ для uid={uid} — пропускаю (не псуємо могилу)");
+            return;
+        }
+
+        // РЕКОНСИЛЯЦІЯ ТЕРМІНАЛЬНОГО СТАНУ (фікс застряглої «-1» при co-dig, 2026-06-08):
+        // grave_empty — кінцевий стан (частин нема → runaway/ре-дроп неможливий). Тому його
+        // застосовуємо ЗАВЖДИ, в обхід owner-guard. При co-dig обидва owner-guard'и блокують
+        // стани одне одного → контестована могила розходиться й застрягає на grave_ground
+        // («-1» в обох — лайв-тест 2026-06-08). Щойно хтось ДОБИВАЄ її локально й шле empty —
+        // ця гілка форсовано зводить обидві сторони в порожній стан, розчепивши застрягання.
+        bool isTerminal = !string.IsNullOrEmpty(objId) && objId.StartsWith("grave_empty");
+
+        // ГАРД ВЛАСНИКА (фікс runaway-дюпу при co-dig тієї самої могили, 2026-06-08): якщо
+        // я САМ генуїнно копав цю могилу в межах GRAVE_OWNER_WINDOW — НЕ застосовую вхідний
+        // restore (крім термінального — він безпечний і потрібен для реконсиляції). Інакше
+        // restore регідратує _data моєї активної могили → гра ре-кидає частину десятки разів
+        // (лог: 88× plate/3.3с). Монотонність тут безсила (при co-dig стадії однакові).
+        if (!isTerminal
+            && _lastLocalGraveDigTime.TryGetValue(uid, out var dugAt)
+            && UnityEngine.Time.realtimeSinceStartup - dugAt < GRAVE_OWNER_WINDOW)
+            return;  // я активний копач цієї могили → не застосовую чужий restore (рехідратація → дюп)
+
+        var target = FindWgoByUniqueId(uid);
+        if (target == null)
+        {
+            target = FindTargetNear(x, y, out float dist, IsGraveTarget);
+            if (target == null || dist > POSITION_EPSILON)
+            {
+                Multiplayer.Log?.LogWarning($"[CHOP] 0x0D: могилу uid={uid} @({x:F1},{y:F1}) не знайдено " +
+                    $"(найближче: {(target != null ? dist.ToString("F1") : "немає")})");
+                return;
+            }
+        }
+
+        // ДЕДУП на приймачі по підпису СТАДІЇ (не сирий json — той самий шум). Та сама
+        // стадія для uid не застосовується двічі → 1 RestoreFromSerializedObject/стадію.
+        // ВАЖЛИВО: _lastAppliedGraveSig читає й echo-приглушення у OnLocalGraveStateChanged,
+        // тож підпис ОБОВ'ЯЗКОВО той самий (GraveStageSig) на обох шляхах.
+        string sig = GraveStageSig(objId, json);
+        if (_lastAppliedGraveSig.TryGetValue(uid, out var prevSig) && prevSig == sig) return;
+
+        // ГАРД МОНОТОННОСТІ (фікс leak B / дюпу, 2026-06-08): копання незворотне → НЕ
+        // застосовуємо стан, що йде «назад» відносно ЛОКАЛЬНОЇ могили (нижчий obj_id або
+        // додає частини, яких локально вже нема). Саме такий «назад»-restore регідратував
+        // _data → гра ре-кидала плиту щокадру (66 ре-дропів = піраміда). Читаємо живий стан
+        // цілі (істина цієї машини, а не _lastAppliedGraveSig — він стейл при власному копанні).
+        try
+        {
+            var locData = _dataField.GetValue(target);
+            string localJson  = locData != null ? _toJsonMethod.Invoke(locData, new object[] { 0 }) as string : null;
+            string localObjId = _objIdField.GetValue(target) as string;
+            if (!string.IsNullOrEmpty(localJson))
+            {
+                int inRank = GraveObjRank(objId), locRank = GraveObjRank(localObjId);
+                if (inRank < locRank) return;                                  // obj_id «назад» — стейл/луна
+                if (inRank == locRank && !GraveParts(json).IsSubsetOf(GraveParts(localJson)))
+                    return;                                                    // додає частини назад — ре-гідратація
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] 0x0D гард монотонності впав (застосовую далі): {e.Message}"); }
+
+        ApplyingRemoteChop = true;
+        try
+        {
+            // Локальна SerializableWGO цілі (валідні типи/формули цієї машини), у її
+            // Item вливаємо JSON стану відправника (FromJsonOverwrite → _params/inventory
+            // частин оновлюються, OnAfterDeserialize відбудовує вкладене). Підміняємо
+            // obj_id (для переходів grave_ground→exhume→empty). RestoreFromSerializedObject
+            // застосовує стан + перебудовує візуал одним викликом гри.
+            var sw = _fromWgoMethod.Invoke(null, new object[] { target });
+            if (sw == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: FromWGO(приймач) = null"); return; }
+            if (_fromJsonOverwriteMethod == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: JsonUtility.FromJsonOverwrite нема"); return; }
+            var item = _swItemField.GetValue(sw);
+            if (item != null)
+            {
+                _fromJsonOverwriteMethod.Invoke(null, new object[] { json, item });
+            }
+            else
+            {
+                // Запасний шлях: вливаємо просто в живий _data цілі.
+                var data = _dataField.GetValue(target);
+                if (data == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: _data цілі = null"); return; }
+                _fromJsonOverwriteMethod.Invoke(null, new object[] { json, data });
+                _swItemField.SetValue(sw, data);
+            }
+            if (!string.IsNullOrEmpty(objId)) _swObjIdField.SetValue(sw, objId);
+            _restoreFromSerializedMethod.Invoke(target, new object[] { sw, false });
+            _lastGraveRestoreTime[uid] = UnityEngine.Time.realtimeSinceStartup;  // per-uid: гасити runaway-дроп цієї могили в глядача
+            _lastAppliedGraveSig[uid] = sig;
+            // Термінальний стан: могила завершена → прибираємо все відстеження для uid, щоб
+            // нічого не висіло (owner-вікно, артефакт-restore, per-stage дедуп). Грейв спокійний.
+            if (isTerminal)
+            {
+                _lastLocalGraveDigTime.Remove(uid);
+                _lastGraveRestoreTime.Remove(uid);
+                _graveSentStageSig.Remove(uid);
+                _graveSentParts.Remove(uid);
+            }
+            Multiplayer.Log?.LogInfo($"[CHOP] Могила uid={uid} obj={objId} стан відновлено ✓ (json={json.Length}ch)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x0D RestoreFromSerializedObject впав: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+    }
+
+    // Розбір пакета 0x0D → ApplyRemoteGraveState.
+    public static void ParseAndApplyGraveOp(byte[] data)
+    {
+        if (data == null || data.Length < 25) { Multiplayer.Log?.LogWarning($"[CHOP] 0x0D замалий: {data?.Length}"); return; }
+        EnsureReflection();
+        if (!GraveStateReflectionReady()) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: serialize-API не готове"); return; }
+        try
+        {
+            long uid = BitConverter.ToInt64(data, 1);
+            float x  = BitConverter.ToSingle(data, 9);
+            float y  = BitConverter.ToSingle(data, 13);
+            int variation = BitConverter.ToInt32(data, 17);
+            int off  = 21;
+            int idLen = BitConverter.ToUInt16(data, off); off += 2;
+            if (off + idLen + 4 > data.Length) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D objId за межами"); return; }
+            string objId = System.Text.Encoding.UTF8.GetString(data, off, idLen); off += idLen;
+            int dataLen = BitConverter.ToInt32(data, off); off += 4;
+            if (dataLen < 0 || off + dataLen > data.Length) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D itemData за межами"); return; }
+            string itemData = System.Text.Encoding.UTF8.GetString(data, off, dataLen);
+            ApplyRemoteGraveState(uid, x, y, objId, variation, itemData);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ParseAndApplyGraveOp: {e.Message}"); }
     }
 
     // ── Прийом 0x0A: обʼєкт зрубано/розбито — прибираємо його тут ────────────
@@ -4040,6 +4649,76 @@ public static class ChopSync
         _itemType != null && _itemIdField != null && _itemValueField != null
         && _directionType != null && _dropItemsMethod != null;
 
+    // Освіжає owner-вікно могили на КОЖНОМУ тіку локальної роботи (DoAction щокадру поки
+    // тримаєш F). Критично: work-сесія (і перший шкідливий вхідний restore) починається
+    // РАНІШЕ за першу зміну стадії, тому ставити мітку лише в OnLocalGraveStateChanged пізно
+    // — restore встигав рехідратувати _data активної могили → смужка роботи застрягала повна
+    // й гра повторно «завершувала» роботу, видаючи gravestone знов і знов (лайв-тест Zonda
+    // 2026-06-08). Звідси: поки я САМ копаю могилу, owner-guard має блокувати ВСІ її restore.
+    public static void NoteLocalGraveWork(MonoBehaviour wgo)
+    {
+        if (ApplyingRemoteChop) return;   // це реплей, не моя робота — не вважати власником
+        EnsureReflection();
+        if (!_ready || wgo == null || _objIdField == null || _uniqueIdField == null) return;
+        var oid = _objIdField.GetValue(wgo) as string;
+        if (oid == null || !oid.StartsWith("grave")) return;
+        try { _lastLocalGraveDigTime[Convert.ToInt64(_uniqueIdField.GetValue(wgo))] = UnityEngine.Time.realtimeSinceStartup; }
+        catch { }
+    }
+
+    // Викликається з PREFIX DropItems. true → СКАСУВАТИ локальний дроп гри (і Postfix не
+    // транслює). Лікує локальну піраміду в ГЛЯДАЧА: після restore гра ре-кидає частину
+    // могили десятки разів (runaway). Postfix-дедуп ловив лише мережу, а предмет уже
+    // спавнився локально — тому рішення тут, ДО виклику гри.
+    // Логіка (лише для могил, лише генуїнні локальні дропи — реплей/restore-внутрішнє пускаємо):
+    //   • Я НЕ копаю цю могилу, але її нещодавно регідратували вхідним станом → артефакт
+    //     restore (owner-guard не дає restore на МОЮ активну могилу, тож recent-restore = я
+    //     глядач) → скасувати. Свою копію глядач дістає через реплей шеред-луту.
+    //   • Backstop: per-stage дедуп — кожну частину могила віддає 1× на стадію; повтор → скасувати.
+    public static bool ShouldSuppressGraveDrop(MonoBehaviour wgo, object itemsList)
+    {
+        if (ApplyingRemoteChop) return false;          // реплей шеред-луту / restore-внутрішнє — пускаємо
+        EnsureReflection();
+        if (!_ready || wgo == null || _objIdField == null || _uniqueIdField == null
+            || _toJsonMethod == null || _dataField == null) return false;
+        var oid = _objIdField.GetValue(wgo) as string ?? "";
+        if (!oid.StartsWith("grave")) return false;    // лише могили
+        long uid;
+        try { uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo)); } catch { return false; }
+
+        float now = UnityEngine.Time.realtimeSinceStartup;
+        bool amDigging = _lastLocalGraveDigTime.TryGetValue(uid, out var dugAt)
+                         && now - dugAt < GRAVE_OWNER_WINDOW;
+
+        // Артефакт restore у глядача: не я копаю + могилу щойно регідратували → runaway.
+        if (!amDigging && _lastGraveRestoreTime.TryGetValue(uid, out var rt)
+            && now - rt < GRAVE_RESTORE_ARTIFACT_WINDOW)
+            return true;
+
+        // Backstop per-stage: кожну частину 1× на стадію (на випадок якщо вікно артефакту
+        // протухло, а runaway триває; для копача — захист від повторів у межах стадії).
+        var gdata = _dataField.GetValue(wgo);
+        string stageSig = GraveStageSig(oid, gdata != null ? _toJsonMethod.Invoke(gdata, new object[] { 0 }) as string ?? "" : "");
+        if (!_graveSentStageSig.TryGetValue(uid, out var prevStage) || prevStage != stageSig)
+        {
+            _graveSentStageSig[uid] = stageSig;
+            _graveSentParts[uid] = new HashSet<string>();
+        }
+        var sent = _graveSentParts[uid];
+        bool anyNew = false;
+        var list = itemsList as System.Collections.IList;
+        if (list != null)
+            foreach (var it in list)
+            {
+                if (it == null) continue;
+                var id = _itemIdField.GetValue(it) as string;
+                if (string.IsNullOrEmpty(id)) continue;
+                if (!sent.Contains(id)) { anyNew = true; sent.Add(id); }
+            }
+        if (!anyNew && list != null && list.Count > 0) return true;  // повтор частини на стадії — runaway
+        return false;
+    }
+
     // Серіалізація: type(1) + x(4) + y(4) + dir(1) + count(1)
     //               + N * { idLen(1) + id(utf8) + value(4) }
     public static void OnLocalDropItems(MonoBehaviour wgo, object itemsList, object direction)
@@ -4069,6 +4748,9 @@ public static class ChopSync
                 payload += 1 + idBytes.Length + 4;
             }
             if (triples.Count == 0 || triples.Count > 255) return;
+            // Дедуп/придушення grave-runaway тепер у Prefix DropItems (ShouldSuppressGraveDrop):
+            // якщо локальний дроп придушено там, цей Postfix не викликається (прапор у патчі),
+            // тож сюди доходять лише легітимні дропи, які треба транслювати.
 
             var p = wgo.transform.position;
             byte dir = (byte)Convert.ToInt32(direction);
@@ -4088,11 +4770,6 @@ public static class ChopSync
             }
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
             Multiplayer.Log?.LogInfo($"[CHOP] Лут @({p.x:F1},{p.y:F1}) → {triples.Count} item(ів), dir={dir}");
-            // Тимчасова розвідка: які саме предмети шлемо (для body/риби/шкіри — чи
-            // приходять до приймача й чи нормально рендеряться)
-            var dbgIds = string.Join(", ",
-                triples.Select(kv => System.Text.Encoding.UTF8.GetString(kv.Key) + "=" + kv.Value));
-            Multiplayer.Log?.LogInfo($"[CHOP-DBG] send items: {dbgIds}");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalDropItems: {e.Message}"); }
     }
@@ -4114,7 +4791,6 @@ public static class ChopSync
 
             var listType = typeof(List<>).MakeGenericType(_itemType);
             var list = (System.Collections.IList)Activator.CreateInstance(listType);
-            var dbgIds = new List<string>(count);
             for (int i = 0; i < count; i++)
             {
                 if (off + 1 > data.Length) return false;
@@ -4123,12 +4799,9 @@ public static class ChopSync
                 string id = System.Text.Encoding.UTF8.GetString(data, off, idLen); off += idLen;
                 int val = BitConverter.ToInt32(data, off); off += 4;
                 list.Add(_itemCtor.Invoke(new object[] { id, val }));
-                dbgIds.Add(id + "=" + val);
             }
             itemsList = list;
             direction = Enum.ToObject(_directionType, (int)dir);
-            // Тимчасова розвідка (пара до [CHOP-DBG] send items на відправнику)
-            Multiplayer.Log?.LogInfo($"[CHOP-DBG] recv items @({x:F1},{y:F1}): {string.Join(", ", dbgIds)}");
             return true;
         }
         catch (Exception e)
@@ -4155,6 +4828,24 @@ public static class ChopSync
             }
             return;
         }
+
+        // ВЛАСНИК-ЛУТ (фікс 2× при co-dig тієї самої могили, 2026-06-08): якщо ціль —
+        // могила, яку я САМ зараз активно копаю (owner-вікно), НЕ реплею вхідний лут: я
+        // вже роблю власну копію цієї частини локально. Без цього co-dig дає по 2 копії на
+        // машину (своя + напарника). Нормальний спільний лут (один копає/другий дивиться)
+        // НЕ зачіпається: глядач не копає → owner-вікно порожнє → отримує копію як і раніше.
+        if (IsGraveTarget(target) && _uniqueIdField != null)
+        {
+            try
+            {
+                long guid = Convert.ToInt64(_uniqueIdField.GetValue(target));
+                if (_lastLocalGraveDigTime.TryGetValue(guid, out var dugAt)
+                    && UnityEngine.Time.realtimeSinceStartup - dugAt < GRAVE_OWNER_WINDOW)
+                    return;  // я сам копаю цю могилу → роблю свою копію, чужий лут не дублюю
+            }
+            catch { }
+        }
+
         InvokeDropItems(target, itemsList, direction);
     }
 
@@ -4189,9 +4880,27 @@ public static class ChopSync
         }
     }
 
+    // Кеш скану всіх WGO. FindObjectsOfType дуже дорогий (ітерує всю сцену),
+    // а при бурсті пакетів (напр. друг копає цілий цвинтар → 35 пакетів 0x0D)
+    // скан-на-кожен-пакет давав сильний лаг (лайв-тест 2026-06-07). Кешуємо
+    // результат на ~1с: бурст ділить один скан замість десятків. Посилання
+    // лишаються валідними крізь трансформацію (ReplaceWithObject ПЕРЕвикористовує
+    // той самий WGO, не знищує), а знищені обʼєкти ловить null-перевірка нижче.
+    private static UnityEngine.Object[] _wgoScanCache;
+    private static float _wgoScanCacheTime = -999f;
+    private static UnityEngine.Object[] ScanWgosCached()
+    {
+        if (_wgoScanCache == null || Time.time - _wgoScanCacheTime > 1f)
+        {
+            _wgoScanCache = UnityEngine.Object.FindObjectsOfType(_wgoType);
+            _wgoScanCacheTime = Time.time;
+        }
+        return _wgoScanCache;
+    }
+
     // Найближчий синхро-обʼєкт до точки (x,y) серед активних WGO. Predicate
     // визначає тип цілі: IsDestroySyncTarget для 0x09/0x0A, IsLootSyncTarget
-    // для 0x0B (ширший — пускає й жили).
+    // для 0x0B (ширший — пускає й жили), IsGraveTarget для 0x0D.
     private static MonoBehaviour FindTargetNear(float x, float y, out float bestDist,
                                                 Func<MonoBehaviour, bool> filter = null)
     {
@@ -4202,7 +4911,7 @@ public static class ChopSync
 
         MonoBehaviour best = null;
         var target = new Vector2(x, y);
-        foreach (var comp in UnityEngine.Object.FindObjectsOfType(_wgoType))
+        foreach (var comp in ScanWgosCached())
         {
             var mb = comp as MonoBehaviour;
             if (mb == null || !filter(mb)) continue;
@@ -4250,6 +4959,9 @@ public static class DoActionSyncPatch
         float amount;
         try { amount = Convert.ToSingle(__args[1]); } catch { return; }
         ChopSync.OnLocalChop(__instance, __args[0] as MonoBehaviour, amount);
+        // Щокадрова робота по могилі (тримання F) → освіжаємо owner-вікно з першого тіку,
+        // щоб вхідний restore не рехідратував активну могилу й не ламав work-сесію.
+        ChopSync.NoteLocalGraveWork(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
@@ -4268,8 +4980,26 @@ public static class DropItemsBroadcastPatch
             .FirstOrDefault(m => m.Name == "DropItems");
     }
 
+    // Прапор «локальний дроп скасовано в Prefix» — щоб Postfix не транслював те, чого гра
+    // не дропнула. Синхронно (Prefix→original→Postfix на одному потоці), плоский static ОК.
+    static bool _graveDropSuppressed;
+
+    // PREFIX: для grave-runaway скасовуємо САМ виклик гри (повертаємо false) → локальний
+    // предмет НЕ спавниться (лікує піраміду в глядача; Postfix цього не міг — предмет уже впав).
+    static bool Prefix(MonoBehaviour __instance, object[] __args)
+    {
+        _graveDropSuppressed = false;
+        if (__args != null && __args.Length >= 1 && ChopSync.ShouldSuppressGraveDrop(__instance, __args[0]))
+        {
+            _graveDropSuppressed = true;
+            return false;   // скасувати оригінальний DropItems
+        }
+        return true;
+    }
+
     static void Postfix(MonoBehaviour __instance, object[] __args)
     {
+        if (_graveDropSuppressed) { _graveDropSuppressed = false; return; }  // дроп скасовано → не транслюємо
         // Порядок важливий: ЛУТ (0x0B) шлемо ПЕРШИМ, зміну стану (0x0A) — другою.
         // Пакети reliable+ordered (k_EP2PSendReliable), тож приймач застосує лут
         // поки обʼєкт ще на місці, і лише тоді його трансформує. Інакше для природи
@@ -4278,6 +5008,84 @@ public static class DropItemsBroadcastPatch
         if (__args != null && __args.Length >= 2)
             ChopSync.OnLocalDropItems(__instance, __args[0], __args[1]);
         ChopSync.OnTreeFelled(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// B-2: відправка візуальних стадій могили. ReplaceWithObject ловить переходи
+// obj_id (grave_ground→exhume→empty); фільтр newId.StartsWith("grave") відсікає
+// дерева→пеньки. Postfix не міняє локальну поведінку.
+[HarmonyPatch]
+public static class GraveReplaceSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "ReplaceWithObject"
+                              && m.GetParameters().Length == 3);
+    }
+
+    static void Postfix(MonoBehaviour __instance)
+    {
+        // Тригер зміни стадії могили → синк ПОВНОГО стану (підхід A). Фільтр grave*
+        // усередині OnLocalGraveStateChanged (відсікає дерева→пеньки).
+        ChopSync.OnLocalGraveStateChanged(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// B-2: тригер зміни стадії могили — RedrawPart фіксує КОЖНУ візуальну зміну
+// (під-частини + внутрішні при ReplaceWithObject). У відповідь шлемо ПОВНИЙ стан
+// (підхід A). Дублі з GraveReplaceSyncPatch нешкідливі (відновлення ідемпотентне).
+[HarmonyPatch]
+public static class GraveRedrawSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "RedrawPart"
+                              && m.GetParameters().Length == 4
+                              && m.GetParameters()[1].ParameterType == typeof(string));
+    }
+
+    static void Postfix(MonoBehaviour __instance)
+    {
+        ChopSync.OnLocalGraveStateChanged(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// B-2 ФІКС «стадія відстає»: RedrawPart спрацьовує ДО оновлення _data (ланцюг:
+// DropItems→OnCraftStateChanged→RedrawPart→OnWorkFinished), тож той тригер ловив
+// ПОПЕРЕДНЮ стадію. OnWorkFinished/OnCraftStateChanged спрацьовують ПІСЛЯ оновлення
+// _data → ловимо свіжий стан. Пакети reliable+ordered, тож фінальний стан приходить
+// останнім. Ідемпотентно (повне відновлення), фільтр grave* усередині.
+[HarmonyPatch]
+public static class GraveWorkSyncPatch
+{
+    static IEnumerable<MethodBase> TargetMethods()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        if (wgo == null) yield break;
+        var flags = BindingFlags.Public | BindingFlags.NonPublic |
+                    BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        foreach (var name in new[] { "OnWorkFinished", "OnCraftStateChanged" })
+        {
+            var m = wgo.GetMethods(flags).FirstOrDefault(x => x.Name == name && x.GetParameters().Length == 0);
+            if (m != null) yield return m;
+        }
+    }
+
+    static void Postfix(MonoBehaviour __instance)
+    {
+        ChopSync.OnLocalGraveStateChanged(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
