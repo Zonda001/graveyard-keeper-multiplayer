@@ -444,6 +444,11 @@ public class Multiplayer : BaseUnityPlugin
         //      знімків покаже поле, що кодує стадію (його й синкатимемо замість 0x0D).
         if (Input.GetKeyDown(KeyCode.F4))
             ChopRecon.CaptureNearestGrave();
+
+        // F3 — РОЗВІДКА UID ДРОПІВ (ідея Zonda): стань біля трупа на землі → дамп усіх полів
+        //      дропа+Item. Зніми на ОБОХ машинах для ОДНОГО трупа → порівняй *id/*uid (★).
+        if (Input.GetKeyDown(KeyCode.F3))
+            ChopRecon.DumpNearestBodyDrop();
     }
 
     // ── Спавн клону іншого гравця (мережевий) ────────────────────────────────
@@ -1001,8 +1006,77 @@ public class Multiplayer : BaseUnityPlugin
                 Logger.LogInfo("[P2] overhead_obj: виправлено magenta -> white");
             }
             sr.enabled = false;
+            _remoteOverheadRenderer = sr;   // кеш для показу носіння (0x12/0x13)
             break;
         }
+    }
+
+    // ── Показ предмета над головою КЛОНА напарника (синк носіння overhead) ───────────
+    private SpriteRenderer _remoteOverheadRenderer;
+
+    private SpriteRenderer RemoteOverheadRenderer()
+    {
+        if (_remoteOverheadRenderer != null) return _remoteOverheadRenderer;
+        if (_remotePlayerGO == null) return null;
+        foreach (var sr in _remotePlayerGO.GetComponentsInChildren<SpriteRenderer>(true))
+            if (sr.gameObject.name == "overhead_obj") { _remoteOverheadRenderer = sr; break; }
+        return _remoteOverheadRenderer;
+    }
+
+    // Аніматор персонажа клона (для пози носіння через float "walk_type_f").
+    private Animator _remoteAnimator;
+    private Animator RemoteCharAnimator()
+    {
+        if (_remoteAnimator != null) return _remoteAnimator;
+        if (_remotePlayerGO == null) return null;
+        // Шукаємо аніматор, що має параметр walk_type_f (головний аніматор персонажа).
+        foreach (var an in _remotePlayerGO.GetComponentsInChildren<Animator>(true))
+        {
+            if (an.runtimeAnimatorController == null) continue;
+            foreach (var p in an.parameters)
+                if (p.name == "walk_type_f") { _remoteAnimator = an; return _remoteAnimator; }
+        }
+        return _remoteAnimator;
+    }
+
+    // Поза носіння на клоні: SetWalkAnimationType у грі = animator.SetFloat("walk_type_f", x).
+    // Standard=0, OverheadItem=0.1 (руки вгору, притримує), WithTool=-0.1.
+    private void SetRemoteWalkType(float v)
+    {
+        var an = RemoteCharAnimator();
+        if (an == null) { Logger.LogWarning("[CHOP] аніматор клона з walk_type_f не знайдено"); return; }
+        try { an.SetFloat("walk_type_f", v); } catch { }
+    }
+
+    // Напарник підняв важкий предмет → показати його над головою його клона + поза носіння.
+    public void SetRemoteOverhead(string icon)
+    {
+        var sr = RemoteOverheadRenderer();
+        if (sr == null) { Logger.LogWarning("[CHOP] overhead клона не знайдено"); return; }
+        try
+        {
+            var esc = AccessTools.TypeByName("EasySpritesCollection");
+            var getSprite = esc?.GetMethod("GetSprite", BindingFlags.Public | BindingFlags.Static);
+            var sprite = getSprite?.Invoke(null, new object[] { icon, false, "" });
+            sr.sprite = sprite as Sprite;
+            sr.color = Color.white;
+            sr.enabled = sr.sprite != null;
+            sr.gameObject.SetActive(true);
+            SetRemoteWalkType(0.1f);   // поза OverheadItem — клон тримає предмет руками
+            Logger.LogInfo($"[CHOP] Overhead клона: показано icon={icon} + поза носіння ✓");
+        }
+        catch (Exception e) { Logger.LogError($"[CHOP] SetRemoteOverhead впав: {e.Message}"); }
+    }
+
+    // Напарник поклав/кинув → прибрати предмет над головою його клона + звичайна поза.
+    public void ClearRemoteOverhead()
+    {
+        SetRemoteWalkType(0f);   // повернути Standard-позу
+        var sr = RemoteOverheadRenderer();
+        if (sr == null) return;
+        sr.sprite = null;
+        sr.enabled = false;
+        Logger.LogInfo("[CHOP] Overhead клона: прибрано + поза Standard");
     }
 
     private void EnableAnimations(GameObject obj)
@@ -1979,6 +2053,9 @@ public class SteamManager : MonoBehaviour
                 SendTimeSync();
             }
 
+            // Переносимий труп: щокадрове відстеження руху (внутрішній throttle на відправку).
+            ChopSync.TickCarriedBodies();
+
             // Дерева, зрубані поки ми були в іншій локації — пробуємо знищити,
             // коли гравець дійде до них і вони завантажаться.
             _chopRetryTimer += Time.deltaTime;
@@ -2229,6 +2306,59 @@ public class SteamManager : MonoBehaviour
             // ── Візуальна стадія могили на іншій машині (RedrawPart/ReplaceWithObject) ─
             _logger.LogInfo($"[CHOP] Віддалена стадія могили (0x0D, {data.Length}б)");
             ChopSync.ParseAndApplyGraveOp(data);
+        }
+        else if (type == 0x0F)
+        {
+            // ── Позиція переносимого трупа (носій рухає → глядач дзеркалить) ──────
+            // type(1) uid(8) x(4) y(4)
+            if (data.Length < 17) { _logger.LogWarning($"[CHOP] 0x0F замалий ({data.Length})"); return; }
+            long buid = BitConverter.ToInt64(data, 1);
+            float bx = BitConverter.ToSingle(data, 9);
+            float by = BitConverter.ToSingle(data, 13);
+            ChopSync.ApplyRemoteBodyPos(buid, bx, by);
+        }
+        else if (type == 0x10)
+        {
+            // ── Труп прибрано (покладено в могилу/спожито) → глядач чисто видаляє ──
+            // type(1) uid(8)
+            if (data.Length < 9) { _logger.LogWarning($"[CHOP] 0x10 замалий ({data.Length})"); return; }
+            long ruid = BitConverter.ToInt64(data, 1);
+            _logger.LogInfo($"[CHOP] Труп uid={ruid} прибрано напарником (0x10)");
+            ChopSync.ApplyRemoteBodyRemove(ruid);
+        }
+        else if (type == 0x11)
+        {
+            // ── Спавн трупа на граві глядача через DropItem (непідбірний переносимий) ──
+            // type(1) graveUid(8) dir(4) x(4) y(4) z(4) i3(4) b4(1) jsonLen(4) json
+            if (data.Length < 34) { _logger.LogWarning($"[CHOP] 0x11 замалий ({data.Length})"); return; }
+            long guid = BitConverter.ToInt64(data, 1);
+            int  cdir = BitConverter.ToInt32(data, 9);
+            float cx = BitConverter.ToSingle(data, 13);
+            float cy = BitConverter.ToSingle(data, 17);
+            float cz = BitConverter.ToSingle(data, 21);
+            float cforce = BitConverter.ToSingle(data, 25);
+            bool cb4 = data[29] != 0;
+            int  cjl = BitConverter.ToInt32(data, 30);
+            string cjson = (cjl > 0 && data.Length >= 34 + cjl)
+                ? System.Text.Encoding.UTF8.GetString(data, 34, cjl) : "";
+            _logger.LogInfo($"[CHOP] Спавн трупа від напарника uid={guid} json={cjl}б (0x11)");
+            ChopSync.ApplyRemoteCorpseSpawn(guid, cdir, cx, cy, cz, cforce, cb4, cjson);
+        }
+        else if (type == 0x12)
+        {
+            // ── Напарник несе важкий предмет над головою → показати на його клоні ──
+            // type(1) iconLen(1) icon(utf8)
+            if (data.Length < 2) return;
+            int il = data[1];
+            string icon = (data.Length >= 2 + il) ? System.Text.Encoding.UTF8.GetString(data, 2, il) : "";
+            _logger.LogInfo($"[CHOP] Напарник несе overhead icon={icon} (0x12)");
+            Multiplayer.Instance?.SetRemoteOverhead(icon);
+        }
+        else if (type == 0x13)
+        {
+            // ── Напарник поклав/кинув → прибрати overhead із клона ──
+            _logger.LogInfo("[CHOP] Напарник поклав overhead (0x13)");
+            Multiplayer.Instance?.ClearRemoteOverhead();
         }
     }
 
@@ -3699,6 +3829,70 @@ public static class ChopRecon
     }
 
     // Дамп полів об'єкта по ієрархії його ігрових типів (без Unity-бази).
+    // РОЗВІДКА UID ДРОПІВ (ідея Zonda 2026-06-09): чи має рантайм-дроп (труп) СТАБІЛЬНИЙ uid,
+    // ОДНАКОВИЙ на обох машинах? Якщо так — універсальний синк дропів за uid без grave-anchor
+    // (двері до загального синку). F3: стань біля трупа на землі → дамп усіх полів дропа +
+    // вкладеного Item (2 рівні). Зніми на ОБОХ машинах для ОДНОГО трупа → порівняй *id/*uid.
+    public static void DumpNearestBodyDrop()
+    {
+        var t = AccessTools.TypeByName("DropResGameObject");
+        if (t == null) { Multiplayer.Log?.LogWarning("[RECON-DROP] тип DropResGameObject не знайдено"); return; }
+        MonoBehaviour best = null; float bestD = float.MaxValue;
+        foreach (var c in UnityEngine.Object.FindObjectsOfType(t))
+        {
+            var mb = c as MonoBehaviour;
+            if (mb == null || DropId(mb) != "body") continue;
+            float d = Camera.main != null
+                ? Vector3.Distance(mb.transform.position, Camera.main.transform.position) : 0f;
+            if (d < bestD) { bestD = d; best = mb; }
+        }
+        if (best == null) { Multiplayer.Log?.LogWarning("[RECON-DROP] трупа-дропа поблизу немає (стань біля трупа на землі)"); return; }
+        Multiplayer.Log?.LogInfo($"[RECON-DROP] ===== Труп go={best.gameObject.name} instId={best.GetInstanceID()} " +
+            $"pos=({best.transform.position.x:F1},{best.transform.position.y:F1}) =====");
+        DumpFieldsDeep(best, "drop.", 0);
+    }
+
+    // Читає id Item з DropResGameObject (поле типу з .id:string).
+    private static string DropId(MonoBehaviour drop)
+    {
+        if (drop == null) return null;
+        foreach (var f in drop.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            object v; try { v = f.GetValue(drop); } catch { continue; }
+            var idF = v?.GetType().GetField("id");
+            if (idF != null && idF.FieldType == typeof(string)) return idF.GetValue(v) as string;
+        }
+        return null;
+    }
+
+    // Глибокий дамп (2 рівні): усі поля об'єкта + вкладені reference-поля (Item тощо), щоб
+    // побачити будь-які *id/*uid. Окремо помічає поля з "id"/"uid" у назві маркером ★.
+    private static void DumpFieldsDeep(object obj, string prefix, int depth)
+    {
+        if (obj == null || depth > 2) return;
+        var seen = new HashSet<string>();
+        for (var t = obj.GetType(); t != null && t != typeof(object); t = t.BaseType)
+        {
+            if (t.Namespace != null && t.Namespace.StartsWith("UnityEngine")) break;
+            foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic |
+                                          BindingFlags.Instance | BindingFlags.DeclaredOnly))
+            {
+                if (!seen.Add(f.Name)) continue;
+                object val; try { val = f.GetValue(obj); } catch { val = "<err>"; }
+                string fl = f.Name.ToLower();
+                string mark = (fl.Contains("id") || fl.Contains("uid") || fl.Contains("guid")) ? " ★" : "";
+                Multiplayer.Log?.LogInfo($"[RECON-DROP]   {prefix}{f.Name} ({f.FieldType.Name}) = {Format(val)}{mark}");
+                if (depth < 2 && val != null)
+                {
+                    var vt = val.GetType();
+                    if (!vt.IsPrimitive && !vt.IsEnum && vt != typeof(string) &&
+                        !(val is UnityEngine.Object) && !(val is System.Collections.IEnumerable))
+                        DumpFieldsDeep(val, prefix + f.Name + ".", depth + 1);
+                }
+            }
+        }
+    }
+
     private static void DumpFields(object obj, int depth, string prefix)
     {
         if (obj == null || depth > 1) return;
@@ -3791,6 +3985,145 @@ public static class WGOChopTracePatch
             ? string.Join(", ", __args.Select(a => a?.ToString() ?? "null"))
             : "";
         Multiplayer.Log?.LogInfo($"[RECON-TRACE] {__originalMethod.Name}({args})");
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// РОЗВІДКА ПІДБИРАННЯ ТРУПА (2026-06-08): спавн розшифровано — труп іде через WGO.DropItem
+// (однина, id=body). Тепер треба знайти МЕТОД ПІДБИРАННЯ (труп беруть ВРУЧНУ колізією, не
+// авто-магнітом — можливо НЕ CollectDrop). Цей патч трасує методи DropResGameObject з назвами
+// collect/pick/take/grab/catch/fly/destroy/remove + дампить id дропу та стек. Гейт —
+// ChopRecon.TraceEnabled (F5). Цикл (СОЛО): F5 → підняти труп з землі → у логі [CORPSE-PICK]
+// метод+стек. Це фундамент синку підбирання (опора C / інвентар).
+[HarmonyPatch]
+public static class CorpsePickupTracePatch
+{
+    static readonly string[] Keywords =
+        { "collect", "pick", "take", "grab", "catch", "fly", "destroy", "remove", "give" };
+
+    static IEnumerable<MethodBase> TargetMethods()
+    {
+        var t = AccessTools.TypeByName("DropResGameObject");
+        if (t == null) yield break;
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        var seen = new HashSet<string>();
+        for (var ty = t; ty != null && ty != typeof(MonoBehaviour) && ty != typeof(object); ty = ty.BaseType)
+            foreach (var m in ty.GetMethods(flags))
+            {
+                if (m.IsAbstract || m.IsGenericMethodDefinition || m.GetMethodBody() == null) continue;
+                string ln = m.Name.ToLower();
+                if (ln.StartsWith("get_") || ln.StartsWith("set_")) continue;
+                if (!Keywords.Any(k => ln.Contains(k))) continue;
+                if (seen.Add(m.Name)) yield return m;
+            }
+    }
+
+    static void Prefix(MonoBehaviour __instance, MethodBase __originalMethod)
+    {
+        if (!ChopRecon.TraceEnabled || __instance == null) return;
+        try
+        {
+            string id = "?";
+            foreach (var f in __instance.GetType().GetFields(
+                         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+            {
+                var v = f.GetValue(__instance);
+                var idF = v?.GetType().GetField("id");
+                if (idF != null && idF.FieldType == typeof(string))
+                { id = idF.GetValue(v) as string ?? "?"; break; }
+            }
+            var stack = string.Join("\n", (Environment.StackTrace ?? "").Split('\n').Skip(2).Take(12));
+            Multiplayer.Log?.LogInfo($"[CORPSE-PICK] {__originalMethod.Name} id={id} go={__instance.gameObject.name}\n{stack}");
+        }
+        catch { }
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// РОЗВІДКА РЕ-ДРОПУ/НОСІННЯ ТРУПА (2026-06-09): труп — ПЕРЕНОСИМИЙ (при підборі НЕ
+// знищується, несеться). Треба знайти (а) метод узяття в руки, (б) метод ВИКИДАННЯ з рук —
+// re-drop НЕ йде через WGO.DropItem (підтверджено логом: повторний труп не з'явився, 0 хуків).
+// Трасуємо методи WorldGameObject з назвами hand/throw/put/place/drop (окрім DropItem/DropItems,
+// що вже хукнуті) + дампимо типи аргументів і Item.id. Гейт F5. Той самий безпечний патерн, що
+// й CorpsePickupTracePatch (попередній варіант падав на патчі Unity-повідомлень OnDestroy).
+[HarmonyPatch]
+public static class CorpseHandsTracePatch
+{
+    static readonly string[] Keywords = { "hand", "throw", "put", "place", "drop" };
+
+    static IEnumerable<MethodBase> TargetMethods()
+    {
+        var t = AccessTools.TypeByName("WorldGameObject");
+        if (t == null) yield break;
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        var seen = new HashSet<string>();
+        foreach (var m in t.GetMethods(flags))
+        {
+            if (m.IsAbstract || m.IsGenericMethodDefinition || m.GetMethodBody() == null) continue;
+            string ln = m.Name.ToLower();
+            if (ln.StartsWith("get_") || ln.StartsWith("set_")) continue;
+            if (m.Name == "DropItem" || m.Name == "DropItems") continue;   // вже хукнуті окремо
+            if (!Keywords.Any(k => ln.Contains(k))) continue;
+            if (m.GetParameters().Length > 5) continue;
+            if (seen.Add(m.Name)) yield return m;
+        }
+    }
+
+    static void Prefix(MonoBehaviour __instance, object[] __args, MethodBase __originalMethod)
+    {
+        if (!ChopRecon.TraceEnabled) return;
+        try
+        {
+            var parts = new List<string>();
+            if (__args != null)
+                foreach (var a in __args)
+                {
+                    if (a == null) { parts.Add("null"); continue; }
+                    var idF = a.GetType().GetField("id");
+                    string idv = (idF != null && idF.FieldType == typeof(string)) ? (idF.GetValue(a) as string) : null;
+                    parts.Add(idv != null ? $"{a.GetType().Name}(id={idv})" : a.GetType().Name);
+                }
+            var stack = string.Join("\n", (Environment.StackTrace ?? "").Split('\n').Skip(2).Take(10));
+            Multiplayer.Log?.LogInfo($"[CORPSE-HANDS] {__originalMethod.Name}({string.Join(", ", parts)})\n{stack}");
+        }
+        catch { }
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// РОЗВІДКА #3: чи CanPickupWithInteraction справді ПІДБИРАЄ (повертає true в мить забору)
+// чи лише щокадрова перевірка. Логуємо __result (гейт F5).
+[HarmonyPatch]
+public static class CanPickupReturnReconPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("DropResGameObject");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "CanPickupWithInteraction");
+    }
+
+    static void Postfix(MonoBehaviour __instance, object __result)
+    {
+        if (!ChopRecon.TraceEnabled || __instance == null) return;
+        try
+        {
+            string id = "?";
+            foreach (var f in __instance.GetType().GetFields(
+                         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+            {
+                var v = f.GetValue(__instance);
+                var idF = v?.GetType().GetField("id");
+                if (idF != null && idF.FieldType == typeof(string))
+                { id = idF.GetValue(v) as string ?? "?"; break; }
+            }
+            Multiplayer.Log?.LogInfo($"[CORPSE-CANPICK] id={id} result={__result}");
+        }
+        catch { }
     }
 
     static Exception Finalizer(Exception __exception) => null;
@@ -3947,6 +4280,8 @@ public static class ChopSync
     private static FieldInfo  _itemValueField;          // Item.value (int)
     private static Type       _directionType;           // Direction (enum)
     private static MethodInfo _dropItemsMethod;         // WGO.DropItems(List<Item>, Direction)
+    private static MethodInfo _dropItemSingularMethod;  // WGO.DropItem(Item, Direction, Vector3, float, bool)
+    private static MethodInfo _getOverheadIconMethod;   // Item.GetOverheadIcon() → назва спрайта над головою
     private static bool       _ready;
 
     private static MonoBehaviour _cachedLocalPlayerWgo;
@@ -4025,6 +4360,7 @@ public static class ChopSync
         _itemCtor        = _itemType?.GetConstructor(new[] { typeof(string), typeof(int) });
         _itemIdField     = _itemType?.GetField("id", f);
         _itemValueField  = _itemType?.GetField("value", f);
+        _getOverheadIconMethod = _itemType?.GetMethod("GetOverheadIcon", f, null, Type.EmptyTypes, null);
         _toJsonMethod    = _itemType?.GetMethod("ToJSON", f, null, new[] { typeof(int) }, null);
         _fromJsonOverwriteMethod = AccessTools.TypeByName("UnityEngine.JsonUtility")
             ?.GetMethod("FromJsonOverwrite", BindingFlags.Public | BindingFlags.Static,
@@ -4032,6 +4368,12 @@ public static class ChopSync
         _directionType   = AccessTools.TypeByName("Direction");
         _dropItemsMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
             .FirstOrDefault(m => m.Name == "DropItems" && m.GetParameters().Length == 2);
+        // Singular DropItem(Item, Direction, Vector3, int, bool) — спавн ПЕРЕНОСИМОГО трупа
+        // (на відміну від DropItems-множини, що робить авто-збиральний лут). Для реплею на глядача.
+        _dropItemSingularMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DropItem"
+                              && m.GetParameters().Length >= 1
+                              && m.GetParameters()[0].ParameterType.Name == "Item");
 
         _ready = _objIdField != null && _doActionMethod != null;
         if (!_ready)
@@ -4719,7 +5061,123 @@ public static class ChopSync
         return false;
     }
 
-    // Серіалізація: type(1) + x(4) + y(4) + dir(1) + count(1)
+    // ТРУП — ЄДИНИЙ ХУК на `DropResGameObject.Drop` (статичний): спільний шлях УСІХ спавнів трупа —
+    // і ексгумація (WGO.DropItem→Drop), і кидок із рук (DropOverheadItem→Drop напряму). Раніше
+    // хукали лише WGO.DropItem → кидок із рук не ловився, труп зникав у напарника. Тепер ловимо все.
+    // Реєструємо ТОЧНИЙ заспавнений GO (__result) — без сканування «найближчого». uid синтетичний
+    // (Ticks, унікальний на власника; передається в 0x11, приймач використовує його як ключ). Стан
+    // тіла (органи+freshness) їде в JSON (ToJSON(0)). Пакет 0x11: type uid dir x y z force b4 jsonLen json.
+    public static void OnCorpseDropped(object[] dropArgs, object resultGO)
+    {
+        EnsureReflection();
+        if (!DropReflectionReady() || dropArgs == null || dropArgs.Length < 2) return;
+        var item = dropArgs[1];                                   // Drop(pos, Item, parent, dir, force, curve, walls, stacked)
+        if (item == null || (_itemIdField.GetValue(item) as string) != "body") return;
+        var go = resultGO as MonoBehaviour;
+        if (go == null) return;
+
+        if (ApplyingRemoteChop)
+        {
+            // Це наш реплей (ApplyRemoteCorpseSpawn) → реєструємо під переданим uid, owner=False.
+            long ruid = _incomingCorpseUid ?? DateTime.UtcNow.Ticks;
+            RegisterCorpseBodyGO(go, ruid, owner: false);
+            return;
+        }
+        if (!Connected()) return;
+
+        // Локальний спавн (ексгумація АБО кидок із рук) → новий uid, реєстрація власника, 0x11.
+        long uid = DateTime.UtcNow.Ticks;
+        RegisterCorpseBodyGO(go, uid, owner: true);
+
+        var pos = go.transform.position;                          // фактична позиція заспавненого трупа
+        int dir = (dropArgs.Length > 3 && dropArgs[3] != null) ? Convert.ToInt32(dropArgs[3]) : 0;
+        float force = (dropArgs.Length > 4 && dropArgs[4] != null) ? Convert.ToSingle(dropArgs[4]) : 1f;
+        bool walls = false;                                       // приймач спавнить ТОЧНО на pos (без репозиції)
+        string json = "";
+        try { if (_toJsonMethod != null) json = _toJsonMethod.Invoke(item, new object[] { 0 }) as string ?? ""; }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] труп ToJSON впав: {e.Message}"); }
+        var jb = System.Text.Encoding.UTF8.GetBytes(json);
+
+        var pk = new byte[34 + jb.Length];
+        pk[0] = 0x11;
+        BitConverter.GetBytes(uid).CopyTo(pk, 1);
+        BitConverter.GetBytes(dir).CopyTo(pk, 9);
+        BitConverter.GetBytes(pos.x).CopyTo(pk, 13);
+        BitConverter.GetBytes(pos.y).CopyTo(pk, 17);
+        BitConverter.GetBytes(pos.z).CopyTo(pk, 21);
+        BitConverter.GetBytes(force).CopyTo(pk, 25);
+        pk[29] = (byte)(walls ? 1 : 0);
+        BitConverter.GetBytes(jb.Length).CopyTo(pk, 30);
+        Buffer.BlockCopy(jb, 0, pk, 34, jb.Length);
+        SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+        Multiplayer.Log?.LogInfo($"[CHOP] Спавн трупа → uid={uid} pos=({pos.x:F1},{pos.y:F1}) json={jb.Length}б → 0x11");
+    }
+
+    // Реєстрація трупа за ТОЧНИМ GameObject (з хука Drop) — без сканування сцени.
+    public static void RegisterCorpseBodyGO(MonoBehaviour go, long uid, bool owner)
+    {
+        if (go == null) return;
+        var existing = FindBodyByUid(uid);
+        if (existing != null && existing.go != null) return;
+        if (_bodies.Any(b => ReferenceEquals(b.go, go))) return;   // вже відстежується
+        var p = go.transform.position;
+        _bodies.RemoveAll(b => b.uid == uid);
+        _bodies.Add(new BodyTrack {
+            go = go, uid = uid, lastPos = new Vector2(p.x, p.y),
+            registeredTime = Time.time, lastRemoteTime = -99f, lastSendTime = -99f, isOwner = owner
+        });
+        Multiplayer.Log?.LogInfo($"[CHOP] Труп зареєстровано → uid={uid} owner={owner} pos=({p.x:F1},{p.y:F1})");
+    }
+
+    // Приймач 0x11: відтворити ПОВНИЙ труп на граві глядача через ту саму DropItem (під
+    // echo-guard). Тіло відновлюємо з JSON (органи+freshness), а не порожнє new Item.
+    // Постфікс DropItemSingularBroadcastPatch підхопить його в реєстр (owner=False).
+    public static void ApplyRemoteCorpseSpawn(long uid, int dir, float x, float y, float z, float force, bool b4, string json)
+    {
+        EnsureReflection();
+        if (!DropReflectionReady() || _dropItemSingularMethod == null || _itemCtor == null) return;
+        // Ціль для виклику instance-методу DropItem: могила-джерело (початковий спавн) АБО, якщо її
+        // uid не знайдено (re-drop з рук, uid=гравець), будь-який локальний wgo — позиція все одно
+        // явна (x,y,z), тож на якому wgo кликати неважливо.
+        var target = FindWgoByUniqueId(uid) ?? GetLocalPlayerWgo();
+        if (target == null)
+        {
+            Multiplayer.Log?.LogWarning($"[CHOP] 0x11: ні джерела uid={uid}, ні локального wgo — труп не заспавнено");
+            return;
+        }
+        // Уже є живий труп цього uid? (повторний 0x11) — не дублюємо.
+        var existed = FindBodyByUid(uid);
+        if (existed != null && existed.go != null)
+        {
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x11: труп uid={uid} вже існує — пропуск");
+            return;
+        }
+        ApplyingRemoteChop = true;
+        _incomingCorpseUid = uid;   // RegisterCorpseBody (постфікс) зареєструє під цим uid, owner=False
+        try
+        {
+            var body = _itemCtor.Invoke(new object[] { "body", 1 });
+            // Влити повний стан трупа (органи/freshness) з JSON відправника.
+            if (!string.IsNullOrEmpty(json) && _fromJsonOverwriteMethod != null)
+            {
+                try { _fromJsonOverwriteMethod.Invoke(null, new object[] { json, body }); }
+                catch (Exception je) { Multiplayer.Log?.LogWarning($"[CHOP] 0x11 FromJsonOverwrite впав: {je.Message}"); }
+            }
+            var direction = Enum.ToObject(_directionType, dir);
+            var ps = _dropItemSingularMethod.GetParameters();
+            var call = new object[ps.Length];
+            if (ps.Length > 0) call[0] = body;
+            if (ps.Length > 1) call[1] = direction;
+            if (ps.Length > 2) call[2] = new Vector3(x, y, z);
+            if (ps.Length > 3) call[3] = force;     // float (декомпіляція: DropItem param 3 = float force)
+            if (ps.Length > 4) call[4] = b4;        // bool check_walls
+            _dropItemSingularMethod.Invoke(target, call);
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x11: труп uid={uid} заспавнено ✓");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x11 спавн трупа впав: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; _incomingCorpseUid = null; }
+    }
+
     //               + N * { idLen(1) + id(utf8) + value(4) }
     public static void OnLocalDropItems(MonoBehaviour wgo, object itemsList, object direction)
     {
@@ -4861,6 +5319,249 @@ public static class ChopSync
         Multiplayer.Log?.LogInfo($"[CHOP] Лут реплеєно ✓ (спільний режим: обидва отримують ~{expected} item(ів))");
     }
 
+    // ── СИНК ПЕРЕНОСИМОГО ТРУПА (0x0F позиція / 0x10 видалення) ──────────────────────
+    // Розвідка 2026-06-09 (F5-трейс, повний цикл взяти→нести→кинути→покласти в могилу):
+    // труп при підборі НЕ знищується — гра тримає той самий DropResGameObject і НЕСЕ його з
+    // гравцем (range-check id=body триває після DestroyLinkedHint; зникає лише при кладенні
+    // через ReplaceWithObject). Тому модель «знищити копію в глядача» була ХИБНА. Правильно:
+    // труп завжди живий в обох; машина, де його ЛОКАЛЬНО рухають (несуть/кидають), транслює
+    // позицію за uid могили-джерела (uid СПІЛЬНИЙ — доведено синком стадій); інша дзеркалить
+    // свою копію. Зник у носія (кладення/споживання) → 0x10 → глядач чисто видаляє
+    // (DestroyLinkedHint прибирає й показник свіжості). Хук рук не потрібен — рух сам визначає
+    // власника. Foothold для інвентаря (опора C) і для будь-яких переносимих (колода/камінь).
+    private class BodyTrack
+    {
+        public MonoBehaviour go;       // локальний DropResGameObject(body)
+        public long uid;               // uid могили-джерела (спільний ключ)
+        public Vector2 lastPos;
+        public float registeredTime;   // для відстою фізики при спавні
+        public float lastRemoteTime;   // коли востаннє рухнули за 0x0F (echo-guard)
+        public float lastSendTime;     // throttle відправки
+        public bool alive = true;
+        public bool isOwner;           // true = заспавнений РЕАЛЬНОЮ ексгумацією (не 0x0B-реплеєм)
+    }
+    private static readonly List<BodyTrack> _bodies = new List<BodyTrack>();
+    private static MethodInfo _destroyLinkedHintMethod;
+
+    private const float BODY_SETTLE_SEC   = 1.5f;   // відстій фізики після спавну (не слати рух)
+    private const float BODY_ECHO_SEC     = 0.4f;   // після 0x0F-руху не слати назад
+    private const float BODY_SEND_MIN_SEC = 0.06f;  // throttle ~16/с
+    private const float BODY_MOVE_EPS     = 0.1f;   // поріг «рухнувся»
+
+    private static BodyTrack FindBodyByUid(long uid)
+    {
+        for (int i = 0; i < _bodies.Count; i++) if (_bodies[i].uid == uid) return _bodies[i];
+        return null;
+    }
+
+    // Чи цей дроп — труп-ДЗЕРКАЛО (owner=False): мирориться з машини носія. Локально його НЕ
+    // можна авто-збирати, інакше зникає (лайв-тест 2026-06-09: GONE через 1 кадр у глядача —
+    // авто-магніт глядачевого гравця хапав свіжий труп; у власника не хапає, бо той щойно
+    // завершив «роботу»-ексгумацію й авто-збір тимчасово приглушений).
+    public static bool IsMirrorCorpse(object drop)
+    {
+        if (drop == null) return false;
+        for (int i = 0; i < _bodies.Count; i++)
+            if (!_bodies[i].isOwner && ReferenceEquals(_bodies[i].go, drop)) return true;
+        return false;
+    }
+
+    private static float _lastMirrorBlockLog = -99f;
+    public static void NoteMirrorCollectBlocked()
+    {
+        if (Time.time - _lastMirrorBlockLog < 2f) return;   // throttle (CanCollectDrop дзвонить часто)
+        _lastMirrorBlockLog = Time.time;
+        Multiplayer.Log?.LogInfo("[CHOP] Авто-збір трупа-дзеркала заблоковано ✓");
+    }
+
+    // uid, під яким реєструвати труп під час 0x11-реплею (для re-drop wgo-uid ≠ переданий uid).
+    private static long? _incomingCorpseUid;
+
+    // ── НОСІННЯ OVERHEAD (0x12 несе / 0x13 поклав) ───────────────────────────────────
+    // Розвідка коду: важкі предмети (труп/колода/камінь) несуться через
+    // BaseCharacterComponent.SetOverheadItem(Item). Хук локального гравця → транслюємо, щоб
+    // напарник показав предмет над головою НАШОГО клона. Доповнює наземний мирор (0x0F/0x11).
+    public static void OnLocalOverheadChanged(object item)
+    {
+        if (ApplyingRemoteChop || !Connected()) return;
+        if (item == null)
+        {
+            var p = new byte[1] { 0x13 };
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, p);
+            Multiplayer.Log?.LogInfo("[CHOP] Overhead поклав → 0x13");
+            return;
+        }
+        EnsureReflection();
+        string icon = "";
+        try { if (_getOverheadIconMethod != null) icon = _getOverheadIconMethod.Invoke(item, null) as string ?? ""; }
+        catch { }
+        var ib = System.Text.Encoding.UTF8.GetBytes(icon);
+        if (ib.Length > 255) return;
+        var pk = new byte[2 + ib.Length];
+        pk[0] = 0x12;
+        pk[1] = (byte)ib.Length;
+        Buffer.BlockCopy(ib, 0, pk, 2, ib.Length);
+        SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+        Multiplayer.Log?.LogInfo($"[CHOP] Overhead несе icon={icon} → 0x12");
+    }
+
+    // Реєстрація при спавні трупа (на ОБОХ машинах: реальна ексгумація в одного, 0x0B-реплей в
+    // іншого — обидва кличуть WGO.DropItem(body)). Знаходить щойно створене тіло (найближче до
+    // могили, ще не зареєстроване) і прив'язує до uid могили. БЕЗ гейту ApplyingRemoteChop.
+    public static void RegisterCorpseBody(MonoBehaviour graveWgo, object item)
+    {
+        EnsureReflection();
+        if (!DropReflectionReady() || graveWgo == null || item == null || _uniqueIdField == null) return;
+        if ((_itemIdField.GetValue(item) as string) != "body") return;
+        // Під час 0x11-реплею uid приходить із пакета (для re-drop wgo — це локальний гравець,
+        // чий uid ≠ логічному uid трупа). Інакше — uid джерела (могили) при реальному дропі.
+        long uid;
+        if (_incomingCorpseUid.HasValue) uid = _incomingCorpseUid.Value;
+        else { try { uid = Convert.ToInt64(_uniqueIdField.GetValue(graveWgo)); } catch { return; } }
+        // Уже є живий трек для цього uid? (DropItem міг злетіти двічі) — не дублюємо.
+        var existing = FindBodyByUid(uid);
+        if (existing != null && existing.go != null) return;
+        var t = AccessTools.TypeByName("DropResGameObject");
+        if (t == null) return;
+        var gp = graveWgo.transform.position;
+        MonoBehaviour best = null; float bestD = float.MaxValue;
+        foreach (var c in UnityEngine.Object.FindObjectsOfType(t))
+        {
+            var mb = c as MonoBehaviour;
+            if (mb == null) continue;
+            if (_bodies.Any(b => ReferenceEquals(b.go, mb))) continue;   // вже відстежується
+            if (ReadDropItemId(mb) != "body") continue;
+            float d = Vector2.Distance(new Vector2(mb.transform.position.x, mb.transform.position.y),
+                                       new Vector2(gp.x, gp.y));
+            if (d < bestD) { bestD = d; best = mb; }
+        }
+        if (best == null) return;
+        var p = best.transform.position;
+        // ВЛАСНИК = машина, де труп заспавнено РЕАЛЬНОЮ ексгумацією (ApplyingRemoteChop==false).
+        // Реплей-копія (0x0B) — НЕ власник, лише дзеркалить. Тільки власник транслює 0x0F/0x10:
+        // без цього глядачева копія (фізика/авто-збір) слала спурйозне 0x10 і стирала справжній труп.
+        bool owner = !ApplyingRemoteChop;
+        _bodies.RemoveAll(b => b.uid == uid);   // замінити мертвий трек того ж uid
+        _bodies.Add(new BodyTrack {
+            go = best, uid = uid, lastPos = new Vector2(p.x, p.y),
+            registeredTime = Time.time, lastRemoteTime = -99f, lastSendTime = -99f, isOwner = owner
+        });
+        Multiplayer.Log?.LogInfo($"[CHOP] Труп зареєстровано → uid={uid} owner={owner} dist={bestD:F1} " +
+            $"bodyPos=({p.x:F1},{p.y:F1}) gravePos=({gp.x:F1},{gp.y:F1})");
+    }
+
+    // Читає id предмета з DropResGameObject (поле типу Item з .id:string).
+    private static string ReadDropItemId(MonoBehaviour drop)
+    {
+        if (drop == null) return null;
+        foreach (var f in drop.GetType().GetFields(
+                     BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            var v = f.GetValue(drop);
+            var idF = v?.GetType().GetField("id");
+            if (idF != null && idF.FieldType == typeof(string)) return idF.GetValue(v) as string;
+        }
+        return null;
+    }
+
+    // Чисте видалення дропа: спершу прибрати «прив'язану підказку» (показник свіжості — інакше
+    // він лишається привидом після грубого Destroy), потім знищити сам GameObject.
+    private static void CleanDestroyDrop(MonoBehaviour drop)
+    {
+        if (drop == null) return;
+        if (_destroyLinkedHintMethod == null)
+        {
+            var t = AccessTools.TypeByName("DropResGameObject");
+            _destroyLinkedHintMethod = t?.GetMethod("DestroyLinkedHint",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        }
+        try { _destroyLinkedHintMethod?.Invoke(drop, null); } catch { }
+        UnityEngine.Object.Destroy(drop.gameObject);
+    }
+
+    // Per-frame тік (з SteamManager.Update): для кожного локального трупа — якщо рухнувся
+    // (несуть/кидають) і це не відстій/луна, транслюємо позицію (0x0F); якщо GO зник
+    // (покладено в могилу/спожито) — транслюємо видалення (0x10) і чистимо трек.
+    public static void TickCarriedBodies()
+    {
+        if (_bodies.Count == 0) return;
+        float now = Time.time;
+        for (int i = _bodies.Count - 1; i >= 0; i--)
+        {
+            var b = _bodies[i];
+            if (b.go == null)   // знищено локально (кладення/споживання АБО авто-збір копії)
+            {
+                // ТІЛЬКИ власник транслює видалення. Глядачева копія могла зникнути від фізики/
+                // авто-збору — НЕ можна слати 0x10 (саме це стирало справжній труп у власника).
+                if (b.alive && b.isOwner && Connected())
+                {
+                    var rm = new byte[9];
+                    rm[0] = 0x10;
+                    BitConverter.GetBytes(b.uid).CopyTo(rm, 1);
+                    SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, rm);
+                    Multiplayer.Log?.LogInfo($"[CHOP] Труп uid={b.uid} зник у власника → 0x10");
+                }
+                else
+                    Multiplayer.Log?.LogInfo($"[DIAG-BODY] uid={b.uid} GONE локально owner={b.isOwner} (0x10 НЕ слемо)");
+                _bodies.RemoveAt(i);
+                continue;
+            }
+            var pos = b.go.transform.position;
+            var p2 = new Vector2(pos.x, pos.y);
+            if (Vector2.Distance(p2, b.lastPos) < BODY_MOVE_EPS) continue;   // не рухався
+            float moved = Vector2.Distance(p2, b.lastPos);
+            b.lastPos = p2;
+            // ТІЛЬКИ власник транслює позицію (глядач лише дзеркалить вхідні 0x0F).
+            if (!b.isOwner) continue;
+            if (now - b.registeredTime < BODY_SETTLE_SEC) continue;          // відстій фізики
+            if (now - b.lastRemoteTime < BODY_ECHO_SEC) continue;           // наша луна (рух від 0x0F)
+            if (!Connected()) continue;
+            if (now - b.lastSendTime < BODY_SEND_MIN_SEC) continue;          // throttle
+            b.lastSendTime = now;
+            var pk = new byte[17];
+            pk[0] = 0x0F;
+            BitConverter.GetBytes(b.uid).CopyTo(pk, 1);
+            BitConverter.GetBytes(pos.x).CopyTo(pk, 9);
+            BitConverter.GetBytes(pos.y).CopyTo(pk, 13);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+            Multiplayer.Log?.LogInfo($"[DIAG-BODY] uid={b.uid} рух {moved:F1} → 0x0F @({pos.x:F1},{pos.y:F1})");
+        }
+    }
+
+    // Приймач 0x0F: посунути СВОЮ копію трупа (за uid) у трансльовану позицію. Echo-guard:
+    // позначаємо lastRemoteTime, щоб тік не відіслав цей рух назад носію.
+    public static void ApplyRemoteBodyPos(long uid, float x, float y)
+    {
+        var b = FindBodyByUid(uid);
+        if (b == null || b.go == null)
+        {
+            Multiplayer.Log?.LogInfo($"[DIAG-BODY] 0x0F uid={uid} @({x:F1},{y:F1}) — копії нема " +
+                $"({(b == null ? "трек відсутній" : "go знищено")})");
+            return;
+        }
+        var cur = b.go.transform.position;
+        b.go.transform.position = new Vector3(x, y, cur.z);
+        b.lastPos = new Vector2(x, y);
+        b.lastRemoteTime = Time.time;
+        Multiplayer.Log?.LogInfo($"[DIAG-BODY] 0x0F uid={uid} → копію посунуто @({x:F1},{y:F1})");
+    }
+
+    // Приймач 0x10: носій поклав/спожив труп → чисто видаляємо свою копію (з показником свіжості).
+    public static void ApplyRemoteBodyRemove(long uid)
+    {
+        var b = FindBodyByUid(uid);
+        if (b == null) return;
+        ApplyingRemoteChop = true;
+        try
+        {
+            if (b.go != null) CleanDestroyDrop(b.go);
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x10: труп uid={uid} прибрано ✓ (напарник поклав/спожив)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x10 прибирання впало: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+        _bodies.RemoveAll(t => t.uid == uid);
+    }
+
     public static void RetryPendingDrops()
     {
         if (_pendingDrops.Count == 0) return;
@@ -4967,6 +5668,94 @@ public static class DoActionSyncPatch
     static Exception Finalizer(Exception __exception) => null;
 }
 
+// Синк переносимого трупа тепер НЕ хукає підбирання (CanPickupWithInteraction) — модель
+// перейшла з «знищити копію при підборі» на дзеркалення позиції (0x0F) + видалення при
+// кладенні (0x10), керовані per-frame тіком ChopSync.TickCarriedBodies. Хук рук не потрібен.
+
+// БЛОК ЗБОРУ ТРУПА-ДЗЕРКАЛА (на основі декомпіляції 2026-06-09): коли труп збирається,
+// гра ставить is_collected=true, і `DropsList.Add` при наступному дропі робить
+// `Object.Destroy(gameObject)` — ОСЬ що знищувало мирорений труп за кілька кадрів. Тож
+// блокуємо ОБИДВА гейти збору для трупа-дзеркала (owner=False):
+//  1) WorldGameObject.CanCollectDrop(DropResGameObject) → ПОВЕРТАЄ INT (не bool!) — авто-магніт
+//     збирає лише коли >0. Форсимо 0. (Старий патч мав фільтр bool → НЕ наклався — баг.)
+//  2) DropResGameObject.CanPickupWithInteraction → bool — ручний підбір. Форсимо false.
+// Власника НЕ зачіпає (його труп owner=True → IsMirrorCorpse=false).
+[HarmonyPatch]
+public static class MirrorCorpseCollectBlockPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "CanCollectDrop" && m.ReturnType == typeof(int));
+    }
+
+    static void Postfix(object[] __args, ref int __result)
+    {
+        if (__result <= 0 || __args == null || __args.Length == 0) return;
+        if (ChopSync.IsMirrorCorpse(__args[0] as MonoBehaviour))
+        {
+            __result = 0;
+            ChopSync.NoteMirrorCollectBlocked();
+        }
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// Блок РУЧНОГО підбору трупа-дзеркала: глядач не має забирати чужий мирорений труп.
+[HarmonyPatch]
+public static class MirrorCorpsePickupBlockPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("DropResGameObject");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "CanPickupWithInteraction");
+    }
+
+    static void Postfix(MonoBehaviour __instance, ref bool __result)
+    {
+        if (__result && ChopSync.IsMirrorCorpse(__instance)) __result = false;
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// НОСІННЯ OVERHEAD: BaseCharacterComponent.SetOverheadItem(Item) — універсальний механізм
+// носіння важких предметів (труп/колода/камінь над головою). Хук ЛОКАЛЬНОГО гравця → транслюємо
+// напарнику, щоб показав предмет над головою нашого клона (0x12 несе / 0x13 поклав). Клон гри
+// SetOverheadItem не викликає (його BaseCharacterComponent вимкнено), тож хук = завжди локальний;
+// для певності звіряємо з MainGame.me.player_char.
+[HarmonyPatch]
+public static class OverheadSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("BaseCharacterComponent");
+        return t?.GetMethod("SetOverheadItem",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+    }
+
+    static void Postfix(MonoBehaviour __instance, object[] __args)
+    {
+        try
+        {
+            var mg = AccessTools.TypeByName("MainGame");
+            var fl = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance;
+            var me = mg?.GetField("me", fl)?.GetValue(null);
+            var pc = mg?.GetField("player_char", fl)?.GetValue(me) as MonoBehaviour;
+            if (pc != null && !ReferenceEquals(pc, __instance)) return;   // не локальний гравець
+        }
+        catch { }
+        ChopSync.OnLocalOverheadChanged(__args != null && __args.Length > 0 ? __args[0] : null);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
 // Відправка: DropItems на дереві = воно зрубане → транслюємо знищення (0x0A).
 // Postfix не міняє поведінку — звичайна рубка гравця лишається недоторканою.
 [HarmonyPatch]
@@ -5008,6 +5797,32 @@ public static class DropItemsBroadcastPatch
         if (__args != null && __args.Length >= 2)
             ChopSync.OnLocalDropItems(__instance, __args[0], __args[1]);
         ChopSync.OnTreeFelled(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ТРУП — ЄДИНИЙ ХУК на статичний `DropResGameObject.Drop(Vector3, Item, Transform, Direction,
+// float, int, bool, bool)`: спільний шлях УСІХ спавнів трупа (ексгумація: WGO.DropItem→Drop;
+// кидок із рук: DropOverheadItem→Drop напряму). Постфікс дає __result = заспавнений DropResGameObject.
+// Фільтр id=="body" у OnCorpseDropped. Замінив старий хук WGO.DropItem (не ловив кидок із рук).
+[HarmonyPatch]
+public static class CorpseDropBroadcastPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("DropResGameObject");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Static | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "Drop"
+                              && m.GetParameters().Length >= 2
+                              && m.GetParameters()[1].ParameterType.Name == "Item"
+                              && m.ReturnType.Name == "DropResGameObject");
+    }
+
+    static void Postfix(object[] __args, object __result)
+    {
+        ChopSync.OnCorpseDropped(__args, __result);
     }
 
     static Exception Finalizer(Exception __exception) => null;
