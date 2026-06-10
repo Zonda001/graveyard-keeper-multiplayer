@@ -2383,6 +2383,14 @@ public class SteamManager : MonoBehaviour
             string bObjId = System.Text.Encoding.UTF8.GetString(data, 23, bidLen);
             ChopSync.ApplyRemoteBuildSpawn(buid, bx, by, bz, bObjId);
         }
+        else if (type == 0x16)
+        {
+            // ── Напарник ЗНІС будівлю → знищуємо свою копію за uid ──
+            // type(1) uid(8). Симетрично до 0x15-спавну.
+            if (data.Length < 9) { _logger.LogWarning($"[CHOP] 0x16 замалий ({data.Length})"); return; }
+            long ruid = BitConverter.ToInt64(data, 1);
+            ChopSync.ApplyRemoteBuildRemove(ruid);
+        }
     }
 
 
@@ -4261,6 +4269,7 @@ public static class ChopSync
     private static MethodInfo _setParamMethod;          // WGO.SetParam(string,float) — форс «завершено» у глядача (без каркаса)
     private static MethodInfo _getBodyFromInventoryMethod; // WGO.GetBodyFromInventory(bool) — надійний сигнал тіла в могилі (для підпису стадії)
     private static MethodInfo _spawnWgoMethod;          // WorldMap.SpawnWGO(Transform,string,Vector3?) — спавн нового обʼєкта (Фаза 2 будівництво)
+    private static MethodInfo _destroyMeMethod;         // WGO.DestroyMe() (декомпіл 114595) — знищення обʼєкта (синк знесення будівлі 0x16)
     private static PropertyInfo _worldRootProp;         // LazyEngine.world_root (static Transform, декомпіл 98892) — батько для спавну
     private static FieldInfo  _uniqueIdField;           // WGO.unique_id (long) — надійний матчинг цілі
     private static FieldInfo  _swUniqueIdField;         // SerializableWGO.unique_id
@@ -4402,6 +4411,8 @@ public static class ChopSync
         // world_root — СТАТИЧНА property у класі LazyEngine (декомпіл 98892, НЕ MainGame!).
         _worldRootProp = AccessTools.TypeByName("LazyEngine")?.GetProperty("world_root",
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        _destroyMeMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DestroyMe" && m.GetParameters().Length == 0);
         // WGO.GetParam/SetParam — щоб у глядача форсити furniture-предмети могили як «завершені»
         // (param≥1) → гра не малює деревʼяний каркас «під будівництвом». _itemInventoryField нижче
         // (після _itemType). GetParam має дефолт-аргумент → шукаємо overload з 2 параметрами.
@@ -5859,6 +5870,46 @@ public static class ChopSync
         finally { ApplyingRemoteChop = false; }
     }
 
+    // ── ЗНЕСЕННЯ БУДІВЛІ (0x16) — симетрично до спавну ────────────────────────
+    // Відправка: трекована будівля знищується локально (хук WGO.DestroyMe) → шлемо {uid},
+    // щоб напарник прибрав свою копію. Гейт на _syncedBuildUids (лише наші будівлі) + Connected
+    // + !ApplyingRemoteChop (не відлунюємо чужий remove). uid читається ДО знищення (Prefix).
+    public static void OnLocalBuildRemoved(MonoBehaviour wgo)
+    {
+        if (ApplyingRemoteChop || !Connected() || wgo == null || _uniqueIdField == null) return;
+        if (_syncedBuildUids.Count == 0) return;
+        try
+        {
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (!_syncedBuildUids.Contains(uid)) return;   // не наша будівля — ігнор
+            _syncedBuildUids.Remove(uid);
+            var packet = new byte[9];
+            packet[0] = 0x16;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            Multiplayer.Log?.LogInfo($"[CHOP] Будівлю uid={uid} знесено локально → 0x16");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalBuildRemoved: {e.Message}"); }
+    }
+
+    // Приймач 0x16: напарник зніс будівлю → знищуємо свою копію за uid (під echo-guard).
+    public static void ApplyRemoteBuildRemove(long uid)
+    {
+        EnsureReflection();
+        _syncedBuildUids.Remove(uid);
+        var target = FindWgoByUniqueId(uid);
+        if (target == null) { Multiplayer.Log?.LogInfo($"[CHOP] 0x16 uid={uid}: обʼєкт не знайдено (вже нема)"); return; }
+        if (_destroyMeMethod == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x16: DestroyMe-API не готове"); return; }
+        ApplyingRemoteChop = true;
+        try
+        {
+            _destroyMeMethod.Invoke(target, null);
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x16: будівлю uid={uid} знесено ✓ (напарник прибрав)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x16 знесення впало: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+    }
+
     public static void RetryPendingDrops()
     {
         if (_pendingDrops.Count == 0) return;
@@ -6051,6 +6102,27 @@ public static class BuildPlacePatch
 
     static void Prefix() { ChopSync.SetPendingBuildWobj(ReadFloatingWobj()); }
     static void Postfix() { ChopSync.OnBuildPlaceFinished(ReadFloatingWobj()); }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ФАЗА 2 — ЗНЕСЕННЯ: хук WGO.DestroyMe (декомпіл 114595). Prefix читає uid ДО знищення й шле 0x16,
+// якщо це трекована будівля (фільтр у OnLocalBuildRemoved: _syncedBuildUids + Connected + !echo).
+// DestroyMe — фінальна точка знесення (MarkForRemoval→ProcessRemove→DestroyMe). ВІДОМА МЕЖА:
+// масовий DestroyMe при вивантаженні світу теж тригерить, але якщо Connected()=false на виході —
+// гейт відсіє; інакше — edge (як вихід-із-трупом), відкладено.
+[HarmonyPatch]
+public static class BuildRemovePatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DestroyMe" && m.GetParameters().Length == 0);
+    }
+
+    static void Prefix(MonoBehaviour __instance) { ChopSync.OnLocalBuildRemoved(__instance); }
 
     static Exception Finalizer(Exception __exception) => null;
 }
