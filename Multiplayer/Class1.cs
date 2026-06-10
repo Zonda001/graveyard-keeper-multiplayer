@@ -4232,6 +4232,10 @@ public static class ChopSync
     private static Type       _serializableWgoType;     // SerializableWGO ([Serializable])
     private static MethodInfo _fromWgoMethod;           // static SerializableWGO.FromWGO(wgo) → SerializableWGO
     private static MethodInfo _restoreFromSerializedMethod; // WGO.RestoreFromSerializedObject(SerializableWGO, bool)
+    private static MethodInfo _redrawMethod;            // WGO.Redraw(force_redraw,force_redraw_part,draw_puff) — форс-малювання меблів могили після restore
+    private static FieldInfo  _itemInventoryField;      // Item.inventory (List<Item>) — furniture-предмети могили
+    private static MethodInfo _getParamMethod;          // WGO.GetParam(string,float) — значення частини могили
+    private static MethodInfo _setParamMethod;          // WGO.SetParam(string,float) — форс «завершено» у глядача (без каркаса)
     private static FieldInfo  _uniqueIdField;           // WGO.unique_id (long) — надійний матчинг цілі
     private static FieldInfo  _swUniqueIdField;         // SerializableWGO.unique_id
     private static FieldInfo  _swItemDataField;         // SerializableWGO.item_data (String) — компактний стан _data
@@ -4245,6 +4249,14 @@ public static class ChopSync
     // стан двічі — інакше дубль-тригери дають зайвий RestoreFromSerializedObject = мигання.
     private static readonly Dictionary<long, string> _lastSentGraveSig = new Dictionary<long, string>();
     private static readonly Dictionary<long, string> _lastAppliedGraveSig = new Dictionary<long, string>();
+    // ЧАС останнього applied-стану (для ВІКНА echo-приглушення). Луна (стан, який ми щойно
+    // застосували як глядач) вертається за частки секунди; СТЕЙЛ applied-підпис (напр.
+    // застосований на старті під час метушні по цвинтарю) НЕ має глушити чесну зміну через
+    // хвилини. БАГ 2026-06-10: будівник застосував повну могилу 13587 на старті (лог рядок 288)
+    // → відбудова до тієї ж повної (той самий підпис) глушилась вічно → 2-й furniture-предмет
+    // не доходив. Вікно розрубує: глушимо лише НЕДАВНЮ луну.
+    private static readonly Dictionary<long, float> _lastAppliedGraveSigTime = new Dictionary<long, float>();
+    private const float ECHO_SUPPRESS_WINDOW = 4f;
     // DEDUP РЕ-ДРОПУ ЧАСТИН МОГИЛИ (фікс дюпу при co-dig, 2026-06-08): могила легітимно
     // віддає кожну частину 1× на стадію. Доки набір частин (стадія) той самий, повторний
     // 0x0B-дроп тієї ж частини = runaway-ре-дроп (restore регідратував _data при co-dig) →
@@ -4261,6 +4273,11 @@ public static class ChopSync
     // через баг розташування (мітку ставив після дедуп-return → при стабільній стадії не оновлювалась).
     private static readonly Dictionary<long, float> _lastLocalGraveDigTime = new Dictionary<long, float>();
     private const float GRAVE_OWNER_WINDOW = 3f;
+    // Вікно «активного контесту» для гарду МОНОТОННОСТІ (ширше за owner-window): поки я
+    // САМ працював цю могилу так нещодавно — тримаємо захист від stale-echo-рехідратації
+    // (runaway-ре-дроп триває ~кілька секунд після завершення дії). Поза вікном (чистий
+    // глядач або давно по копанню) монотонність НЕ діє → видно й зворотню відбудову могили.
+    private const float GRAVE_CONTEST_WINDOW = 8f;
     // АРТЕФАКТ RESTORE (фікс локальної піраміди в ГЛЯДАЧА, 2026-06-08): час останнього
     // restore ПО uid. Якщо могилу нещодавно регідратували вхідним станом — її локальні
     // grave-дропи = runaway-артефакт (гра ре-кидає частину після restore). Скасовуємо їх
@@ -4338,6 +4355,20 @@ public static class ChopSync
             .FirstOrDefault(m => m.Name == "FromWGO" && m.GetParameters().Length == 1);
         _restoreFromSerializedMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
             .FirstOrDefault(m => m.Name == "RestoreFromSerializedObject" && m.GetParameters().Length == 2);
+        // WGO.Redraw(bool force_redraw, bool force_redraw_part, bool draw_puff) — рядок 114000
+        // декомпіляції. Кличе custom_drawers.OnObjectRedraw(force_redraw), що малює меблі могили
+        // (рамка GraveFence/хрест GraveStone) з інвентаря + рефрешить quality. RestoreFromSerializedObject
+        // робить лише SetObject (база), меблі не перемальовує → потрібен форс-редрав після restore.
+        _redrawMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "Redraw" && m.GetParameters().Length == 3);
+        // WGO.GetParam/SetParam — щоб у глядача форсити furniture-предмети могили як «завершені»
+        // (param≥1) → гра не малює деревʼяний каркас «під будівництвом». _itemInventoryField нижче
+        // (після _itemType). GetParam має дефолт-аргумент → шукаємо overload з 2 параметрами.
+        _getParamMethod = _wgoType.GetMethods(f).FirstOrDefault(m => m.Name == "GetParam"
+            && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(string));
+        _setParamMethod = _wgoType.GetMethods(f).FirstOrDefault(m => m.Name == "SetParam"
+            && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(string)
+            && m.GetParameters()[1].ParameterType == typeof(float));
         _swUniqueIdField  = _serializableWgoType?.GetField("unique_id", f);
         _swItemDataField  = _serializableWgoType?.GetField("item_data", f);
         _swItemField      = _serializableWgoType?.GetField("item", f);
@@ -4359,6 +4390,7 @@ public static class ChopSync
         _itemType        = AccessTools.TypeByName("Item");
         _itemCtor        = _itemType?.GetConstructor(new[] { typeof(string), typeof(int) });
         _itemIdField     = _itemType?.GetField("id", f);
+        _itemInventoryField = _itemType?.GetField("inventory", f);  // List<Item> — furniture-предмети могили
         _itemValueField  = _itemType?.GetField("value", f);
         _getOverheadIconMethod = _itemType?.GetMethod("GetOverheadIcon", f, null, Type.EmptyTypes, null);
         _toJsonMethod    = _itemType?.GetMethod("ToJSON", f, null, new[] { typeof(int) }, null);
@@ -4542,12 +4574,16 @@ public static class ChopSync
     {
         string rt = ExtractJsonArray(json, "_res_type");
         if (rt == null) return (objId ?? "") + "|" + json;  // фолбек: _params не знайдено
-        // Лишаємо ЛИШЕ ключі частин могили (grave*), відкидаємо волатильні параметри
-        // (decay/hp/hp_inited/inventory_size) + _res_v значення. Лайв-тест 2026-06-08
-        // довів: повний _res_type/_res_v нестабільний (decay міняється щомиті й по-різному
-        // на машинах) → DIAG-ECHO=0, дедуп/echo-приглушення не спрацьовували. Набір
-        // grave-частин СТАБІЛЬНИЙ у межах стадії й ОДНАКОВИЙ на обох машинах; викопано
-        // частину → ключ зникає (GameRes.RemoveZeroValues). Це і є справжня стадія.
+        // НАБІР КЛЮЧІВ grave-частин (БЕЗ значень) — навмисно key-only (2026-06-10).
+        // Ключі добре розрізняють і стадії копання, і furniture-предмети: рамка=grave_bot_stn_1,
+        // хрест=grave_top_stn_plate_1 — РІЗНІ ключі, тож 2-й предмет дає інший підпис → синкається.
+        // ЗНАЧЕННЯ (presence 0/1) НЕ беремо НАВМИСНО: транзієнт розбору «предмет ще в інвентарі +
+        // value<1» гра малює як ДЕРЕВ'ЯНУ рамку (grave_*_building_1_stg_1, декомпіл OnDrawGrave/
+        // GetNewWOPPrefabsNames 88883) — якби підпис розрізняв значення, цей транзієнт синкався б і
+        // глядач блимав деревʼяною рамкою при РОЗБОРІ (баг тесту #5, спостереження Zonda). Key-only
+        // його дедупає (той самий ключ при v0 і v1 → 1 синк). Стале echo-приглушення повної могили
+        // зі старту (ті самі ключі) лікує ВІКНО ECHO_SUPPRESS_WINDOW (тест довів: значення НЕ
+        // рятувало — старт і відбудова обидва мали plate-ключ; вікно — справжній фікс 2-го предмета).
         var parts = new List<string>();
         foreach (System.Text.RegularExpressions.Match m in
                  System.Text.RegularExpressions.Regex.Matches(rt, "\"(grave[^\"]*)\""))
@@ -4555,6 +4591,7 @@ public static class ChopSync
         parts.Sort();
         return (objId ?? "") + "|" + string.Join(",", parts);
     }
+
 
     // Витягує "[...]" одразу після ключа (перше входження). _res_type/_res_v — плоскі
     // масиви (рядки/інти), без вкладених дужок, тож перша ']' закриває. null якщо нема.
@@ -4568,6 +4605,33 @@ public static class ChopSync
         int close = json.IndexOf(']', open);
         if (close < 0) return null;
         return json.Substring(open, close - open + 1);
+    }
+
+    // Форсує furniture-предмети могили (рамка/хрест, id="grave_*") у ІНВЕНТАРІ до param≥1, щоб гра
+    // малювала завершений камінь, а не деревʼяний каркас «під будівництвом» (grave_*_building_1,
+    // OnDrawGrave/GetNewWOPPrefabsNames 88883 малює його при GetParam(item.id)<1). Лише в ГЛЯДАЧА
+    // після restore: він не будує, тож не має показувати каркас. Тіло (id="body") пропускаємо;
+    // викопані частини вже НЕ в інвентарі → не чіпаємо (зникають коректно, копання ціле).
+    private static void ForceGraveFurnitureComplete(MonoBehaviour wgo)
+    {
+        if (_itemInventoryField == null || _itemIdField == null
+            || _getParamMethod == null || _setParamMethod == null || _dataField == null) return;
+        try
+        {
+            var data = _dataField.GetValue(wgo);
+            if (data == null) return;
+            var inv = _itemInventoryField.GetValue(data) as System.Collections.IList;
+            if (inv == null) return;
+            foreach (var it in inv)
+            {
+                if (it == null) continue;
+                string id = _itemIdField.GetValue(it) as string;
+                if (id == null || !id.StartsWith("grave")) continue;  // furniture = grave_*; тіло "body" — ні
+                float p = Convert.ToSingle(_getParamMethod.Invoke(wgo, new object[] { id, 0f }));
+                if (p < 1f) _setParamMethod.Invoke(wgo, new object[] { id, 1f });
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] furniture-complete впав: {e.Message}"); }
     }
 
     // === МОНОТОННІСТЬ СТАДІЙ МОГИЛИ (2026-06-08, фікс leak B / дюпу) ===
@@ -4626,8 +4690,12 @@ public static class ChopSync
             // на свою активну могилу → ре-кидав плиту. Echo-guard тут безсилий (луна =
             // окремий мережевий пакет, не ре-ентрі в тім же кадрі). Лайв-тест 2026-06-08:
             // глядач відлунював 1 стан, копач застосовував 1 — латентна петля, каскадила в месиві.
-            if (_lastAppliedGraveSig.TryGetValue(uid, out var appliedSig) && appliedSig == sig)
-                return;  // echo-приглушення: це наша ж луна (ми застосували цей стан як глядач)
+            if (_lastAppliedGraveSig.TryGetValue(uid, out var appliedSig) && appliedSig == sig
+                && _lastAppliedGraveSigTime.TryGetValue(uid, out var appliedAt)
+                && UnityEngine.Time.realtimeSinceStartup - appliedAt < ECHO_SUPPRESS_WINDOW)
+                return;  // echo-приглушення: це наша НЕДАВНЯ луна (застосували цей стан як глядач щойно).
+                         // Вікно ECHO_SUPPRESS_WINDOW: стейл applied-підпис (хвилини тому) НЕ глушить
+                         // чесну зміну з тим самим підписом (фікс відбудови могили 2-м предметом 2026-06-10).
 
             // Сюди доходить лише ГЕНУЇННА локальна зміна (луну відсік echo-чек вище) → я
             // активно копаю цю могилу. Оновлюємо вікно власника ЩОРАЗУ (до дедупу нижче, бо
@@ -4757,11 +4825,21 @@ public static class ChopSync
         string sig = GraveStageSig(objId, json);
         if (_lastAppliedGraveSig.TryGetValue(uid, out var prevSig) && prevSig == sig) return;
 
-        // ГАРД МОНОТОННОСТІ (фікс leak B / дюпу, 2026-06-08): копання незворотне → НЕ
-        // застосовуємо стан, що йде «назад» відносно ЛОКАЛЬНОЇ могили (нижчий obj_id або
-        // додає частини, яких локально вже нема). Саме такий «назад»-restore регідратував
-        // _data → гра ре-кидала плиту щокадру (66 ре-дропів = піраміда). Читаємо живий стан
-        // цілі (істина цієї машини, а не _lastAppliedGraveSig — він стейл при власному копанні).
+        // ГАРД МОНОТОННОСТІ (фікс leak B / дюпу, 2026-06-08) — ТЕПЕР ЛИШЕ ПРИ АКТИВНОМУ
+        // КОНТЕСТІ (фікс зворотного синку, 2026-06-10). Раніше діяв БЕЗУМОВНО: копання
+        // вважалось незворотним, тож стан «назад» (нижчий obj_id rank або додає частини)
+        // відкидався як stale-echo — інакше «назад»-restore регідратував _data й гра ре-кидала
+        // плиту щокадру (66 ре-дропів = піраміда). АЛЕ зворотній синк (кладення тіла
+        // grave_empty→grave_corp, відбудова →grave_ground) ЗАКОННО йде «вгору» по стадіях, і
+        // безумовний гард його різав (лог 2026-06-10: глядач приймав grave_corp/grave_ground,
+        // але restore не викликався — спостерігач бачив лише порожню могилу). Тому монотонність
+        // діє ТІЛЬКИ якщо Я САМ працював цю могилу в межах GRAVE_CONTEST_WINDOW (тоді «назад»
+        // справді = stale-echo/рехідратація мого активного _data). Чистий глядач (не торкався
+        // цієї могили) застосовує стани в порядку як є — reliable+ordered гарантує послідовність
+        // копання→кладення→відбудова. Читаємо живий стан цілі (істина цієї машини).
+        bool recentlyWorked = _lastLocalGraveDigTime.TryGetValue(uid, out var workedAt)
+                              && UnityEngine.Time.realtimeSinceStartup - workedAt < GRAVE_CONTEST_WINDOW;
+        if (recentlyWorked)
         try
         {
             var locData = _dataField.GetValue(target);
@@ -4803,8 +4881,26 @@ public static class ChopSync
             }
             if (!string.IsNullOrEmpty(objId)) _swObjIdField.SetValue(sw, objId);
             _restoreFromSerializedMethod.Invoke(target, new object[] { sw, false });
+            // СПОСТЕРІГАЧ НЕ БУДУЄ → не показувати каркас «під будівництвом». Гра малює деревʼяний
+            // каркас (grave_*_building_1, OnDrawGrave/GetNewWOPPrefabsNames 88883) для furniture-
+            // предмета в інвентарі з param<1 (транзієнт розбору, який будівник проскакує, а глядач
+            // отримує знімком і малює). Форсуємо param=1 furniture-предметам У ІНВЕНТАРІ → завжди
+            // завершений камінь. Викопані предмети ВЖЕ не в інвентарі → не чіпаємо → зникають
+            // коректно (копання не ламається). Має бути ПЕРЕД редравом нижче. Лайв-баг тесту #7.
+            ForceGraveFurnitureComplete(target);
+            // ФОРС-РЕДРАВ МЕБЛІВ (фікс 2026-06-10): RestoreFromSerializedObject кладе предмети
+            // (тіло/рамка GraveFence/хрест GraveStone) в _data.inventory + робить SetObject (база),
+            // але НЕ малює меблі-візуал і НЕ рефрешить grave quality. Лайв-тест #3: стан 12721б із
+            // рамкою застосовувався (`відновлено ✓`), та рамка не зʼявлялась і quality застрягало на
+            // «-1» у глядача. Гра малює меблі через Redraw(force_redraw:true)→custom_drawers.
+            // OnObjectRedraw (декомпіл 114060) — кличемо його тут. Безпечно від re-send: ще під
+            // echo-guard ApplyingRemoteChop (GraveRedrawSyncPatch.OnLocalGraveStateChanged вийде рано).
+            if (_redrawMethod != null)
+                try { _redrawMethod.Invoke(target, new object[] { true, false, false }); }
+                catch (Exception re) { Multiplayer.Log?.LogWarning($"[CHOP] 0x0D форс-редрав впав: {re.Message}"); }
             _lastGraveRestoreTime[uid] = UnityEngine.Time.realtimeSinceStartup;  // per-uid: гасити runaway-дроп цієї могили в глядача
             _lastAppliedGraveSig[uid] = sig;
+            _lastAppliedGraveSigTime[uid] = UnityEngine.Time.realtimeSinceStartup;  // мітка часу для ВІКНА echo-приглушення
             // Термінальний стан: могила завершена → прибираємо все відстеження для uid, щоб
             // нічого не висіло (owner-вікно, артефакт-restore, per-stage дедуп). Грейв спокійний.
             if (isTerminal)
@@ -5896,6 +5992,37 @@ public static class GraveWorkSyncPatch
             var m = wgo.GetMethods(flags).FirstOrDefault(x => x.Name == name && x.GetParameters().Length == 0);
             if (m != null) yield return m;
         }
+    }
+
+    static void Postfix(MonoBehaviour __instance)
+    {
+        ChopSync.OnLocalGraveStateChanged(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ЗВОРОТНІЙ СИНК МОГИЛИ — кладення тіла НАЗАД у могилу. З декомпіляції (2026-06-10):
+// FlowCanvas PutOverheadToWGO (рядок 74541) кладе тіло через wgo.AddToInventory(Item)
+// + Redraw, БЕЗ ReplaceWithObject/RedrawPart/OnWorkFinished — тобто жоден наш існуючий
+// тригер 0x0D не спрацьовував, і глядач НЕ бачив тіла в могилі. Хук AddToInventory(Item)
+// (WorldGameObject, перевантаження з 1 параметром Item) тригерить той самий синк ПОВНОГО
+// стану (підхід A: ToJSON(0) → RestoreFromSerializedObject — тіло сидить у data.inventory,
+// тож реплікується разом зі станом). Маркер тіла в GraveStageSig (варіант a) не дає дедупу
+// проковтнути відправку. Фільтр grave* — усередині OnLocalGraveStateChanged (інші wgo з
+// AddToInventory: скрині/верстати → IsGraveTarget відсіює дешево). SetOverheadItem(null)
+// у власника синкається окремо (0x13 → carry-mirror клона прибирається).
+[HarmonyPatch]
+public static class GraveAddBodySyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "AddToInventory"
+                              && m.GetParameters().Length == 1
+                              && m.GetParameters()[0].ParameterType.Name == "Item");
     }
 
     static void Postfix(MonoBehaviour __instance)
