@@ -4537,6 +4537,22 @@ public static class ChopSync
         return id != null && id.StartsWith("grave");
     }
 
+    // uid будівель, які пройшли спавн-примітив 0x15 (поставлені/отримані цією сесією). Стадії
+    // будівництва ЦИХ обʼєктів синкаємо наявним 0x0D (плейсхолдер_place→готова). Трек по uid (НЕ
+    // широкий obj_id-предикат) — щоб НЕ флудити кожен WGO; спільний uid із 0x15 гарантує матч.
+    private static readonly HashSet<long> _syncedBuildUids = new HashSet<long>();
+    private static void TrackBuildUid(long uid) { if (uid != 0) _syncedBuildUids.Add(uid); }
+
+    // Ціль реплікації СТАНУ через 0x0D: могила АБО синкнута будівля (за uid). Розширює grave-only
+    // на Фазу 2 будівництва, лишаючись вузьким (тільки 0x15-обʼєкти, не весь світ).
+    private static bool IsStateRepTarget(MonoBehaviour wgo)
+    {
+        if (IsGraveTarget(wgo)) return true;
+        if (_syncedBuildUids.Count == 0 || wgo == null || _uniqueIdField == null) return false;
+        try { return _syncedBuildUids.Contains(Convert.ToInt64(_uniqueIdField.GetValue(wgo))); }
+        catch { return false; }
+    }
+
     private static bool IsPlayerActor(MonoBehaviour actor)
     {
         if (actor == null) return false;
@@ -4720,7 +4736,7 @@ public static class ChopSync
     public static void OnLocalGraveStateChanged(MonoBehaviour wgo)
     {
         if (ApplyingRemoteChop || !Connected()) return;
-        if (!IsGraveTarget(wgo)) return;
+        if (!IsStateRepTarget(wgo)) return;   // могила АБО синкнута будівля (Фаза 2)
         EnsureReflection();
         if (!GraveStateReflectionReady()) return;
         try
@@ -5808,6 +5824,7 @@ public static class ChopSync
             BitConverter.GetBytes((ushort)idB.Length).CopyTo(packet, 21);
             Buffer.BlockCopy(idB, 0, packet, 23, idB.Length);
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            TrackBuildUid(uid);   // стадії будівництва ЦІЄЇ будівлі підуть по 0x0D (предикат IsStateRepTarget)
             Multiplayer.Log?.LogInfo($"[CHOP] Будівлю поставлено uid={uid} obj={objId} @({pos.x:F1},{pos.y:F1}) → 0x15");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalBuildPlaced: {e.Message}"); }
@@ -5835,6 +5852,7 @@ public static class ChopSync
             var spawned = _spawnWgoMethod.Invoke(null, new object[] { worldRoot, objId, posObj }) as MonoBehaviour;
             if (spawned == null) { Multiplayer.Log?.LogWarning($"[CHOP] 0x15: SpawnWGO({objId}) = null"); return; }
             _uniqueIdField.SetValue(spawned, uid);   // ФОРС спільного uid (перебиває локальний UniqueID.GetUniqueID)
+            TrackBuildUid(uid);   // приймемо стадії будівництва цієї будівлі по 0x0D
             Multiplayer.Log?.LogInfo($"[CHOP] 0x15: будівлю obj={objId} uid={uid} заспавнено ✓ @({x:F1},{y:F1})");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x15 спавн впав: {e.Message}"); }
