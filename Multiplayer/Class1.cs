@@ -2368,6 +2368,21 @@ public class SteamManager : MonoBehaviour
             long tuid = BitConverter.ToInt64(data, 1);
             ChopSync.ApplyRemoteCorpseTransfer(tuid);
         }
+        else if (type == 0x15)
+        {
+            // ── СПАВН-ПРИМІТИВ (Фаза 2): напарник поставив будівлю/будмайданчик → спавнимо її в
+            // нас зі СПІЛЬНИМ uid (щоб подальші стадії будівництва синкались по 0x0D за тим uid) ──
+            // type(1) uid(8) x(4) y(4) z(4) objIdLen(2) objId
+            if (data.Length < 21) { _logger.LogWarning($"[CHOP] 0x15 замалий ({data.Length})"); return; }
+            long  buid = BitConverter.ToInt64(data, 1);
+            float bx = BitConverter.ToSingle(data, 9);
+            float by = BitConverter.ToSingle(data, 13);
+            float bz = BitConverter.ToSingle(data, 17);
+            int   bidLen = BitConverter.ToUInt16(data, 21);
+            if (23 + bidLen > data.Length) { _logger.LogWarning("[CHOP] 0x15 objId за межами"); return; }
+            string bObjId = System.Text.Encoding.UTF8.GetString(data, 23, bidLen);
+            ChopSync.ApplyRemoteBuildSpawn(buid, bx, by, bz, bObjId);
+        }
     }
 
 
@@ -4245,6 +4260,8 @@ public static class ChopSync
     private static MethodInfo _getParamMethod;          // WGO.GetParam(string,float) — значення частини могили
     private static MethodInfo _setParamMethod;          // WGO.SetParam(string,float) — форс «завершено» у глядача (без каркаса)
     private static MethodInfo _getBodyFromInventoryMethod; // WGO.GetBodyFromInventory(bool) — надійний сигнал тіла в могилі (для підпису стадії)
+    private static MethodInfo _spawnWgoMethod;          // WorldMap.SpawnWGO(Transform,string,Vector3?) — спавн нового обʼєкта (Фаза 2 будівництво)
+    private static PropertyInfo _worldRootProp;         // LazyEngine.world_root (static Transform, декомпіл 98892) — батько для спавну
     private static FieldInfo  _uniqueIdField;           // WGO.unique_id (long) — надійний матчинг цілі
     private static FieldInfo  _swUniqueIdField;         // SerializableWGO.unique_id
     private static FieldInfo  _swItemDataField;         // SerializableWGO.item_data (String) — компактний стан _data
@@ -4375,6 +4392,16 @@ public static class ChopSync
         // тіла в grave_empty не міняло підпис → echo/дедуп ковтав 0x0D → тіло не синкалось, виштовхувалось.
         _getBodyFromInventoryMethod = _wgoType.GetMethods(f)
             .FirstOrDefault(m => m.Name == "GetBodyFromInventory" && m.GetParameters().Length == 1);
+        // Фаза 2 (будівництво): спавн нового WGO зі спільним uid. WorldMap.SpawnWGO(Transform,string,Vector3?)
+        // (декомпіл 99430) + MainGame.world_root (98892) як батько. uid форсимо напряму після спавну.
+        var worldMapType = AccessTools.TypeByName("WorldMap");
+        _spawnWgoMethod = worldMapType?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+            .FirstOrDefault(m => m.Name == "SpawnWGO" && m.GetParameters().Length == 3
+                              && m.GetParameters()[0].ParameterType.Name == "Transform"
+                              && m.GetParameters()[1].ParameterType == typeof(string));
+        // world_root — СТАТИЧНА property у класі LazyEngine (декомпіл 98892, НЕ MainGame!).
+        _worldRootProp = AccessTools.TypeByName("LazyEngine")?.GetProperty("world_root",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
         // WGO.GetParam/SetParam — щоб у глядача форсити furniture-предмети могили як «завершені»
         // (param≥1) → гра не малює деревʼяний каркас «під будівництвом». _itemInventoryField нижче
         // (після _itemType). GetParam має дефолт-аргумент → шукаємо overload з 2 параметрами.
@@ -5737,6 +5764,83 @@ public static class ChopSync
         Multiplayer.Log?.LogInfo($"[CHOP] 0x14: труп uid={uid} передано напарнику (він підняв) — наземну копію прибрано ✓");
     }
 
+    // ── ФАЗА 2: СПАВН-ПРИМІТИВ (0x15) ─────────────────────────────────────────
+    // wobj, який збираються поставити (захоплений у Prefix DoPlace; cur_floating обнуляється
+    // всередині методу, тож у Postfix його вже не прочитати — звідси Prefix-захоплення).
+    private static MonoBehaviour _pendingBuildWobj;
+    public static void SetPendingBuildWobj(MonoBehaviour wobj) { _pendingBuildWobj = wobj; }
+
+    // Postfix DoPlace: розміщення ВІДБУЛОСЬ, якщо поточний floating-wobj БІЛЬШЕ не той, що захопили
+    // (його лишили на сцені → cur_floating став null або новий). Якщо той самий — DoPlace вийшов
+    // рано (не вистачило ресурсів / місце зайняте) → нічого не шлемо.
+    public static void OnBuildPlaceFinished(MonoBehaviour nowFloatingWobj)
+    {
+        var placed = _pendingBuildWobj;
+        _pendingBuildWobj = null;
+        if (placed == null || ReferenceEquals(placed, nowFloatingWobj)) return;
+        OnLocalBuildPlaced(placed);
+    }
+
+    // Відправка: гравець поставив будівлю/будмайданчик (хук BuildModeLogics.DoPlace) → транслюємо
+    // {uid, pos, obj_id}, щоб обʼєкт зʼявився в напарника зі СПІЛЬНИМ uid. Спільний uid критичний:
+    // подальші стадії будівництва (ReplaceWithObject placeholder→будівля) синкатимуться по 0x0D за
+    // цим uid (наступний крок). Стан плейсхолдера дефолтний → JSON поки НЕ шлемо (свіжий обʼєкт).
+    public static void OnLocalBuildPlaced(MonoBehaviour wobj)
+    {
+        if (ApplyingRemoteChop || !Connected() || wobj == null) return;
+        EnsureReflection();
+        if (_objIdField == null || _uniqueIdField == null) return;
+        try
+        {
+            string objId = _objIdField.GetValue(wobj) as string;
+            if (string.IsNullOrEmpty(objId)) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wobj));
+            var pos = wobj.transform.position;
+
+            var idB = System.Text.Encoding.UTF8.GetBytes(objId);
+            if (idB.Length > 65535) return;
+            var packet = new byte[23 + idB.Length];
+            packet[0] = 0x15;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            BitConverter.GetBytes(pos.x).CopyTo(packet, 9);
+            BitConverter.GetBytes(pos.y).CopyTo(packet, 13);
+            BitConverter.GetBytes(pos.z).CopyTo(packet, 17);
+            BitConverter.GetBytes((ushort)idB.Length).CopyTo(packet, 21);
+            Buffer.BlockCopy(idB, 0, packet, 23, idB.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            Multiplayer.Log?.LogInfo($"[CHOP] Будівлю поставлено uid={uid} obj={objId} @({pos.x:F1},{pos.y:F1}) → 0x15");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalBuildPlaced: {e.Message}"); }
+    }
+
+    // Приймач 0x15: спавнимо обʼєкт зі спільним uid. Якщо вже існує за uid (напр. повторний пакет
+    // або стадія) — не дублюємо. uid форсимо НАПРЯМУ після спавну (надійно, не залежить від restore).
+    public static void ApplyRemoteBuildSpawn(long uid, float x, float y, float z, string objId)
+    {
+        EnsureReflection();
+        if (_spawnWgoMethod == null || _worldRootProp == null || _uniqueIdField == null)
+        {
+            Multiplayer.Log?.LogWarning("[CHOP] 0x15: spawn-API не готове"); return;
+        }
+        if (FindWgoByUniqueId(uid) != null)
+        {
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x15 uid={uid}: обʼєкт уже існує — спавн пропущено");
+            return;
+        }
+        ApplyingRemoteChop = true;
+        try
+        {
+            var worldRoot = _worldRootProp.GetValue(null);
+            object posObj = (UnityEngine.Vector3?)new UnityEngine.Vector3(x, y, z);
+            var spawned = _spawnWgoMethod.Invoke(null, new object[] { worldRoot, objId, posObj }) as MonoBehaviour;
+            if (spawned == null) { Multiplayer.Log?.LogWarning($"[CHOP] 0x15: SpawnWGO({objId}) = null"); return; }
+            _uniqueIdField.SetValue(spawned, uid);   // ФОРС спільного uid (перебиває локальний UniqueID.GetUniqueID)
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x15: будівлю obj={objId} uid={uid} заспавнено ✓ @({x:F1},{y:F1})");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x15 спавн впав: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+    }
+
     public static void RetryPendingDrops()
     {
         if (_pendingDrops.Count == 0) return;
@@ -5889,6 +5993,50 @@ public static class MirrorCorpseCollectBlockPatch
 // носіння важких предметів (труп/колода/камінь над головою). Хук ЛОКАЛЬНОГО гравця → транслюємо
 // напарнику, щоб показав предмет над головою нашого клона (0x12 несе / 0x13 поклав). Клон гри
 // SetOverheadItem не викликає (його BaseCharacterComponent вимкнено), тож хук = завжди локальний;
+// ФАЗА 2 — БУДІВНИЦТВО: хук розміщення будівлі. BuildModeLogics.DoPlace (декомпіл 43996) ставить
+// плаваюче прев'ю у світ (StopCurrentFloating leave_on_scene → ReplaceWithObject "_place"). cur_floating
+// обнуляється ВСЕРЕДИНІ методу, тож wobj захоплюємо в Prefix, а в Postfix визначаємо, чи розміщення
+// відбулось (поточний floating != захоплений). Прев'ю вже має unique_id (StopCurrentFloating його читає),
+// тож синкаємо за ним. ApplyRemoteBuildSpawn спавнить копію зі спільним uid → стадії підуть по 0x0D.
+[HarmonyPatch]
+public static class BuildPlacePatch
+{
+    static FieldInfo _curFloatingField;
+    static PropertyInfo _wobjProp;
+    static FieldInfo _wobjField;
+
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("BuildModeLogics");
+        return t?.GetMethod("DoPlace", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+    }
+
+    static MonoBehaviour ReadFloatingWobj()
+    {
+        try
+        {
+            if (_curFloatingField == null)
+            {
+                var ft = AccessTools.TypeByName("FloatingWorldGameObject");
+                var sf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+                var inf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                _curFloatingField = ft?.GetField("cur_floating", sf) ?? ft?.GetField("_cur_floating", sf);
+                _wobjProp  = ft?.GetProperty("wobj", inf);
+                _wobjField = ft?.GetField("wobj", inf) ?? ft?.GetField("_wo", inf);
+            }
+            var cf = _curFloatingField?.GetValue(null);
+            if (cf == null) return null;
+            return (_wobjProp != null ? _wobjProp.GetValue(cf) : _wobjField?.GetValue(cf)) as MonoBehaviour;
+        }
+        catch { return null; }
+    }
+
+    static void Prefix() { ChopSync.SetPendingBuildWobj(ReadFloatingWobj()); }
+    static void Postfix() { ChopSync.OnBuildPlaceFinished(ReadFloatingWobj()); }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
 // для певності звіряємо з MainGame.me.player_char.
 [HarmonyPatch]
 public static class OverheadSyncPatch
