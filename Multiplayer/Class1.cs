@@ -2360,6 +2360,14 @@ public class SteamManager : MonoBehaviour
             _logger.LogInfo("[CHOP] Напарник поклав overhead (0x13)");
             Multiplayer.Instance?.ClearRemoteOverhead();
         }
+        else if (type == 0x14)
+        {
+            // ── Напарник ПІДНЯВ наш труп-дзеркало (передача власності) → прибрати наземну копію ──
+            // type(1) uid(8). Труп повернеться як нове дзеркало через 0x11, коли напарник кине.
+            if (data.Length < 9) { _logger.LogWarning($"[CHOP] 0x14 замалий ({data.Length})"); return; }
+            long tuid = BitConverter.ToInt64(data, 1);
+            ChopSync.ApplyRemoteCorpseTransfer(tuid);
+        }
     }
 
 
@@ -4236,6 +4244,7 @@ public static class ChopSync
     private static FieldInfo  _itemInventoryField;      // Item.inventory (List<Item>) — furniture-предмети могили
     private static MethodInfo _getParamMethod;          // WGO.GetParam(string,float) — значення частини могили
     private static MethodInfo _setParamMethod;          // WGO.SetParam(string,float) — форс «завершено» у глядача (без каркаса)
+    private static MethodInfo _getBodyFromInventoryMethod; // WGO.GetBodyFromInventory(bool) — надійний сигнал тіла в могилі (для підпису стадії)
     private static FieldInfo  _uniqueIdField;           // WGO.unique_id (long) — надійний матчинг цілі
     private static FieldInfo  _swUniqueIdField;         // SerializableWGO.unique_id
     private static FieldInfo  _swItemDataField;         // SerializableWGO.item_data (String) — компактний стан _data
@@ -4361,6 +4370,11 @@ public static class ChopSync
         // робить лише SetObject (база), меблі не перемальовує → потрібен форс-редрав після restore.
         _redrawMethod = _wgoType.GetMethods(f | BindingFlags.DeclaredOnly)
             .FirstOrDefault(m => m.Name == "Redraw" && m.GetParameters().Length == 3);
+        // WGO.GetBodyFromInventory(bool) — надійний сигнал «у могилі є тіло» (декомпіл 115283). Тіло
+        // сидить в інвентарі (не в _res_type), тож key-only підпис стадії його НЕ ловив → кладення
+        // тіла в grave_empty не міняло підпис → echo/дедуп ковтав 0x0D → тіло не синкалось, виштовхувалось.
+        _getBodyFromInventoryMethod = _wgoType.GetMethods(f)
+            .FirstOrDefault(m => m.Name == "GetBodyFromInventory" && m.GetParameters().Length == 1);
         // WGO.GetParam/SetParam — щоб у глядача форсити furniture-предмети могили як «завершені»
         // (param≥1) → гра не малює деревʼяний каркас «під будівництвом». _itemInventoryField нижче
         // (після _itemType). GetParam має дефолт-аргумент → шукаємо overload з 2 параметрами.
@@ -4564,6 +4578,17 @@ public static class ChopSync
     // гравця давав 0 → ідентичність як сигнал власності НЕ годиться. Лік дюпу зроблено
     // інакше — echo-приглушення по підпису стадії (нижче), власник не потрібен.
 
+    // Чи є тіло в інвентарі могили (надійний сигнал гри GetBodyFromInventory, не json-парсинг).
+    // Додається в підпис стадії БІТОМ, щоб кладення/виймання тіла міняло підпис (key-only його
+    // не ловив — тіло не в _res_type). На відправнику береться з живого wgo; на приймачі — з біта
+    // в пакеті (variation), бо приймач на момент дедупу ще НЕ застосував стан.
+    private static bool GraveHasBody(MonoBehaviour wgo)
+    {
+        if (_getBodyFromInventoryMethod == null || wgo == null) return false;
+        try { return _getBodyFromInventoryMethod.Invoke(wgo, new object[] { true }) != null; }
+        catch { return false; }
+    }
+
     // === ПІДПИС СТАДІЇ МОГИЛИ (2026-06-08) ===
     // Сирий json має per-frame шум (для ОДНІЄЇ стадії: 13587/13587/13602… → копач слав
     // 14 станів/могилу, глядач робив 13 RestoreFromSerializedObject = мигання рамки).
@@ -4681,7 +4706,11 @@ public static class ChopSync
             long uid     = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
 
             // Підпис СТАДІЇ (не сирий json — він має per-frame шум, лайв-тест 2026-06-08).
-            string sig = GraveStageSig(objId, json);
+            // + БІТ ТІЛА (фікс 2026-06-10): тіло сидить в інвентарі, НЕ в _res_type, тож key-only
+            // підпис кладення тіла в grave_empty не міняв → echo/дедуп ковтав 0x0D → тіло не синкалось
+            // напарнику й виштовхувалось назад. Біт несеться в пакеті (поле variation, біт0).
+            bool hasBody = GraveHasBody(wgo);
+            string sig = GraveStageSig(objId, json) + (hasBody ? "|B" : "");
 
             // ECHO-ПРИГЛУШЕННЯ (фікс дюпу): якщо це РІВНО та стадія, яку ми щойно отримали
             // й застосували для цього uid — це наша ж луна (ми глядач), НЕ власна зміна.
@@ -4719,7 +4748,7 @@ public static class ChopSync
             BitConverter.GetBytes(uid).CopyTo(packet, 1);
             BitConverter.GetBytes(p.x).CopyTo(packet, 9);
             BitConverter.GetBytes(p.y).CopyTo(packet, 13);
-            BitConverter.GetBytes(0).CopyTo(packet, 17);          // variation (резерв)
+            BitConverter.GetBytes(hasBody ? 1 : 0).CopyTo(packet, 17);  // variation: біт0 = тіло в могилі
             int off = 21;
             BitConverter.GetBytes((ushort)idB.Length).CopyTo(packet, off); off += 2;
             Buffer.BlockCopy(idB, 0, packet, off, idB.Length); off += idB.Length;
@@ -4822,7 +4851,9 @@ public static class ChopSync
         // стадія для uid не застосовується двічі → 1 RestoreFromSerializedObject/стадію.
         // ВАЖЛИВО: _lastAppliedGraveSig читає й echo-приглушення у OnLocalGraveStateChanged,
         // тож підпис ОБОВ'ЯЗКОВО той самий (GraveStageSig) на обох шляхах.
-        string sig = GraveStageSig(objId, json);
+        // Біт ТІЛА з пакета (variation біт0) — той самий, що відправник додав у свій підпис. Узгоджено:
+        // після restore наша могила теж матиме тіло → майбутній GraveHasBody(wgo) дасть той самий біт.
+        string sig = GraveStageSig(objId, json) + (((variation & 1) != 0) ? "|B" : "");
         if (_lastAppliedGraveSig.TryGetValue(uid, out var prevSig) && prevSig == sig) return;
 
         // ГАРД МОНОТОННОСТІ (фікс leak B / дюпу, 2026-06-08) — ТЕПЕР ЛИШЕ ПРИ АКТИВНОМУ
@@ -5438,6 +5469,7 @@ public static class ChopSync
     }
     private static readonly List<BodyTrack> _bodies = new List<BodyTrack>();
     private static MethodInfo _destroyLinkedHintMethod;
+    private static FieldInfo _highlightedDropField;   // DropResGameObject.currently_higlighted_obj (static) — який дроп зараз підбираємо
 
     private const float BODY_SETTLE_SEC   = 1.5f;   // відстій фізики після спавну (не слати рух)
     private const float BODY_ECHO_SEC     = 0.4f;   // після 0x0F-руху не слати назад
@@ -5459,6 +5491,17 @@ public static class ChopSync
         if (drop == null) return false;
         for (int i = 0; i < _bodies.Count; i++)
             if (!_bodies[i].isOwner && ReferenceEquals(_bodies[i].go, drop)) return true;
+        return false;
+    }
+
+    // uid трупа-ДЗЕРКАЛА (owner=false) за посиланням на його наземний GO. Для передачі власності:
+    // коли глядач підіймає мирор, треба знати uid, щоб сказати власнику прибрати його наземну копію.
+    private static bool TryGetMirrorUid(object go, out long uid)
+    {
+        uid = 0;
+        if (go == null) return false;
+        for (int i = 0; i < _bodies.Count; i++)
+            if (!_bodies[i].isOwner && ReferenceEquals(_bodies[i].go, go)) { uid = _bodies[i].uid; return true; }
         return false;
     }
 
@@ -5488,6 +5531,26 @@ public static class ChopSync
             return;
         }
         EnsureReflection();
+        // ПЕРЕДАЧА ВЛАСНОСТІ ТРУПА: якщо предмет, який ми щойно підняли над головою — це наш
+        // труп-ДЗЕРКАЛО з землі (DropResGameObject.currently_higlighted_obj у мить SetOverheadItem
+        // ще НЕ занулений грою — обнуляється рядком пізніше, декомпіл TryOtherInteractions 81559→81562),
+        // то власність переходить до НАС. Шлемо 0x14 {uid}, щоб ВЛАСНИК прибрав свій наземний труп
+        // (інакше дубль). Далі несемо (0x12 нижче); кинемо → Drop-хук зробить нас owner=true (0x11→мирор).
+        try
+        {
+            if (_highlightedDropField == null)
+                _highlightedDropField = AccessTools.TypeByName("DropResGameObject")
+                    ?.GetField("currently_higlighted_obj", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            var hl = _highlightedDropField?.GetValue(null);
+            if (hl != null && TryGetMirrorUid(hl, out long muid))
+            {
+                var tp = new byte[9]; tp[0] = 0x14;
+                BitConverter.GetBytes(muid).CopyTo(tp, 1);
+                SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, tp);
+                Multiplayer.Log?.LogInfo($"[CHOP] Підняли труп-дзеркало uid={muid} → 0x14 (передача власності)");
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] 0x14 send впав: {e.Message}"); }
         string icon = "";
         try { if (_getOverheadIconMethod != null) icon = _getOverheadIconMethod.Invoke(item, null) as string ?? ""; }
         catch { }
@@ -5658,6 +5721,22 @@ public static class ChopSync
         _bodies.RemoveAll(t => t.uid == uid);
     }
 
+    // Приймач 0x14: напарник ПІДНЯВ наш труп-дзеркало (передача власності) → прибираємо свій
+    // наземний труп (інакше дубль: він несе overhead, а в нас лежить на землі). Труп повернеться
+    // НОВИМ дзеркалом через 0x11, коли напарник його кине (тоді він — owner). Видалення те саме,
+    // що 0x10, але семантика інша: труп не зник, а перейшов у руки напарника.
+    public static void ApplyRemoteCorpseTransfer(long uid)
+    {
+        var b = FindBodyByUid(uid);
+        if (b == null) { Multiplayer.Log?.LogInfo($"[CHOP] 0x14 uid={uid}: трек не знайдено (вже нема)"); return; }
+        ApplyingRemoteChop = true;
+        try { if (b.go != null) CleanDestroyDrop(b.go); }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x14 прибирання впало: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+        _bodies.RemoveAll(t => t.uid == uid);
+        Multiplayer.Log?.LogInfo($"[CHOP] 0x14: труп uid={uid} передано напарнику (він підняв) — наземну копію прибрано ✓");
+    }
+
     public static void RetryPendingDrops()
     {
         if (_pendingDrops.Count == 0) return;
@@ -5800,25 +5879,11 @@ public static class MirrorCorpseCollectBlockPatch
     static Exception Finalizer(Exception __exception) => null;
 }
 
-// Блок РУЧНОГО підбору трупа-дзеркала: глядач не має забирати чужий мирорений труп.
-[HarmonyPatch]
-public static class MirrorCorpsePickupBlockPatch
-{
-    static MethodBase TargetMethod()
-    {
-        var t = AccessTools.TypeByName("DropResGameObject");
-        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
-                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(m => m.Name == "CanPickupWithInteraction");
-    }
-
-    static void Postfix(MonoBehaviour __instance, ref bool __result)
-    {
-        if (__result && ChopSync.IsMirrorCorpse(__instance)) __result = false;
-    }
-
-    static Exception Finalizer(Exception __exception) => null;
-}
+// ПЕРЕДАЧА ВЛАСНОСТІ ТРУПА (2026-06-10): блок РУЧНОГО підбору трупа-дзеркала ЗНЯТО — глядач
+// ТЕПЕР МОЖЕ підняти мирор, і це передає власність (OnLocalOverheadChanged ловить підйом дзеркала
+// → 0x14 → власник прибирає наземну копію; кидок глядача → Drop-хук робить його owner). Авто-збір
+// (MirrorCorpseCollectBlockPatch вище, CanCollectDrop→0) ЛИШАЄТЬСЯ: передача лише навмисним
+// підйомом (кнопка), не авто-магнітом — інакше труп безконтрольно перестрибував би.
 
 // НОСІННЯ OVERHEAD: BaseCharacterComponent.SetOverheadItem(Item) — універсальний механізм
 // носіння важких предметів (труп/колода/камінь над головою). Хук ЛОКАЛЬНОГО гравця → транслюємо
