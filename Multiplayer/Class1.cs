@@ -208,6 +208,10 @@ public class Multiplayer : BaseUnityPlugin
                 }
             }
             Logger.LogInfo("[MP] PatchAll успішно ✓");
+            // МАРКЕР ЗБІРКИ: перший рядок, який перевіряємо в кожному лайв-лозі — щоб «гра
+            // крутить стару DLL з памʼяті» більше ніколи не зʼїдало тест (інцидент 2026-06-11:
+            // дві сесії тестували попередню збірку, бо гру не перезапустили після деплою).
+            Logger.LogInfo($"[MP] BUILD: {System.IO.File.GetLastWriteTime(System.Reflection.Assembly.GetExecutingAssembly().Location):yyyy-MM-dd HH:mm:ss}");
 
             var tutType = AccessTools.TypeByName("TutorialGUI");
             var openMethod = tutType?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
@@ -2440,6 +2444,36 @@ public class SteamManager : MonoBehaviour
                 ChopSync.ApplyRemoteCraftClaim(auid, astart, acraftId);
             }
         }
+        else if (type == 0x19)
+        {
+            // ── Опи скрині (Фаза 3, конкурентний синк): напарник переклав предмети →
+            // застосовуємо дельти до своєї копії ──
+            // type(1) uid(8) count(1) [idLen(1) id delta(4) jsonLen(2) json]*
+            if (data.Length < 10) { _logger.LogWarning($"[CHOP] 0x19 замалий ({data.Length})"); return; }
+            long ouid = BitConverter.ToInt64(data, 1);
+            int ocount = data[9];
+            var oops = new List<ChopSync.ChestOp>(ocount);
+            int ooff = 10;
+            bool ook = true;
+            for (int i = 0; i < ocount; i++)
+            {
+                if (ooff + 1 > data.Length) { ook = false; break; }
+                int idLen = data[ooff++];
+                if (ooff + idLen + 6 > data.Length) { ook = false; break; }
+                string oid = System.Text.Encoding.UTF8.GetString(data, ooff, idLen); ooff += idLen;
+                int odelta = BitConverter.ToInt32(data, ooff); ooff += 4;
+                int jsonLen = BitConverter.ToUInt16(data, ooff); ooff += 2;
+                string ojson = "";
+                if (jsonLen > 0)
+                {
+                    if (ooff + jsonLen > data.Length) { ook = false; break; }
+                    ojson = System.Text.Encoding.UTF8.GetString(data, ooff, jsonLen); ooff += jsonLen;
+                }
+                oops.Add(new ChopSync.ChestOp { id = oid, delta = odelta, json = ojson });
+            }
+            if (ook) ChopSync.ApplyRemoteChestOps(ouid, oops);
+            else _logger.LogWarning("[CHOP] 0x19 пошкоджений");
+        }
     }
 
 
@@ -4388,6 +4422,18 @@ public static class ChopSync
     private static PropertyInfo _componentsCraftProp;   // ComponentsManager.craft (CraftComponent зі словника)
     private static PropertyInfo _isRemovingProp;        // WGO.is_removing (станція в процесі знесення)
     private static PropertyInfo _wgoProgressProp;       // WGO.progress (float 0..1 → _data.progress)
+    private static Type       _chestGuiType;            // ChestGUI (GUI скрині, декомпіл 44979)
+    private static FieldInfo  _chestObjField;           // ChestGUI._chest_obj (WGO відкритої скрині)
+    private static MethodInfo _chestFullRedrawMethod;   // ChestGUI.FullRedrawPanels(int) — живий рефреш
+    private static PropertyInfo _chestIsShownProp;      // BaseGUI.is_shown (чи відкрита зараз)
+    private static FieldInfo  _guiElementsChestField;   // GUIElements.chest (інстанс ChestGUI, 68701)
+    private static PropertyInfo _guiElementsMeProp;     // GUIElements.me (static singleton, property)
+    private static FieldInfo  _guiElementsMeField;      // GUIElements.me (fallback, якщо поле)
+    private static MethodInfo _wgoSayMethod;            // WGO.Say(string,...) — бабл над гравцем (114227)
+    private static MethodInfo _dataAddItemMethod;       // Item.AddItem(Item, bool) — додати стак (71563)
+    private static MethodInfo _dataRemoveNoCheckMethod; // Item.RemoveItemNoCheck(Item,int,string,List,Item) — зняти скільки є (71904)
+    private static MethodInfo _dataGetTotalCountMethod; // Item.GetTotalCount(string) — скільки є id
+    private static PropertyInfo _wgoDataProp;           // WGO.data (property, яку читає GUI/Inventory)
     private static MethodInfo _setBubbleWidgetDataMethod; // WGO.SetBubbleWidgetData(BubbleWidgetData, WidgetID)
     private static Type _bubbleProgressDataType;        // BubbleWidgetProgressData
     private static Type _progressDelegateType;          // BubbleWidgetProgressData.ProgressDelegate (вкладений)
@@ -4540,6 +4586,23 @@ public static class ChopSync
             if (widType != null) _widgetIdCraftingProgress = Enum.Parse(widType, "CraftingProgress");
         }
         catch { }
+        // Спільні скрині (Фаза 3): ChestGUI._chest_obj + FullRedrawPanels (живий рефреш у
+        // напарника, якщо скриня відкрита в момент 0x0D-restore). GUIElements.me.chest (68701).
+        _chestGuiType          = AccessTools.TypeByName("ChestGUI");
+        _chestObjField         = _chestGuiType?.GetField("_chest_obj", f);
+        _chestFullRedrawMethod = _chestGuiType?.GetMethods(f)
+                                     .FirstOrDefault(m => m.Name == "FullRedrawPanels");
+        _chestIsShownProp      = _chestGuiType?.GetProperty("is_shown",
+                                     BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        var guiElemType        = AccessTools.TypeByName("GUIElements");
+        _guiElementsChestField = guiElemType?.GetField("chest", f);
+        _guiElementsMeProp     = guiElemType?.GetProperty("me", BindingFlags.Public | BindingFlags.Static);
+        if (_guiElementsMeProp == null)
+            _guiElementsMeField = guiElemType?.GetField("me", BindingFlags.Public | BindingFlags.Static);
+        _wgoSayMethod = _wgoType.GetMethods(f).FirstOrDefault(m =>
+            m.Name == "Say" && m.GetParameters().Length >= 4 &&
+            m.GetParameters()[0].ParameterType == typeof(string));
+        _wgoDataProp = _wgoType.GetProperty("data", f);
         _redrawBubbleMethod = _wgoType.GetMethods(f).FirstOrDefault(m => m.Name == "RedrawBubble");
 
         // Анімація падіння дерева — компонент TreeDisappearAnimation на дереві.
@@ -4555,6 +4618,21 @@ public static class ChopSync
         _itemIdField     = _itemType?.GetField("id", f);
         _itemInventoryField = _itemType?.GetField("inventory", f);  // List<Item> — furniture-предмети могили
         _itemValueField  = _itemType?.GetField("value", f);
+        // ⚠️ ОПИ СКРИНІ (0x19) — біндинги СТРОГО ПІСЛЯ присвоєння _itemType! Інцидент 2026-06-11:
+        // цей блок стояв вище за `_itemType = ...`, а EnsureReflection одноразова → методи були
+        // null НАЗАВЖДИ → гілки add/remove тихо скіпались («опи ✓», а вміст не мінявся; 4 тести).
+        _dataAddItemMethod = _itemType?.GetMethods(f).FirstOrDefault(m =>
+            m.Name == "AddItem" && m.GetParameters().Length == 2 &&
+            m.GetParameters()[0].ParameterType == _itemType);
+        _dataRemoveNoCheckMethod = _itemType?.GetMethods(f).FirstOrDefault(m =>
+            m.Name == "RemoveItemNoCheck" && m.GetParameters().Length == 5);
+        // GetTotalCount(string, bool count_in_bags = true) — ДВА параметри (декомпіл 72327).
+        _dataGetTotalCountMethod = _itemType?.GetMethods(f).FirstOrDefault(m =>
+            m.Name == "GetTotalCount" && m.GetParameters().Length == 2 &&
+            m.GetParameters()[0].ParameterType == typeof(string) &&
+            m.GetParameters()[1].ParameterType == typeof(bool));
+        Multiplayer.Log?.LogInfo($"[CHOP] 0x19 біндинги: ctor={_itemCtor != null} add={_dataAddItemMethod != null} " +
+            $"removeNC={_dataRemoveNoCheckMethod != null} total={_dataGetTotalCountMethod != null}");
         _getOverheadIconMethod = _itemType?.GetMethod("GetOverheadIcon", f, null, Type.EmptyTypes, null);
         _toJsonMethod    = _itemType?.GetMethod("ToJSON", f, null, new[] { typeof(int) }, null);
         _fromJsonOverwriteMethod = AccessTools.TypeByName("UnityEngine.JsonUtility")
@@ -4674,8 +4752,13 @@ public static class ChopSync
     {
         if (IsGraveTarget(wgo)) return true;
         if (IsWorkbench(wgo)) return true;   // Фаза 2: крафт на верстатах (obj_def.has_craft)
-        if (_syncedBuildUids.Count == 0 || wgo == null || _uniqueIdField == null) return false;
-        try { return _syncedBuildUids.Contains(Convert.ToInt64(_uniqueIdField.GetValue(wgo))); }
+        if ((_syncedBuildUids.Count == 0 && _knownChestUids.Count == 0) ||
+            wgo == null || _uniqueIdField == null) return false;
+        try
+        {
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            return _syncedBuildUids.Contains(uid) || _knownChestUids.Contains(uid);   // Фаза 3: скрині
+        }
         catch { return false; }
     }
 
@@ -4726,7 +4809,11 @@ public static class ChopSync
                 string id = _itemIdField.GetValue(it) as string ?? "";
                 int val = 0;
                 if (_itemValueField != null) { try { val = Convert.ToInt32(_itemValueField.GetValue(it)); } catch { } }
-                unchecked { h = h * 31 + id.GetHashCode(); h = h * 31 + val; }
+                // + лічильник ВКЛАДЕНОГО інвентаря (Фаза 3): перекладання В СУМКУ всередині скрині
+                // не міняє id/value сумки — без цього хеш не ворухнувся б і зміна не синкнулась.
+                int nested = 0;
+                try { nested = (_itemInventoryField.GetValue(it) as System.Collections.IList)?.Count ?? 0; } catch { }
+                unchecked { h = h * 31 + id.GetHashCode(); h = h * 31 + val; h = h * 31 + nested; }
             }
             return h & 0x3FFFFFFF;   // 30 біт
         }
@@ -5364,6 +5451,350 @@ public static class ChopSync
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] MiniCancelLocalCraft: {e.Message}"); }
     }
 
+    // ── ФАЗА 3: СПІЛЬНІ СКРИНІ (C2; обмін C1 = через скриню) ─────────────────────────────────
+    // У GK з інвентаря НЕ можна кинути предмет на землю → обмін природно йде через скриню.
+    // Механіка: всі перекладання гравець↔скриня йдуть через ChestGUI.MoveItem (декомпіл 45167)
+    // → Postfix шле стан скрині наявним 0x0D (повний JSON _data, інвентар всередині). Трек uid
+    // вузький (тільки відкриті цією сесією скрині, як _syncedBuildUids — не весь світ). Підпис
+    // стає inv-чутливим через WorkbenchInvHash (+лічильник вкладених). Приймач — наявний restore;
+    // якщо скриня в нього ВІДКРИТА — FullRedrawPanels (живий рефреш, бачить зміни одразу).
+    // ВІДОМИЙ ЕДЖ (прийнято, як co-dig): обидва перекладають ОДНУ скриню в межах RTT →
+    // last-write-wins, можливий дюп/зникнення предмета. Не редагувати одну скриню вдвох одночасно.
+    private static readonly HashSet<long> _knownChestUids = new HashSet<long>();
+
+    public static void TrackChestWgo(object wgoObj)
+    {
+        if (!Connected()) return;
+        EnsureReflection();
+        try
+        {
+            var wgo = wgoObj as MonoBehaviour;
+            if (wgo == null || _uniqueIdField == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (_knownChestUids.Add(uid))
+                Multiplayer.Log?.LogInfo($"[CHOP] Скриня uid={uid} у треку синку");
+        }
+        catch { }
+    }
+
+    private static bool IsTrackedChest(MonoBehaviour wgo)
+    {
+        if (_knownChestUids.Count == 0 || wgo == null || _uniqueIdField == null) return false;
+        try { return _knownChestUids.Contains(Convert.ToInt64(_uniqueIdField.GetValue(wgo))); }
+        catch { return false; }
+    }
+
+    // ── СИНК СКРИНІ ОПЕРАЦІЯМИ (0x19) — справжній КОНКУРЕНТНИЙ синк ──────────────────────────
+    // Повні стани (перша версія C2) ламались на контесті: стани в польоті затирали паралельні
+    // зміни → воскресіння предметів (дюп води, лайв-тест 2026-06-11). ОПЕРАЦІЇ («забрав 2 води»,
+    // «поклав 3 дошки») застосовуються поверх будь-якого стану: різні предмети не конфліктують
+    // взагалі, один стак сходиться арифметично (A −2 і B −3 з пʼяти → 0 в обох). Обидва можуть
+    // редагувати скриню ОДНОЧАСНО — без локів. Залишковий едж: обидва забрали ОСТАННІЙ предмет
+    // у вікні RTT → клемп на нулі → 1 зайвий екземпляр (рідкісно, лог-warning).
+    // Операції = ДІФФ вмісту до/після MoveItem (Prefix знімок → Postfix порівняння): ловить
+    // точну фактичну зміну (включно з клемпами самої гри), не довіряючи аргументам.
+    // РЕКОНСИЛІАЦІЯ: закриття GUI шле повний стан 0x0D (ідемпотентний знімок) — але ЛИШЕ якщо
+    // напарник не чіпав цю скриню останні CHEST_SNAPSHOT_QUIESCE с (не затерти його свіже).
+    public struct ChestOp { public string id; public int delta; public string json; }
+    private const float CHEST_SNAPSHOT_QUIESCE = 2f;
+    private static readonly Dictionary<long, float> _lastRemoteChestOpTime = new Dictionary<long, float>();
+    // Знімок вмісту перед MoveItem (виклик синхронний і однопотоковий — один статичний слот).
+    private static long _moveSnapUid = -1;
+    private static Dictionary<string, int> _moveSnapCounts;
+    private static Dictionary<string, int> _moveSnapNested;
+
+    // id → сумарний value по стаках; nested — сумарний розмір вкладених інвентарів (bag-in-chest).
+    private static Dictionary<string, int> ReadChestCounts(MonoBehaviour wgo, Dictionary<string, int> nested)
+    {
+        var map = new Dictionary<string, int>();
+        try
+        {
+            var data = _dataField?.GetValue(wgo);
+            var inv = data != null ? _itemInventoryField?.GetValue(data) as System.Collections.IList : null;
+            if (inv == null) return map;
+            foreach (var it in inv)
+            {
+                if (it == null) continue;
+                string id = _itemIdField?.GetValue(it) as string ?? "";
+                if (id.Length == 0) continue;
+                int val = 1;
+                try { val = Convert.ToInt32(_itemValueField.GetValue(it)); } catch { }
+                map.TryGetValue(id, out var cur); map[id] = cur + val;
+                if (nested != null)
+                {
+                    int n = 0;
+                    try { n = (_itemInventoryField.GetValue(it) as System.Collections.IList)?.Count ?? 0; } catch { }
+                    nested.TryGetValue(id, out var nc); nested[id] = nc + n;
+                }
+            }
+        }
+        catch { }
+        return map;
+    }
+
+    // Prefix ChestGUI.MoveItem: знімок «до» (нічого не блокуємо).
+    public static void CaptureChestBeforeMove(object chestGui)
+    {
+        _moveSnapUid = -1;
+        if (!Connected() || chestGui == null) return;
+        EnsureReflection();
+        try
+        {
+            var wgo = _chestObjField?.GetValue(chestGui) as MonoBehaviour;
+            if (wgo == null || _uniqueIdField == null) return;
+            _moveSnapUid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            _moveSnapNested = new Dictionary<string, int>();
+            _moveSnapCounts = ReadChestCounts(wgo, _moveSnapNested);
+        }
+        catch { _moveSnapUid = -1; }
+    }
+
+    // Postfix ChestGUI.MoveItem: дифф «до/після» → операції 0x19 (або повний стан, якщо зміна
+    // лише всередині сумки-в-скрині — її як add/remove не виразиш).
+    public static void OnLocalChestChanged(object chestGui)
+    {
+        if (ApplyingRemoteChop || !Connected() || chestGui == null) return;
+        EnsureReflection();
+        try
+        {
+            var wgo = _chestObjField?.GetValue(chestGui) as MonoBehaviour;
+            if (wgo == null || _uniqueIdField == null) return;
+            TrackChestWgo(wgo);
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (_moveSnapUid != uid || _moveSnapCounts == null) return;   // знімка нема — нічого слати
+            var nestedAfter = new Dictionary<string, int>();
+            var after = ReadChestCounts(wgo, nestedAfter);
+
+            var ops = new List<ChestOp>();
+            foreach (var kv in after)
+            {
+                _moveSnapCounts.TryGetValue(kv.Key, out var before);
+                if (kv.Value != before) ops.Add(new ChestOp { id = kv.Key, delta = kv.Value - before });
+            }
+            foreach (var kv in _moveSnapCounts)
+                if (!after.ContainsKey(kv.Key)) ops.Add(new ChestOp { id = kv.Key, delta = -kv.Value });
+
+            if (ops.Count == 0)
+            {
+                // Кількості не змінились — можливо, зміна всередині сумки-в-скрині → повний стан.
+                bool nestedChanged = false;
+                foreach (var kv in nestedAfter)
+                {
+                    _moveSnapNested.TryGetValue(kv.Key, out var nb);
+                    if (kv.Value != nb) { nestedChanged = true; break; }
+                }
+                if (nestedChanged) OnLocalGraveStateChanged(wgo);
+                return;
+            }
+            // json для додавань (якість/вміст сумки): беремо живий стак цього id зі скрині.
+            for (int i = 0; i < ops.Count; i++)
+                if (ops[i].delta > 0)
+                {
+                    var op = ops[i];
+                    op.json = GetChestStackJson(wgo, op.id);
+                    ops[i] = op;
+                }
+            SendChestOps(uid, ops);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalChestChanged: {e.Message}"); }
+        finally { _moveSnapUid = -1; }
+    }
+
+    private static string GetChestStackJson(MonoBehaviour wgo, string id)
+    {
+        try
+        {
+            var data = _dataField?.GetValue(wgo);
+            var inv = data != null ? _itemInventoryField?.GetValue(data) as System.Collections.IList : null;
+            if (inv == null || _toJsonMethod == null) return "";
+            foreach (var it in inv)
+            {
+                if (it == null) continue;
+                if ((_itemIdField?.GetValue(it) as string) == id)
+                    return _toJsonMethod.Invoke(it, new object[] { 0 }) as string ?? "";
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    // 0x19: uid(8) count(1) [idLen(1) id delta(4) jsonLen(2) json]*
+    private static void SendChestOps(long uid, List<ChestOp> ops)
+    {
+        try
+        {
+            int payload = 0;
+            var idB = new List<byte[]>(ops.Count);
+            var jsB = new List<byte[]>(ops.Count);
+            foreach (var op in ops)
+            {
+                var ib = System.Text.Encoding.UTF8.GetBytes(op.id);
+                var jb = op.delta > 0 && !string.IsNullOrEmpty(op.json)
+                             ? System.Text.Encoding.UTF8.GetBytes(op.json) : new byte[0];
+                if (jb.Length > 60000) jb = new byte[0];   // захист; приймач збудує без якості
+                idB.Add(ib); jsB.Add(jb);
+                payload += 1 + ib.Length + 4 + 2 + jb.Length;
+            }
+            var packet = new byte[10 + payload];
+            packet[0] = 0x19;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            packet[9] = (byte)Math.Min(ops.Count, 255);
+            int off = 10;
+            for (int i = 0; i < ops.Count && i < 255; i++)
+            {
+                packet[off++] = (byte)idB[i].Length;
+                Buffer.BlockCopy(idB[i], 0, packet, off, idB[i].Length); off += idB[i].Length;
+                BitConverter.GetBytes(ops[i].delta).CopyTo(packet, off); off += 4;
+                BitConverter.GetBytes((ushort)jsB[i].Length).CopyTo(packet, off); off += 2;
+                Buffer.BlockCopy(jsB[i], 0, packet, off, jsB[i].Length); off += jsB[i].Length;
+            }
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            var descr = string.Join(", ", ops.ConvertAll(o => $"{(o.delta > 0 ? "+" : "")}{o.delta} {o.id}").ToArray());
+            Multiplayer.Log?.LogInfo($"[CHOP] Скриня uid={uid}: опи → {descr} (0x19)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] SendChestOps: {e.Message}"); }
+    }
+
+    // Приймач 0x19: застосувати дельти до СВОЄЇ копії скрині. delta>0 → новий стак (json несе
+    // якість/вміст сумки, value=delta поверх); delta<0 → RemoveItemNoCheck (знімає скільки є —
+    // клемп природний; нестача = контест останнього предмета, лог-warning).
+    public static void ApplyRemoteChestOps(long uid, List<ChestOp> ops)
+    {
+        EnsureReflection();
+        _lastRemoteChestOpTime[uid] = Time.realtimeSinceStartup;
+        var wgo = FindWgoByUniqueId(uid);
+        if (wgo == null)
+        {
+            Multiplayer.Log?.LogWarning($"[CHOP] 0x19: скриню uid={uid} не знайдено (зона не завантажена?) — опи втрачено, реконсиліація на закритті GUI напарника");
+            return;
+        }
+        var data = _dataField?.GetValue(wgo);
+        if (data == null) return;
+        // ДІАГНОСТИКА (тест C2 #3: «опи ✓, але нічого не міняється»): чи GUI читає ТОЙ САМИЙ
+        // контейнер, який мутуємо ми (wgo.data property vs поле _data)?
+        try
+        {
+            var dataProp = _wgoDataProp?.GetValue(wgo);
+            if (dataProp != null && !ReferenceEquals(dataProp, data))
+                Multiplayer.Log?.LogWarning($"[CHOP] 0x19 DIAG: wgo.data ≠ _data ДЛЯ uid={uid} — мутуємо сироту!");
+        }
+        catch { }
+        ApplyingRemoteChop = true;
+        try
+        {
+            foreach (var op in ops)
+            {
+                if (op.delta < 0)
+                {
+                    int have = 0;
+                    try
+                    {
+                        if (_dataGetTotalCountMethod != null)
+                            have = Convert.ToInt32(_dataGetTotalCountMethod.Invoke(data, new object[] { op.id, true }));
+                        else
+                        {
+                            // Фолбек: ручний підрахунок по top-level інвентарю (метод не збіндився).
+                            var inv = _itemInventoryField?.GetValue(data) as System.Collections.IList;
+                            if (inv != null)
+                                foreach (var it in inv)
+                                    if (it != null && (_itemIdField?.GetValue(it) as string) == op.id)
+                                        have += Convert.ToInt32(_itemValueField?.GetValue(it) ?? 0);
+                        }
+                    }
+                    catch { }
+                    int take = Math.Min(have, -op.delta);
+                    if (take < -op.delta)
+                        Multiplayer.Log?.LogWarning($"[CHOP] 0x19: клемп {op.id} (просили −{-op.delta}, було {have}) — контест останнього предмета");
+                    if (take > 0 && _dataRemoveNoCheckMethod != null && _itemCtor != null)
+                    {
+                        var probe = _itemCtor.Invoke(new object[] { op.id, take });
+                        var removed = _dataRemoveNoCheckMethod.Invoke(data, new object[] { probe, take, "", null, null });
+                        int afterR = 0;
+                        try { afterR = Convert.ToInt32(_dataGetTotalCountMethod?.Invoke(data, new object[] { op.id, true }) ?? -1); } catch { }
+                        Multiplayer.Log?.LogInfo($"[CHOP] 0x19 DIAG: remove {op.id} take={take} ret={removed} було={have} стало={afterR}");
+                    }
+                }
+                else if (op.delta > 0 && _itemCtor != null && _dataAddItemMethod != null)
+                {
+                    var item = _itemCtor.Invoke(new object[] { op.id, 1 });
+                    if (!string.IsNullOrEmpty(op.json) && _fromJsonOverwriteMethod != null)
+                        try { _fromJsonOverwriteMethod.Invoke(null, new object[] { op.json, item }); } catch { }
+                    _itemValueField?.SetValue(item, op.delta);
+                    var ok = _dataAddItemMethod.Invoke(data, new object[] { item, true });
+                    bool added = ok is bool ab && ab;
+                    if (!added)
+                    {
+                        // АУДИТ 2026-06-11: CanAddCount (72203) = inventory_size − inventory.Count →
+                        // AddItem ВІДМОВЛЯЄ на повній/розбіжній копії. Але у ВІДПРАВНИКА предмет
+                        // фізично лежить — копія мусить віддзеркалити: пряма вставка повз ліміт.
+                        try
+                        {
+                            var invList = _itemInventoryField?.GetValue(data) as System.Collections.IList;
+                            if (invList != null)
+                            {
+                                invList.Add(item);
+                                added = true;
+                                Multiplayer.Log?.LogWarning($"[CHOP] 0x19: AddItem відмовив ({op.id} x{op.delta}, копія повна/розбіжна) — пряма вставка ✓");
+                            }
+                        }
+                        catch (Exception ie) { Multiplayer.Log?.LogError($"[CHOP] 0x19: пряма вставка впала: {ie.Message}"); }
+                    }
+                    int afterA = 0;
+                    try { afterA = Convert.ToInt32(_dataGetTotalCountMethod?.Invoke(data, new object[] { op.id, true }) ?? -1); } catch { }
+                    Multiplayer.Log?.LogInfo($"[CHOP] 0x19 DIAG: add {op.id} x{op.delta} ok={added} стало={afterA}");
+                }
+            }
+            var descr = string.Join(", ", ops.ConvertAll(o => $"{(o.delta > 0 ? "+" : "")}{o.delta} {o.id}").ToArray());
+            Multiplayer.Log?.LogInfo($"[CHOP] Скриня uid={uid}: опи застосовано ← {descr} ✓");
+            RefreshOpenChestGui(wgo);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteChestOps: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
+    }
+
+    // Закриття GUI: повний стан як реконсиліація (ідемпотентно; покриває втрачені опи далеких
+    // зон) — але не затираємо свіжу активність напарника (quiesce).
+    public static void OnLocalChestClosed(object chestGui)
+    {
+        if (ApplyingRemoteChop || !Connected() || chestGui == null) return;
+        EnsureReflection();
+        try
+        {
+            var wgo = _chestObjField?.GetValue(chestGui) as MonoBehaviour;
+            if (wgo == null || _uniqueIdField == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (!_knownChestUids.Contains(uid)) return;
+            if (_lastRemoteChestOpTime.TryGetValue(uid, out var t) &&
+                Time.realtimeSinceStartup - t < CHEST_SNAPSHOT_QUIESCE)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] Скриня uid={uid}: знімок на закритті пропущено (напарник щойно редагував)");
+                return;
+            }
+            OnLocalGraveStateChanged(wgo);
+        }
+        catch { }
+    }
+
+    // Після 0x0D-restore: якщо в НАС зараз відкрита САМЕ ця скриня — перебудувати панелі GUI
+    // (інакше гравець дивиться на стейл, поки не перевідкриє).
+    private static void RefreshOpenChestGui(MonoBehaviour wgo)
+    {
+        if (_chestGuiType == null || _chestObjField == null || _chestFullRedrawMethod == null) return;
+        try
+        {
+            object me = _guiElementsMeProp != null ? _guiElementsMeProp.GetValue(null)
+                                                   : _guiElementsMeField?.GetValue(null);
+            var gui = me != null ? _guiElementsChestField?.GetValue(me) : null;
+            if (gui == null) return;
+            if (_chestIsShownProp != null && !Convert.ToBoolean(_chestIsShownProp.GetValue(gui))) return;
+            if (!ReferenceEquals(_chestObjField.GetValue(gui), wgo)) return;
+            var pars = _chestFullRedrawMethod.GetParameters();
+            _chestFullRedrawMethod.Invoke(gui, pars.Length == 1 ? new object[] { -1 } : new object[0]);
+            Multiplayer.Log?.LogInfo("[CHOP] Відкриту скриню синкнуто — панелі оновлено ✓");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] RefreshOpenChestGui: {e.Message}"); }
+    }
+
     private static bool IsPlayerActor(MonoBehaviour actor)
     {
         if (actor == null) return false;
@@ -5577,7 +6008,8 @@ public static class ChopSync
             // МОГИЛИ ВИКЛЮЧЕНО (вони теж has_craft): їх покриває body-біт + key-sig — перевірений
             // 8 ітераціями шлях; додавання inv-хешу ризикувало б echo-приглушенням (повернення
             // дюп-петлі 2026-06-08), якби restore хоч якось нормалізував інвентар.
-            int invH = (IsWorkbench(wgo) && !IsGraveTarget(wgo)) ? WorkbenchInvHash(wgo) : 0;
+            int invH = (!IsGraveTarget(wgo) && (IsWorkbench(wgo) || IsTrackedChest(wgo)))
+                           ? WorkbenchInvHash(wgo) : 0;   // Фаза 3: скрині теж inv-чутливі
             string sig = GraveStageSig(objId, json) + (hasBody ? "|B" : "") + (invH != 0 ? "|w" + invH : "");
 
             // ECHO-ПРИГЛУШЕННЯ (фікс дюпу): якщо це РІВНО та стадія, яку ми щойно отримали
@@ -5817,6 +6249,8 @@ public static class ChopSync
                 _graveSentParts.Remove(uid);
             }
             Multiplayer.Log?.LogInfo($"[CHOP] Могила uid={uid} obj={objId} стан відновлено ✓ (json={json.Length}ch)");
+            // Фаза 3: якщо ця скриня зараз відкрита у нас — живий рефреш панелей (бачимо зміни одразу).
+            RefreshOpenChestGui(target);
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x0D RestoreFromSerializedObject впав: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
@@ -7336,6 +7770,73 @@ public static class CraftCancelSyncPatch
     static void Postfix(object __instance)
     {
         ChopSync.OnLocalCraftCancelled(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ФАЗА 3 (спільні скрині): відкриття скрині → трек uid (вузький, лише відкриті цією сесією).
+// ChestGUI.Open(WorldGameObject) — декомпіл 45002; аргумент біндиться за іменем chest_obj.
+[HarmonyPatch]
+public static class ChestOpenTrackPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("ChestGUI");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "Open" && m.GetParameters().Length == 1);
+    }
+
+    static void Postfix(object chest_obj)
+    {
+        ChopSync.TrackChestWgo(chest_obj);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ФАЗА 3 (спільні скрині): закриття GUI → повний стан 0x0D як реконсиліація (ідемпотентний
+// знімок; добирає опи, втрачені далеким напарником). Quiesce всередині OnLocalChestClosed.
+[HarmonyPatch]
+public static class ChestCloseSnapshotPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("ChestGUI");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "Hide");
+    }
+
+    static void Postfix(object __instance)
+    {
+        ChopSync.OnLocalChestClosed(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ФАЗА 3 (спільні скрині, КОНКУРЕНТНО): перекладання гравець↔скриня — лійка ChestGUI.MoveItem
+// (5 арг, декомпіл 45167). Prefix = знімок вмісту «до» (НЕ блокує), Postfix = дифф → операції
+// 0x19 (±N предмета). Обидва гравці можуть редагувати скриню одночасно.
+[HarmonyPatch]
+public static class ChestMoveSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("ChestGUI");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "MoveItem" && m.GetParameters().Length == 5);
+    }
+
+    static void Prefix(object __instance)
+    {
+        ChopSync.CaptureChestBeforeMove(__instance);
+    }
+
+    static void Postfix(object __instance)
+    {
+        ChopSync.OnLocalChestChanged(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
