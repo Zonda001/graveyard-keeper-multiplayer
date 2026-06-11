@@ -2063,6 +2063,9 @@ public class SteamManager : MonoBehaviour
             // Етап 3a: ре-claim живих крафтів (тримає TTL у напарника) + прибирання мертвих.
             ChopSync.TickCraftClaims();
 
+            // Погода: дослати розклад хоста, щойно є кому (включно з late-join).
+            ChopSync.TickWeatherSync();
+
             // Дерева, зрубані поки ми були в іншій локації — пробуємо знищити,
             // коли гравець дійде до них і вони завантажаться.
             _chopRetryTimer += Time.deltaTime;
@@ -2473,6 +2476,25 @@ public class SteamManager : MonoBehaviour
             }
             if (ook) ChopSync.ApplyRemoteChestOps(ouid, oops);
             else _logger.LogWarning("[CHOP] 0x19 пошкоджений");
+        }
+        else if (type == 0x1A)
+        {
+            // ── Погода від хоста (добовий розклад пресетів): type day(4) count(1) [len(1)+name]* ──
+            if (data.Length < 6) { _logger.LogWarning($"[CHOP] 0x1A замалий ({data.Length})"); return; }
+            int wday = BitConverter.ToInt32(data, 1);
+            int wcount = data[5];
+            var wnames = new List<string>(wcount);
+            int woff = 6;
+            bool wok = true;
+            for (int i = 0; i < wcount; i++)
+            {
+                if (woff + 1 > data.Length) { wok = false; break; }
+                int nlen = data[woff++];
+                if (woff + nlen > data.Length) { wok = false; break; }
+                wnames.Add(System.Text.Encoding.UTF8.GetString(data, woff, nlen)); woff += nlen;
+            }
+            if (wok) ChopSync.ApplyRemoteWeather(wday, wnames);
+            else _logger.LogWarning("[CHOP] 0x1A пошкоджений");
         }
     }
 
@@ -4453,6 +4475,12 @@ public static class ChopSync
     private static ConstructorInfo _bubbleItemCtor;     // BubbleWidgetItemData(string item_id, ...)
     private static FieldInfo  _bubbleItemIconIdField;   // BubbleWidgetItemData.icon_id
     private static object _widgetIdCraftingItem;        // enum WidgetID.CraftingItem
+    private static PropertyInfo _envMeProp;             // EnvironmentEngine.me (static, 36015)
+    private static MethodInfo _findNatureMethod;        // EnvironmentEngine.FindNatureWithoutRemoves (36709)
+    private static MethodInfo _tryRemoveNatureMethod;   // EnvironmentEngine.TryRemoveNatureWeatherState (36573)
+    private static MethodInfo _addNatureMethod;         // EnvironmentEngine.AddNatureWeatherState (36500)
+    private static MethodInfo _weatherPresetGetMethod;  // WeatherPreset.GetPreset(string) static (37494)
+    private static MethodInfo _getStatesFromPresetMethod; // SwitchableWeatherState.GetStatesFromPreset static (37448)
     private static MethodInfo _setBubbleWidgetDataMethod; // WGO.SetBubbleWidgetData(BubbleWidgetData, WidgetID)
     private static Type _bubbleProgressDataType;        // BubbleWidgetProgressData
     private static Type _progressDelegateType;          // BubbleWidgetProgressData.ProgressDelegate (вкладений)
@@ -4683,6 +4711,19 @@ public static class ChopSync
         catch { }
         Multiplayer.Log?.LogInfo($"[CHOP] grave-bubble біндинги: getData={_getCraftDefMethod != null} " +
             $"ctor={_bubbleItemCtor != null} widId={_widgetIdCraftingItem != null}");
+        // ПОГОДА (0x1A): хост-авторитарний добовий розклад пресетів.
+        var envType = AccessTools.TypeByName("EnvironmentEngine");
+        _envMeProp             = envType?.GetProperty("me", BindingFlags.Public | BindingFlags.Static);
+        _findNatureMethod      = envType?.GetMethod("FindNatureWithoutRemoves", f);
+        _tryRemoveNatureMethod = envType?.GetMethod("TryRemoveNatureWeatherState", f);
+        _addNatureMethod       = envType?.GetMethod("AddNatureWeatherState", f);
+        _weatherPresetGetMethod = AccessTools.TypeByName("WeatherPreset")
+            ?.GetMethod("GetPreset", BindingFlags.Public | BindingFlags.Static);
+        _getStatesFromPresetMethod = AccessTools.TypeByName("SwitchableWeatherState")
+            ?.GetMethod("GetStatesFromPreset", BindingFlags.Public | BindingFlags.Static);
+        Multiplayer.Log?.LogInfo($"[CHOP] погода-біндинги: me={_envMeProp != null} find={_findNatureMethod != null} " +
+            $"rm={_tryRemoveNatureMethod != null} add={_addNatureMethod != null} " +
+            $"preset={_weatherPresetGetMethod != null} states={_getStatesFromPresetMethod != null}");
         Multiplayer.Log?.LogInfo($"[CHOP] стокпайл-біндинги: character={_componentsCharacterProp != null} " +
             $"overhead={_getOverheadItemMethod != null}");
         _getOverheadIconMethod = _itemType?.GetMethod("GetOverheadIcon", f, null, Type.EmptyTypes, null);
@@ -6096,6 +6137,138 @@ public static class ChopSync
             Multiplayer.Log?.LogInfo("[CHOP] Відкриту скриню синкнуто — панелі оновлено ✓");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] RefreshOpenChestGui: {e.Message}"); }
+    }
+
+    // ── ПОГОДА (0x1A, Фаза 5-лайт): хост-авторитарний добовий розклад ────────────────────────
+    // SmartWeatherEngine.UpdateWeather (37129) ролить 4 пресети дня (ніч/ранок/день/вечір,
+    // офсети 0/0.15/0.35/0.7) ВИПАДКОВО НА КОЖНІЙ МАШИНІ → дощ розходиться. Хост після свого
+    // ролла шле 4 імені пресетів; клієнт відтворює ТОЙ САМИЙ розклад (ремув старої nature-лінії
+    // + GetStatesFromPreset + AddNatureWeatherState — точно як тіло UpdateWeather). Фейл-опен:
+    // нема пакета → клієнт живе зі своїм роллом (нічого не ламається, лише різний дощ).
+    private static readonly float[] WEATHER_DAY_OFFSETS = { 0f, 0.15f, 0.35f, 0.7f };
+    private const float WEATHER_REMOVE_DEC = 10f / 450f;   // TimeOfDay.FromSecondsToTimeK(10) = t/450
+    private static bool _collectingWeather;
+    private static readonly List<string> _weatherCollect = new List<string>();
+    private static int _lastWeatherDay = -1;
+    private static string[] _lastWeatherNames;
+    private static bool _weatherSyncedToPeer;
+    private static FieldInfo _mainGameSaveField, _gameSaveDayField;
+    private static FieldInfo _mainGameMeField;   // ⚠️ MainGame.me — ПОЛЕ (100838), не property!
+
+    private static int GetGameDay()
+    {
+        try
+        {
+            if (_mainGameMeField == null)
+            {
+                var mg = AccessTools.TypeByName("MainGame");
+                _mainGameMeField   = mg?.GetField("me", BindingFlags.Public | BindingFlags.Static);
+                _mainGameSaveField = mg?.GetField("save", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _gameSaveDayField  = AccessTools.TypeByName("GameSave")?.GetField("day",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            }
+            var me   = _mainGameMeField?.GetValue(null);
+            var save = me != null ? _mainGameSaveField?.GetValue(me) : null;
+            return save != null && _gameSaveDayField != null
+                ? Convert.ToInt32(_gameSaveDayField.GetValue(save)) : -1;
+        }
+        catch { return -1; }
+    }
+
+    public static void OnWeatherGenStart()
+    {
+        _collectingWeather = true;
+        _weatherCollect.Clear();
+    }
+
+    public static void OnWeatherPresetChosen(object preset)
+    {
+        if (!_collectingWeather) return;
+        var uo = preset as UnityEngine.Object;
+        if (uo != null) _weatherCollect.Add(uo.name);
+    }
+
+    public static void OnWeatherGenEnd()
+    {
+        _collectingWeather = false;
+        if (_weatherCollect.Count != 4) return;
+        // Зберігаємо НЕЗАЛЕЖНО від ролі: хост генерує добовий розклад ще ДО створення лобі
+        // (Role==None у момент завантаження світу) — інакше late-join не мав би чого дослати.
+        // ВІДПРАВКУ гейтить TickWeatherSync (лише хост + Connected).
+        _lastWeatherDay = GetGameDay();
+        _lastWeatherNames = _weatherCollect.ToArray();
+        _weatherSyncedToPeer = false;
+        TickWeatherSync();
+        if (_lastWeatherDay < 0)
+            Multiplayer.Log?.LogWarning("[CHOP] Погода: день не зчитався (-1) — розклад не застосується правильно!");
+    }
+
+    // З SteamManager.Update (хост): дослати збережений розклад, щойно є кому (включно з
+    // late-join — клієнт зайшов посеред дня). Один раз на підключення/розклад.
+    public static void TickWeatherSync()
+    {
+        if (SteamNetwork.Role != NetworkRole.Host) return;
+        if (!Connected()) { _weatherSyncedToPeer = false; return; }
+        if (_weatherSyncedToPeer || _lastWeatherNames == null) return;
+        try
+        {
+            int payload = 0;
+            var nb = new List<byte[]>(4);
+            foreach (var n in _lastWeatherNames)
+            {
+                var b = System.Text.Encoding.UTF8.GetBytes(n ?? "");
+                if (b.Length > 255) b = new byte[0];
+                nb.Add(b); payload += 1 + b.Length;
+            }
+            var packet = new byte[6 + payload];
+            packet[0] = 0x1A;
+            BitConverter.GetBytes(_lastWeatherDay).CopyTo(packet, 1);
+            packet[5] = (byte)nb.Count;
+            int off = 6;
+            foreach (var b in nb)
+            {
+                packet[off++] = (byte)b.Length;
+                Buffer.BlockCopy(b, 0, packet, off, b.Length); off += b.Length;
+            }
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            _weatherSyncedToPeer = true;
+            Multiplayer.Log?.LogInfo($"[CHOP] Погода дня {_lastWeatherDay} → {string.Join("/", _lastWeatherNames)} (0x1A)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] TickWeatherSync: {e.Message}"); }
+    }
+
+    // Клієнт: відтворити розклад хоста (дзеркало тіла UpdateWeather, але з ЗАДАНИМИ пресетами).
+    public static void ApplyRemoteWeather(int day, List<string> names)
+    {
+        if (SteamNetwork.Role == NetworkRole.Host || names == null || names.Count == 0) return;
+        if (day < 0) { Multiplayer.Log?.LogWarning("[CHOP] 0x1A: день<0 — розклад відкинуто (захист)"); return; }
+        EnsureReflection();
+        if (_envMeProp == null || _addNatureMethod == null || _tryRemoveNatureMethod == null ||
+            _weatherPresetGetMethod == null || _getStatesFromPresetMethod == null || _findNatureMethod == null) return;
+        try
+        {
+            var env = _envMeProp.GetValue(null);
+            if (env == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x1A: EnvironmentEngine ще не готовий"); return; }
+            for (int i = 0; i < names.Count && i < WEATHER_DAY_OFFSETS.Length; i++)
+            {
+                float t = day + WEATHER_DAY_OFFSETS[i];
+                var existing = _findNatureMethod.Invoke(env, null) as System.Collections.IEnumerable;
+                if (existing != null)
+                {
+                    var toRemove = new List<string>();
+                    foreach (var pn in existing) if (pn is string s) toRemove.Add(s);
+                    foreach (var s in toRemove)
+                        _tryRemoveNatureMethod.Invoke(env, new object[] { s, t, WEATHER_REMOVE_DEC });
+                }
+                var preset = _weatherPresetGetMethod.Invoke(null, new object[] { names[i] });
+                if (preset == null) continue;
+                var states = _getStatesFromPresetMethod.Invoke(null, new object[] { t, preset }) as System.Collections.IEnumerable;
+                if (states == null) continue;
+                foreach (var st in states) _addNatureMethod.Invoke(env, new object[] { st });
+            }
+            Multiplayer.Log?.LogInfo($"[CHOP] Погода від хоста: день {day} → {string.Join("/", names.ToArray())} ✓");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteWeather: {e.Message}"); }
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
@@ -7951,6 +8124,45 @@ public static class ItemRemoveSyncPatch
     static void Postfix(object __instance, object __0, int __1, bool __result)
     {
         ChopSync.OnLocalDataItemRemoved(__instance, __0, __1, __result);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ПОГОДА (0x1A): дужки навколо генератора добового розкладу SmartWeatherEngine.UpdateWeather
+// (37129) — Prefix вмикає колектор, Postfix шле зібрані пресети (лише хост, гейт усередині).
+[HarmonyPatch]
+public static class WeatherGenBracketPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("SmartWeatherEngine");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "UpdateWeather" && m.GetParameters().Length == 0);
+    }
+
+    static void Prefix()  { ChopSync.OnWeatherGenStart(); }
+    static void Postfix() { ChopSync.OnWeatherGenEnd(); }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ПОГОДА (0x1A): кожен ролл пресета (SmartWeatherSettings.GetWeatherPreset, 37200) під час
+// генерації → у колектор (порядок фіксований: ніч/ранок/день/вечір).
+[HarmonyPatch]
+public static class WeatherPresetChosenPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("SmartWeatherSettings");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "GetWeatherPreset" && m.GetParameters().Length == 0);
+    }
+
+    static void Postfix(object __result)
+    {
+        ChopSync.OnWeatherPresetChosen(__result);
     }
 
     static Exception Finalizer(Exception __exception) => null;
