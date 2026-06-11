@@ -4434,6 +4434,8 @@ public static class ChopSync
     private static MethodInfo _dataRemoveNoCheckMethod; // Item.RemoveItemNoCheck(Item,int,string,List,Item) — зняти скільки є (71904)
     private static MethodInfo _dataGetTotalCountMethod; // Item.GetTotalCount(string) — скільки є id
     private static PropertyInfo _wgoDataProp;           // WGO.data (property, яку читає GUI/Inventory)
+    private static PropertyInfo _componentsCharacterProp; // ComponentsManager.character (BaseCharacterComponent)
+    private static MethodInfo _getOverheadItemMethod;   // BaseCharacterComponent.GetOverheadItem() (81896)
     private static MethodInfo _setBubbleWidgetDataMethod; // WGO.SetBubbleWidgetData(BubbleWidgetData, WidgetID)
     private static Type _bubbleProgressDataType;        // BubbleWidgetProgressData
     private static Type _progressDelegateType;          // BubbleWidgetProgressData.ProgressDelegate (вкладений)
@@ -4633,6 +4635,12 @@ public static class ChopSync
             m.GetParameters()[1].ParameterType == typeof(bool));
         Multiplayer.Log?.LogInfo($"[CHOP] 0x19 біндинги: ctor={_itemCtor != null} add={_dataAddItemMethod != null} " +
             $"removeNC={_dataRemoveNoCheckMethod != null} total={_dataGetTotalCountMethod != null}");
+        // СТОКПАЙЛИ (Фаза 3): пут/тейк носимих ресурсів. Біндинги ПІСЛЯ _wgoComponentsProp (правило №2).
+        _componentsCharacterProp = _wgoComponentsProp?.PropertyType.GetProperty("character", f);
+        _getOverheadItemMethod = AccessTools.TypeByName("BaseCharacterComponent")?
+            .GetMethods(f).FirstOrDefault(m => m.Name == "GetOverheadItem" && m.GetParameters().Length == 0);
+        Multiplayer.Log?.LogInfo($"[CHOP] стокпайл-біндинги: character={_componentsCharacterProp != null} " +
+            $"overhead={_getOverheadItemMethod != null}");
         _getOverheadIconMethod = _itemType?.GetMethod("GetOverheadIcon", f, null, Type.EmptyTypes, null);
         _toJsonMethod    = _itemType?.GetMethod("ToJSON", f, null, new[] { typeof(int) }, null);
         _fromJsonOverwriteMethod = AccessTools.TypeByName("UnityEngine.JsonUtility")
@@ -5747,9 +5755,153 @@ public static class ChopSync
             var descr = string.Join(", ", ops.ConvertAll(o => $"{(o.delta > 0 ? "+" : "")}{o.delta} {o.id}").ToArray());
             Multiplayer.Log?.LogInfo($"[CHOP] Скриня uid={uid}: опи застосовано ← {descr} ✓");
             RefreshOpenChestGui(wgo);
+            // Фаза 3 (стокпайли): візуал купи (колоди/камінь малюються) — форс-редрав.
+            // Для скринь no-op (вони не міняють вигляд), під echo-guard — re-send не буде.
+            if (_redrawMethod != null)
+                try { _redrawMethod.Invoke(wgo, new object[] { true, false, false }); } catch { }
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteChestOps: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
+    }
+
+    // ── СТОКПАЙЛИ НОСИМИХ РЕСУРСІВ (Фаза 3): той самий оп-канал 0x19 ────────────────────────
+    // Колоди/камінь несуть у руках: ПУТ = PutOverheadToWGO → wgo.AddToInventory (декомпіл 74558,
+    // вже хукнуто GraveAddBodySyncPatch); ТЕЙК = WGO.GiveItemToPlayersHands (115845:
+    // data.RemoveItem + в руки). Приймач опів generic (мутує _data за uid) — тригери нові.
+    // 0x0D-цілі (могили/верстати/будови/скрині) опами НЕ ведемо (їх веде стан) — без дублювання.
+
+    // Цілі, які веде ПОВНИЙ СТАН 0x0D зі своїми тригерами (опи для них = дублювання).
+    // Трековані скрині/стокпайли сюди НЕ входять — їх ведуть опи (+ знімки-реконсиліації).
+    private static bool IsStateSyncedStation(MonoBehaviour wgo)
+    {
+        if (IsGraveTarget(wgo) || IsWorkbench(wgo)) return true;
+        if (_syncedBuildUids.Count == 0 || _uniqueIdField == null) return false;
+        try { return _syncedBuildUids.Contains(Convert.ToInt64(_uniqueIdField.GetValue(wgo))); }
+        catch { return false; }
+    }
+
+    // Реверс-мапа data(Item) → WGO (лінивий скан, кеш назавжди — _data живе з обʼєктом).
+    private static readonly Dictionary<object, MonoBehaviour> _dataWgoMap = new Dictionary<object, MonoBehaviour>();
+    private static MonoBehaviour MapDataToWgo(object data)
+    {
+        if (data == null) return null;
+        if (_dataWgoMap.TryGetValue(data, out var cached)) return cached;
+        MonoBehaviour found = null;
+        try
+        {
+            foreach (var w in ScanWgosCached())
+            {
+                var mb = w as MonoBehaviour;
+                if (mb == null) continue;
+                if (ReferenceEquals(_dataField?.GetValue(mb), data)) { found = mb; break; }
+            }
+        }
+        catch { }
+        _dataWgoMap[data] = found;   // кешуємо і null (data сумки/сейв-обʼєкта — не wgo)
+        return found;
+    }
+
+    // Тротльований повний знімок контейнера (реконсиліація розбіжностей стокпайлів — у них
+    // нема GUI-закриття, як у скринь). Quiesce по чужих опах + 10с/uid.
+    private const float CONTAINER_SNAPSHOT_THROTTLE = 10f;
+    private static readonly Dictionary<long, float> _lastContainerSnapshotTime = new Dictionary<long, float>();
+    // Явний дозвіл на повний стан оп-веденого контейнера (знімок-реконсиліація). Без нього
+    // OnLocalGraveStateChanged для трекованих скринь/стокпайлів МОВЧИТЬ — інакше кожен пут
+    // (AddToInventory-хук) серіалізував би 7КБ json (ЛАГ) і гнався б зі свіжими опами напарника
+    // в польоті (ДЮП «+1 колода», лайв-тест стокпайлів #2).
+    private static bool _containerSnapshotPass;
+
+    private static void MaybeSendContainerSnapshot(MonoBehaviour wgo, long uid)
+    {
+        try
+        {
+            if (_lastRemoteChestOpTime.TryGetValue(uid, out var rt) &&
+                Time.realtimeSinceStartup - rt < CHEST_SNAPSHOT_QUIESCE) return;
+            if (_lastContainerSnapshotTime.TryGetValue(uid, out var st) &&
+                Time.realtimeSinceStartup - st < CONTAINER_SNAPSHOT_THROTTLE) return;
+            _lastContainerSnapshotTime[uid] = Time.realtimeSinceStartup;
+            TrackChestWgo(wgo);
+            _containerSnapshotPass = true;
+            try { OnLocalGraveStateChanged(wgo); }
+            finally { _containerSnapshotPass = false; }
+        }
+        catch { _containerSnapshotPass = false; }
+    }
+
+    // Хук Item.RemoveItem(Item,int,Item) — ЄДИНА лійка зняття з data будь-якого контейнера
+    // (TakeItemFromWGO-лямбда стокпайлів 74197, GiveItemToPlayersHands 115847 тощо).
+    public static void OnLocalDataItemRemoved(object data, object item, int count, bool result)
+    {
+        if (!result || ApplyingRemoteChop || !Connected() || data == null || item == null) return;
+        if (_moveSnapUid != -1) return;   // всередині ChestGUI.MoveItem — діфф-опи скрині покриють
+        EnsureReflection();
+        try
+        {
+            var wgo = MapDataToWgo(data);
+            if (wgo == null) return;                       // data сумки/гравцевих підструктур
+            if (IsPlayerActor(wgo)) return;                // інвентар гравця не синкаємо (дизайн)
+            if (IsStateSyncedStation(wgo)) return;         // верстати/могили/будови — веде 0x0D
+            if (_uniqueIdField == null || _itemIdField == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            string id = _itemIdField.GetValue(item) as string ?? "";
+            if (id.Length == 0) return;
+            int val = count;
+            if (val <= 0) { try { val = Math.Max(1, Convert.ToInt32(_itemValueField.GetValue(item))); } catch { val = 1; } }
+            SendChestOps(uid, new List<ChestOp> { new ChestOp { id = id, delta = -val, json = "" } });
+            MaybeSendContainerSnapshot(wgo, uid);
+        }
+        catch { }
+    }
+
+    private static object GetLocalPlayerOverheadItem()
+    {
+        try
+        {
+            var lp = GetLocalPlayerWgo();
+            if (lp == null || _wgoComponentsProp == null || _componentsCharacterProp == null ||
+                _getOverheadItemMethod == null) return null;
+            var cm = _wgoComponentsProp.GetValue(lp);
+            var ch = cm != null ? _componentsCharacterProp.GetValue(cm) : null;
+            return ch != null ? _getOverheadItemMethod.Invoke(ch, null) : null;
+        }
+        catch { return null; }
+    }
+
+    // ПУТ носимого (з Postfix AddToInventory, лише __result=true). Гейт «це САМЕ носимий пут
+    // гравця»: у Postfix SetOverheadItem(null) ще НЕ викликаний (74560 — після) → overhead == item.
+    public static void OnLocalContainerPut(MonoBehaviour wgo, object item)
+    {
+        if (ApplyingRemoteChop || !Connected() || wgo == null || item == null) return;
+        EnsureReflection();
+        try
+        {
+            if (IsStateSyncedStation(wgo)) return;   // верстати/могили/будови — веде 0x0D (тригер поряд)
+            if (!ReferenceEquals(GetLocalPlayerOverheadItem(), item)) return;
+            if (_uniqueIdField == null || _itemIdField == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            string id = _itemIdField.GetValue(item) as string ?? "";
+            if (id.Length == 0) return;
+            int val = 1;
+            try { val = Math.Max(1, Convert.ToInt32(_itemValueField.GetValue(item))); } catch { }
+            SendChestOps(uid, new List<ChestOp>
+                { new ChestOp { id = id, delta = val, json = GetChestStackJson(wgo, id) } });
+            MaybeSendContainerSnapshot(wgo, uid);
+        }
+        catch { }
+    }
+
+    // ТЕЙК через GiveItemToPlayersHands: ЛИШЕ state-шлях для 0x0D-цілей (закриває діру «взяв
+    // вихід верстата в руки»). −Опи для стокпайлів шле OnLocalDataItemRemoved (хук Item.RemoveItem
+    // — GiveItemToPlayersHands сам кличе data.RemoveItem усередині, 115847 → подвійного опа нема).
+    public static void OnLocalContainerTake(MonoBehaviour wgo, object item)
+    {
+        if (ApplyingRemoteChop || !Connected() || wgo == null || item == null) return;
+        EnsureReflection();
+        try
+        {
+            if (IsStateSyncedStation(wgo)) OnLocalGraveStateChanged(wgo);
+        }
+        catch { }
     }
 
     // Закриття GUI: повний стан як реконсиліація (ідемпотентно; покриває втрачені опи далеких
@@ -5770,7 +5922,9 @@ public static class ChopSync
                 Multiplayer.Log?.LogInfo($"[CHOP] Скриня uid={uid}: знімок на закритті пропущено (напарник щойно редагував)");
                 return;
             }
-            OnLocalGraveStateChanged(wgo);
+            _containerSnapshotPass = true;
+            try { OnLocalGraveStateChanged(wgo); }
+            finally { _containerSnapshotPass = false; }
         }
         catch { }
     }
@@ -5979,6 +6133,11 @@ public static class ChopSync
     {
         if (ApplyingRemoteChop || !Connected()) return;
         if (!IsStateRepTarget(wgo)) return;   // могила АБО синкнута будівля (Фаза 2)
+        // ОП-ВЕДЕНІ КОНТЕЙНЕРИ (трековані скрині/стокпайли): повний стан — ЛИШЕ явна
+        // реконсиліація (_containerSnapshotPass: знімок на закритті GUI / тротльований
+        // MaybeSendContainerSnapshot). Живі зміни ведуть ОПИ 0x19. Інакше кожен пут серіалізує
+        // 7КБ json (ЛАГ при спамі) і стани в польоті гоняться з опами напарника (ДЮП).
+        if (!_containerSnapshotPass && IsTrackedChest(wgo) && !IsStateSyncedStation(wgo)) return;
         // ГЕЙТ БЛИЗЬКОСТІ для верстатів (фікс флуду bat_test, лайв-тест 2026-06-11): has_craft
         // обʼєктів у світі багато (дев-тестові bat_test розкидані по всій мапі), і на завантаженні
         // всі фаєрять RedrawPart → сплеск 0x0D, який приймач навіть не може застосувати (обʼєкт
@@ -7589,9 +7748,60 @@ public static class GraveAddBodySyncPatch
                               && m.GetParameters()[0].ParameterType.Name == "Item");
     }
 
-    static void Postfix(MonoBehaviour __instance)
+    // __0 = доданий Item; __result = чи реально додано (112588 повертає bool — звірено).
+    static void Postfix(MonoBehaviour __instance, object __0, bool __result)
     {
         ChopSync.OnLocalGraveStateChanged(__instance);
+        // Фаза 3 (стокпайли): носимий пут гравця на НЕ-0x0D ціль → оп +N (гейти всередині).
+        if (__result) ChopSync.OnLocalContainerPut(__instance, __0);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ФАЗА 3 (стокпайли): взяти носиме зі складу в руки — WGO.GiveItemToPlayersHands (115845:
+// data.RemoveItem + SetOverheadItem). Оп −N; для 0x0D-цілей — повний стан (закриває діру
+// «взяв вихід верстата в руки — інвентар верстата не синкався»).
+[HarmonyPatch]
+public static class GiveToHandsSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "GiveItemToPlayersHands"
+                              && m.GetParameters().Length == 1);
+    }
+
+    static void Postfix(MonoBehaviour __instance, object __0)
+    {
+        ChopSync.OnLocalContainerTake(__instance, __0);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ФАЗА 3 (стокпайли, фікс лайв-тесту «купа росла без мінусів»): тейк зі стокпайла йде
+// flow-лямбдою TakeItemFromWGO (74197: _wgo.data.RemoveItem(item,1)), НЕ через
+// GiveItemToPlayersHands. Лямбду не патчимо — хукаємо ЛІЙКУ Item.RemoveItem(Item,int,Item)
+// (71886, повертає bool; усі тейки контейнерів сходяться сюди). Гейти/мапа data→WGO/
+// придушення всередині ChestGUI.MoveItem — в OnLocalDataItemRemoved.
+[HarmonyPatch]
+public static class ItemRemoveSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var it = AccessTools.TypeByName("Item");
+        return it?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "RemoveItem" && m.GetParameters().Length == 3 &&
+                                 m.GetParameters()[0].ParameterType.Name == "Item" &&
+                                 m.GetParameters()[1].ParameterType == typeof(int));
+    }
+
+    static void Postfix(object __instance, object __0, int __1, bool __result)
+    {
+        ChopSync.OnLocalDataItemRemoved(__instance, __0, __1, __result);
     }
 
     static Exception Finalizer(Exception __exception) => null;
