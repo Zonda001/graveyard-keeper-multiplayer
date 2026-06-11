@@ -3426,10 +3426,18 @@ public static class MainMenuGUIOpenPatch
             }
 
             // Після MENU_BLOCK_DURATION — це справжній вихід гравця в меню.
+            // ФІКС «вихід із трупом у руках»: кинути overhead ДО виходу (поки P2P живий —
+            // 0x11 встигає полетіти напарнику; spurious-кейси відсіяні вище).
+            ChopSync.DropOverheadOnExit();
             // Скидаємо IsInGame і дозволяємо меню відкритись.
             Multiplayer.Log?.LogInfo($"[CLIENT] MainMenuGUI.Open дозволено (вихід гравця, t={timeSinceInGame:F1}с)");
             SteamNetwork.IsInGame = false;
             SteamNetwork.IsInGameSince = -1f;
+        }
+        else if (!SteamNetwork.IsClientMode && SteamNetwork.IsInGame && SteamNetwork.IsConnected)
+        {
+            // ХОСТ виходить у меню з предметом у руках — той самий фікс (кидок лягає і в сейв).
+            ChopSync.DropOverheadOnExit();
         }
 
         return true;
@@ -4436,6 +4444,15 @@ public static class ChopSync
     private static PropertyInfo _wgoDataProp;           // WGO.data (property, яку читає GUI/Inventory)
     private static PropertyInfo _componentsCharacterProp; // ComponentsManager.character (BaseCharacterComponent)
     private static MethodInfo _getOverheadItemMethod;   // BaseCharacterComponent.GetOverheadItem() (81896)
+    private static MethodInfo _dropOverheadMethod;      // BaseCharacterComponent.DropOverheadItem(bool) (82064)
+    private static PropertyInfo _gameBalanceMeProp;     // GameBalance.me (static)
+    private static MethodInfo _getCraftDefMethod;       // GameBalance.GetData<CraftDefinition>(string)
+    private static FieldInfo  _craftDefOutputField;     // CraftDefinition.output (List<Item>)
+    private static FieldInfo  _craftDefIconField;       // CraftDefinition.icon (sprite id)
+    private static Type       _bubbleItemDataType;      // BubbleWidgetItemData
+    private static ConstructorInfo _bubbleItemCtor;     // BubbleWidgetItemData(string item_id, ...)
+    private static FieldInfo  _bubbleItemIconIdField;   // BubbleWidgetItemData.icon_id
+    private static object _widgetIdCraftingItem;        // enum WidgetID.CraftingItem
     private static MethodInfo _setBubbleWidgetDataMethod; // WGO.SetBubbleWidgetData(BubbleWidgetData, WidgetID)
     private static Type _bubbleProgressDataType;        // BubbleWidgetProgressData
     private static Type _progressDelegateType;          // BubbleWidgetProgressData.ProgressDelegate (вкладений)
@@ -4639,6 +4656,33 @@ public static class ChopSync
         _componentsCharacterProp = _wgoComponentsProp?.PropertyType.GetProperty("character", f);
         _getOverheadItemMethod = AccessTools.TypeByName("BaseCharacterComponent")?
             .GetMethods(f).FirstOrDefault(m => m.Name == "GetOverheadItem" && m.GetParameters().Length == 0);
+        _dropOverheadMethod = AccessTools.TypeByName("BaseCharacterComponent")?
+            .GetMethods(f).FirstOrDefault(m => m.Name == "DropOverheadItem" && m.GetParameters().Length == 1 &&
+                                               m.GetParameters()[0].ParameterType == typeof(bool));
+        // Іконка-бабл над могилою напарника (візуальні клейми): CraftDefinition по craftId з клейма.
+        try
+        {
+            var gbType = AccessTools.TypeByName("GameBalance");
+            var cdType = AccessTools.TypeByName("CraftDefinition");
+            _gameBalanceMeProp = gbType?.GetProperty("me", BindingFlags.Public | BindingFlags.Static);
+            var getData = gbType?.GetMethods(f | BindingFlags.Public).FirstOrDefault(m =>
+                m.Name == "GetData" && m.IsGenericMethod && m.GetParameters().Length == 1 &&
+                m.GetParameters()[0].ParameterType == typeof(string));
+            if (getData != null && cdType != null) _getCraftDefMethod = getData.MakeGenericMethod(cdType);
+            _craftDefOutputField = cdType?.GetField("output", f);
+            _craftDefIconField   = cdType?.GetField("icon", f);
+            _bubbleItemDataType  = AccessTools.TypeByName("BubbleWidgetItemData");
+            _bubbleItemCtor      = _bubbleItemDataType?.GetConstructors()
+                .FirstOrDefault(c => c.GetParameters().Length >= 1 &&
+                                     c.GetParameters()[0].ParameterType == typeof(string));
+            _bubbleItemIconIdField = _bubbleItemDataType?.GetField("icon_id", f);
+            var widType2 = AccessTools.TypeByName("BubbleWidgetData")?.GetNestedType("WidgetID",
+                               BindingFlags.Public | BindingFlags.NonPublic);
+            if (widType2 != null) _widgetIdCraftingItem = Enum.Parse(widType2, "CraftingItem");
+        }
+        catch { }
+        Multiplayer.Log?.LogInfo($"[CHOP] grave-bubble біндинги: getData={_getCraftDefMethod != null} " +
+            $"ctor={_bubbleItemCtor != null} widId={_widgetIdCraftingItem != null}");
         Multiplayer.Log?.LogInfo($"[CHOP] стокпайл-біндинги: character={_componentsCharacterProp != null} " +
             $"overhead={_getOverheadItemMethod != null}");
         _getOverheadIconMethod = _itemType?.GetMethod("GetOverheadIcon", f, null, Type.EmptyTypes, null);
@@ -5177,7 +5221,10 @@ public static class ChopSync
         try
         {
             var wgo = _componentWgoProp.GetValue(craftComponent) as MonoBehaviour;
-            if (wgo == null || !IsArbitratedStation(wgo)) return;
+            // МОГИЛИ: клейм ВИКЛЮЧНО ВІЗУАЛЬНИЙ (бабл+прогрес-бар напарнику, запит Zonda 2026-06-11).
+            // Блокування могил НЕ вмикається (ShouldBlock відсіює через IsArbitratedStation),
+            // гонка клеймів для могил не скасовує крафт (гілка в ApplyRemoteCraftClaim) — co-dig цілий.
+            if (wgo == null || !(IsArbitratedStation(wgo) || IsGraveTarget(wgo))) return;
             if (IsWgoRemoving(wgo)) return;   // знесення поза арбітражем (стара модель + 0x16)
             long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
             string craftId = "";
@@ -5303,6 +5350,20 @@ public static class ChopSync
         // отримавши хостів); клієнт робить mini-cancel свого крафту й реєструє блок.
         if (_localCrafting.ContainsKey(uid))
         {
+            // МОГИЛИ (візуальні клейми): co-dig — НОРМА, не гонка. Нічого не скасовуємо, обидва
+            // клейми живуть (блокування могил все одно не існує); прогрес-мирор гейтиться
+            // локальним is_crafting у ApplyRemoteCraftProgress.
+            try
+            {
+                var raceWgo = FindWgoByUniqueId(uid);
+                if (raceWgo != null && IsGraveTarget(raceWgo))
+                {
+                    _remoteIconWidgets.Remove(uid);
+                    _remoteCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
+                    return;
+                }
+            }
+            catch { }
             if (SteamNetwork.Role == NetworkRole.Host)
             {
                 Multiplayer.Log?.LogWarning($"[CHOP] Гонка стартів uid={uid}: я хост — лишаюсь власником");
@@ -5311,6 +5372,7 @@ public static class ChopSync
             Multiplayer.Log?.LogWarning($"[CHOP] Гонка стартів uid={uid}: поступаюсь хосту (mini-cancel, витрачені матеріали втрачено)");
             MiniCancelLocalCraft(uid);
         }
+        _remoteIconWidgets.Remove(uid);   // новий крафт (нова стадія) → іконка перебудується
         _remoteCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
     }
 
@@ -5380,10 +5442,60 @@ public static class ChopSync
         {
             var wgo = FindWgoByUniqueId(uid);
             if (wgo == null || _wgoProgressProp == null) return;
+            // CO-DIG ЗАХИСТ (могили з візуальними клеймами): якщо Я САМ зараз крафчу/копаю цей
+            // wgo (is_crafting локально) — чужий прогрес НЕ сміє затирати мій (мій бар = мій DoAction).
+            try
+            {
+                var myCc = GetCraftComponent(wgo);
+                if (myCc != null && _isCraftingField != null &&
+                    Convert.ToBoolean(_isCraftingField.GetValue(myCc))) return;
+            }
+            catch { }
             _wgoProgressProp.SetValue(wgo, Mathf.Clamp01(p));
             EnsureRemoteProgressBar(wgo, uid);
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteCraftProgress: {e.Message}"); }
+    }
+
+    // Іконка роботи напарника (бабл): з CraftDefinition по craftId клейма — output[0] (як гра в
+    // черзі, 84608-11; у копальних крафтів могили вихід = частина могили) або sprite-icon.
+    private static readonly Dictionary<long, object> _remoteIconWidgets = new Dictionary<long, object>();
+    private static object BuildClaimIconWidget(string craftId)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(craftId) || _getCraftDefMethod == null ||
+                _gameBalanceMeProp == null || _bubbleItemDataType == null) return null;
+            var gb = _gameBalanceMeProp.GetValue(null);
+            var cd = gb != null ? _getCraftDefMethod.Invoke(gb, new object[] { craftId }) : null;
+            if (cd == null) return null;
+            // 1) item-іконка з output[0].id (рідний вигляд предмета з рамкою)
+            var output = _craftDefOutputField?.GetValue(cd) as System.Collections.IList;
+            if (output != null && output.Count > 0 && output[0] != null && _bubbleItemCtor != null)
+            {
+                var outId = _itemIdField?.GetValue(output[0]) as string;
+                if (!string.IsNullOrEmpty(outId))
+                {
+                    var ps = _bubbleItemCtor.GetParameters();
+                    var args = new object[ps.Length];
+                    args[0] = outId;
+                    for (int i = 1; i < ps.Length; i++)
+                        args[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue
+                                : (ps[i].ParameterType.IsValueType ? Activator.CreateInstance(ps[i].ParameterType) : null);
+                    return _bubbleItemCtor.Invoke(args);
+                }
+            }
+            // 2) фолбек: sprite-іконка крафту
+            var icon = _craftDefIconField?.GetValue(cd) as string;
+            if (!string.IsNullOrEmpty(icon) && _bubbleItemIconIdField != null)
+            {
+                var w = Activator.CreateInstance(_bubbleItemDataType);
+                _bubbleItemIconIdField.SetValue(w, icon);
+                return w;
+            }
+        }
+        catch { }
+        return null;
     }
 
     // Рідний віджет бару в слот CraftingProgress (той, що гра ставить при is_crafting).
@@ -5403,19 +5515,35 @@ public static class ChopSync
                 _remoteBarWidgets[uid] = wdata;
             }
             _setBubbleWidgetDataMethod.Invoke(wgo, new object[] { wdata, _widgetIdCraftingProgress });
+            // Іконка роботи (бабл над могилою напарника; для станцій — узгоджена з чергою 0x17).
+            if (_widgetIdCraftingItem != null)
+            {
+                if (!_remoteIconWidgets.TryGetValue(uid, out var iconW))
+                {
+                    string cid = _remoteCrafting.TryGetValue(uid, out var cl) ? cl.craftId : null;
+                    iconW = BuildClaimIconWidget(cid);
+                    _remoteIconWidgets[uid] = iconW;   // кешуємо і null (нема чого малювати)
+                }
+                if (iconW != null)
+                    _setBubbleWidgetDataMethod.Invoke(wgo, new object[] { iconW, _widgetIdCraftingItem });
+            }
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] EnsureRemoteProgressBar: {e.Message}"); }
     }
 
-    // Стоп/звільнення станції: прибрати бар (слот → null, як робить сама гра в 84633).
+    // Стоп/звільнення станції: прибрати бар та іконку (слоти → null, як гра в 84632-33).
     private static void ClearRemoteProgressBar(long uid)
     {
-        if (!_remoteBarWidgets.Remove(uid)) return;
+        bool hadIcon = _remoteIconWidgets.Remove(uid);
+        if (!_remoteBarWidgets.Remove(uid) && !hadIcon) return;
         try
         {
             var wgo = FindWgoByUniqueId(uid);
-            if (wgo != null && _setBubbleWidgetDataMethod != null && _widgetIdCraftingProgress != null)
+            if (wgo == null || _setBubbleWidgetDataMethod == null) return;
+            if (_widgetIdCraftingProgress != null)
                 _setBubbleWidgetDataMethod.Invoke(wgo, new object[] { null, _widgetIdCraftingProgress });
+            if (_widgetIdCraftingItem != null)
+                _setBubbleWidgetDataMethod.Invoke(wgo, new object[] { null, _widgetIdCraftingItem });
         }
         catch { }
     }
@@ -5865,6 +5993,27 @@ public static class ChopSync
             return ch != null ? _getOverheadItemMethod.Invoke(ch, null) : null;
         }
         catch { return null; }
+    }
+
+    // ФІНІШНА ПРЯМА — фікс «вихід із трупом у руках» (відкладений баг 2026-06-10): коли носій
+    // виходить у меню з предметом overhead, предмет зникав зі світу НАЗАВЖДИ (0x14 прибрав копію
+    // напарника; труп існував лише в памʼяті носія). Фікс: примусовий кидок на землю ПЕРЕД
+    // виходом → DropOverheadItem → DropResGameObject.Drop → наявний CorpseDropBroadcastPatch
+    // шле 0x11 (труп із повним JSON зʼявляється в напарника), а в сейві носія труп лягає на землю.
+    public static void DropOverheadOnExit()
+    {
+        try
+        {
+            EnsureReflection();
+            if (GetLocalPlayerOverheadItem() == null) return;
+            var lp = GetLocalPlayerWgo();
+            var cm = lp != null ? _wgoComponentsProp?.GetValue(lp) : null;
+            var ch = cm != null ? _componentsCharacterProp?.GetValue(cm) : null;
+            if (ch == null || _dropOverheadMethod == null) return;
+            _dropOverheadMethod.Invoke(ch, new object[] { false });
+            Multiplayer.Log?.LogInfo("[CHOP] Вихід із предметом у руках → кинуто на землю ✓ (труп синкне 0x11)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] DropOverheadOnExit: {e.Message}"); }
     }
 
     // ПУТ носимого (з Postfix AddToInventory, лише __result=true). Гейт «це САМЕ носимий пут
