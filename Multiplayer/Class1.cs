@@ -2391,6 +2391,30 @@ public class SteamManager : MonoBehaviour
             long ruid = BitConverter.ToInt64(data, 1);
             ChopSync.ApplyRemoteBuildRemove(ruid);
         }
+        else if (type == 0x17)
+        {
+            // ── Крафт-черга верстата (Фаза 2 кооп-крафт Етап 1): напарник змінив чергу →
+            // відбудовуємо craft_queue + RedrawBubble, щоб бачити ті самі вікна над станціями ──
+            // type(1) uid(8) count(2) [idLen(1) id n(4) infinite(1)]*
+            if (data.Length < 11) { _logger.LogWarning($"[CHOP] 0x17 замалий ({data.Length})"); return; }
+            long cuid = BitConverter.ToInt64(data, 1);
+            int ccount = BitConverter.ToUInt16(data, 9);
+            var items = new List<ChopSync.CraftQ>(ccount);
+            int coff = 11;
+            bool cok = true;
+            for (int i = 0; i < ccount; i++)
+            {
+                if (coff + 1 > data.Length) { cok = false; break; }
+                int idLen = data[coff++];
+                if (coff + idLen + 5 > data.Length) { cok = false; break; }
+                string id = System.Text.Encoding.UTF8.GetString(data, coff, idLen); coff += idLen;
+                int n = BitConverter.ToInt32(data, coff); coff += 4;
+                bool inf = data[coff++] != 0;
+                items.Add(new ChopSync.CraftQ { id = id, n = n, infinite = inf });
+            }
+            if (cok) ChopSync.ApplyRemoteCraftQueue(cuid, items);
+            else _logger.LogWarning("[CHOP] 0x17 пошкоджений");
+        }
     }
 
 
@@ -4323,6 +4347,20 @@ public static class ChopSync
     private const float GRAVE_RESTORE_ARTIFACT_WINDOW = 8f;
     private static FieldInfo  _afterHp0Field;           // ObjectDefinition.after_hp_0
     private static MethodInfo _afterHp0GetValue;        // ChancedStringValue.GetValue(wgo,char)
+    private static FieldInfo  _hasCraftField;           // ObjectDefinition.has_craft (верстат/крафт-станція)
+    private static Type       _craftComponentType;      // CraftComponent (компонент крафту на верстаті)
+    private static FieldInfo  _craftQueueField;         // CraftComponent.craft_queue (List<CraftQueueItem>)
+    private static Type       _craftQueueItemType;      // CraftComponent+CraftQueueItem (вкладений)
+    private static FieldInfo  _cqiIdField;              // CraftQueueItem.id (string — CraftDefinition id)
+    private static FieldInfo  _cqiNField;               // CraftQueueItem.n (int — кількість у черзі)
+    private static FieldInfo  _cqiInfiniteField;        // CraftQueueItem.infinite (bool)
+    private static FieldInfo  _isCraftingField;         // CraftComponent.is_crafting (активний крафт)
+    private static FieldInfo  _currentCraftField;       // CraftComponent.current_craft (CraftDefinition)
+    private static FieldInfo  _craftDefIdField;         // CraftDefinition.id (успадковане з BalanceBaseObject)
+    private static PropertyInfo _componentWgoProp;      // WorldGameObjectComponent.wgo (дістати WGO з компонента)
+    private static PropertyInfo _wgoComponentsProp;     // WGO.components (ComponentsManager — НЕ Unity-компоненти!)
+    private static PropertyInfo _componentsCraftProp;   // ComponentsManager.craft (CraftComponent зі словника)
+    private static MethodInfo _redrawBubbleMethod;      // WGO.RedrawBubble — перемалювати вікно черги
     private static Type       _treeDisappearType;       // TreeDisappearAnimation (компонент дерева)
     private static MethodInfo _startAnimationMethod;    // TreeDisappearAnimation.StartAnimation(VoidDelegate)
     private static Type       _voidDelegateType;        // VoidDelegate (делегат void())
@@ -4428,8 +4466,28 @@ public static class ChopSync
         _swVariationField = _serializableWgoType?.GetField("variation", f);
         _dataField        = _wgoType.GetField("_data", f);
         _afterHp0Field   = AccessTools.TypeByName("ObjectDefinition")?.GetField("after_hp_0", f);
+        _hasCraftField   = AccessTools.TypeByName("ObjectDefinition")?.GetField("has_craft", f);
         _afterHp0GetValue = AccessTools.TypeByName("ChancedStringValue")?.GetMethods(f)
             .FirstOrDefault(m => m.Name == "GetValue" && m.GetParameters().Length == 2);
+
+        // Крафт-черга (Фаза 2 кооп-крафт, Етап 1): CraftComponent.craft_queue (List<CraftQueueItem>).
+        _craftComponentType = AccessTools.TypeByName("CraftComponent");
+        _craftQueueField    = _craftComponentType?.GetField("craft_queue", f);
+        _craftQueueItemType = _craftComponentType?.GetNestedType("CraftQueueItem",
+                                  BindingFlags.Public | BindingFlags.NonPublic);
+        _cqiIdField         = _craftQueueItemType?.GetField("id", f);
+        _cqiNField          = _craftQueueItemType?.GetField("n", f);
+        _cqiInfiniteField   = _craftQueueItemType?.GetField("infinite", f);
+        _isCraftingField    = _craftComponentType?.GetField("is_crafting", f);
+        _currentCraftField  = _craftComponentType?.GetField("current_craft", f);
+        _craftDefIdField    = AccessTools.TypeByName("CraftDefinition")?.GetField("id", f);
+        _componentWgoProp   = AccessTools.TypeByName("WorldGameObjectComponent")?.GetProperty("wgo", f);
+        // CraftComponent — НЕ MonoBehaviour (WorldGameObjectComponentBase = звичайний клас, декомпіл
+        // 100354), GetComponentInChildren його НІКОЛИ не знайде (лайв-тест 2026-06-11: 0x17 мовчав).
+        // Правильний шлях гри: wgo.components (ComponentsManager, 111820) → .craft (82514).
+        _wgoComponentsProp   = _wgoType.GetProperty("components", f);
+        _componentsCraftProp = _wgoComponentsProp?.PropertyType.GetProperty("craft", f);
+        _redrawBubbleMethod = _wgoType.GetMethods(f).FirstOrDefault(m => m.Name == "RedrawBubble");
 
         // Анімація падіння дерева — компонент TreeDisappearAnimation на дереві.
         _treeDisappearType = AccessTools.TypeByName("TreeDisappearAnimation");
@@ -4520,7 +4578,10 @@ public static class ChopSync
         if (id == null) return false;
         return id.StartsWith("tree") || id.StartsWith("stone") ||
                id.StartsWith("steep") || id.StartsWith("grave") ||
-               id.StartsWith("garden") || IsNatureGatherTarget(id);
+               id.StartsWith("garden") || IsNatureGatherTarget(id) ||
+               IsWorkbench(wgo);   // Фаза 2 крафт: ручний крафт скидає вихід через DropItems на землю
+                                   // (декомпіл 83249) — спільний лут реплеїть напарнику. Авто-крафт у
+                                   // інвентар верстата йде окремо через 0x0D inv-hash.
     }
 
     // Природні «збиральні» обʼєкти: квіти (flower_small_*), гриби (mushroom_*),
@@ -4559,9 +4620,251 @@ public static class ChopSync
     private static bool IsStateRepTarget(MonoBehaviour wgo)
     {
         if (IsGraveTarget(wgo)) return true;
+        if (IsWorkbench(wgo)) return true;   // Фаза 2: крафт на верстатах (obj_def.has_craft)
         if (_syncedBuildUids.Count == 0 || wgo == null || _uniqueIdField == null) return false;
         try { return _syncedBuildUids.Contains(Convert.ToInt64(_uniqueIdField.GetValue(wgo))); }
         catch { return false; }
+    }
+
+    // Верстат/крафт-станція = obj_def.has_craft (декомпіл 78335). Стан крафту (вихід) сидить в
+    // ІНВЕНТАРІ верстата, не в obj_id → потрібен інвентар-чутливий підпис (нижче), інакше дедуп глушить.
+    private static bool IsWorkbench(MonoBehaviour wgo)
+    {
+        if (_objDefField == null || _hasCraftField == null || wgo == null) return false;
+        try
+        {
+            var od = _objDefField.GetValue(wgo);
+            return od != null && Convert.ToBoolean(_hasCraftField.GetValue(od));
+        }
+        catch { return false; }
+    }
+
+    // Радіус «гравець поруч із верстатом» (юніти світу). Крафт-взаємодія впритул (~150-300 одиниць
+    // за лайв-логом: лут падав за ~160 від гравця), а дев-обʼєкти bat_test на 2000+ одиниць — поріг
+    // 1200 чисто розділяє. Гейтить лише верстати (могили/будівлі завжди впритул, без гейту).
+    private const float WORKBENCH_SYNC_RANGE = 1200f;
+
+    // Локальний гравець у радіусі range від обʼєкта (по XY). Дешевий sqrMagnitude-чек.
+    private static bool NearLocalPlayer(MonoBehaviour wgo, float range)
+    {
+        if (wgo == null) return false;
+        var lp = GetLocalPlayerWgo();
+        if (lp == null) return false;   // не знайшли гравця — НЕ синкаємо (краще пропустити, ніж флуд)
+        Vector2 d = (Vector2)wgo.transform.position - (Vector2)lp.transform.position;
+        return d.sqrMagnitude <= range * range;
+    }
+
+    // Хеш ВМІСТУ інвентаря верстата (id+value пар). Міняється коли матеріали завантажено / вихід
+    // додано / забрано → підпис стадії змінюється → 0x0D синкає. СТАЛИЙ під час самого крафту
+    // (інвентар не міняється, лише progress) → не флудить. 30 біт (лізе в variation поряд із body-бітом).
+    private static int WorkbenchInvHash(MonoBehaviour wgo)
+    {
+        if (_dataField == null || _itemInventoryField == null || _itemIdField == null) return 0;
+        try
+        {
+            var data = _dataField.GetValue(wgo);
+            if (data == null) return 0;
+            var inv = _itemInventoryField.GetValue(data) as System.Collections.IList;
+            if (inv == null) return 0;
+            int h = 0;
+            foreach (var it in inv)
+            {
+                if (it == null) continue;
+                string id = _itemIdField.GetValue(it) as string ?? "";
+                int val = 0;
+                if (_itemValueField != null) { try { val = Convert.ToInt32(_itemValueField.GetValue(it)); } catch { } }
+                unchecked { h = h * 31 + id.GetHashCode(); h = h * 31 + val; }
+            }
+            return h & 0x3FFFFFFF;   // 30 біт
+        }
+        catch { return 0; }
+    }
+
+    // ── СИНК КРАФТ-ЧЕРГИ (0x17, Фаза 2 кооп-крафт — ЕТАП 1: ВИДИМІСТЬ черги) ─────────────────
+    // craft_queue сидить у CraftComponent, НЕ в _data → 0x0D її не несе. Окремий пакет: при зміні
+    // черги (постановка EnqueueCraft / старт / завершення) шлемо напарнику список {id,n,infinite};
+    // він відбудовує craft_queue + RedrawBubble → бачить ті самі вікна над станціями. Прогрес уже
+    // йде через 0x0D. Гейт по близькості (як 0x0D) + дедуп по хешу черги — без флуду.
+    public struct CraftQ { public string id; public int n; public bool infinite; }
+    private static readonly Dictionary<long,int> _lastSentCraftQueueHash = new Dictionary<long,int>();
+    private static readonly Dictionary<long,int> _lastAppliedCraftQueueHash = new Dictionary<long,int>();
+
+    // CraftComponent з WGO — через wgo.components.craft (ComponentsManager). НЕ Unity GetComponent:
+    // WorldGameObjectComponent не успадковує MonoBehaviour, гра тримає їх у власному словнику.
+    private static object GetCraftComponent(MonoBehaviour wgo)
+    {
+        if (wgo == null || _wgoComponentsProp == null || _componentsCraftProp == null) return null;
+        try
+        {
+            var cm = _wgoComponentsProp.GetValue(wgo);
+            return cm != null ? _componentsCraftProp.GetValue(cm) : null;
+        }
+        catch { return null; }
+    }
+
+    private static List<CraftQ> ReadCraftQueue(MonoBehaviour wgo)
+    {
+        var cc = GetCraftComponent(wgo);
+        if (cc == null || _craftQueueField == null) return null;
+        try
+        {
+            var q = _craftQueueField.GetValue(cc) as System.Collections.IList;
+            if (q == null) return null;
+            var list = new List<CraftQ>(q.Count);
+            foreach (var it in q)
+            {
+                if (it == null) continue;
+                var cq = new CraftQ
+                {
+                    id       = _cqiIdField?.GetValue(it) as string ?? "",
+                    n        = _cqiNField != null ? Convert.ToInt32(_cqiNField.GetValue(it)) : 0,
+                    infinite = _cqiInfiniteField != null && Convert.ToBoolean(_cqiInfiniteField.GetValue(it))
+                };
+                if (!string.IsNullOrEmpty(cq.id)) list.Add(cq);
+            }
+            // АКТИВНИЙ крафт — синтетичним ПЕРШИМ пунктом (лайв-тест 3, 2026-06-11): TryStartCraftFromQueue
+            // при старті робить --n і ВИДАЛЯЄ пункт із черги (декомпіл 83782-85) — одиночний крафт лишає
+            // craft_queue порожньою, хоч станція працює. Бабл у приймача малюється з craft_queue[0] і без
+            // is_crafting (гілка 84606), тож синтетичний пункт показує «це зараз роблять» природно.
+            // :r:-крафти (знесення) не миримо — знесення вже синкає 0x16.
+            try
+            {
+                if (_isCraftingField != null && _currentCraftField != null && _craftDefIdField != null
+                    && Convert.ToBoolean(_isCraftingField.GetValue(cc)))
+                {
+                    var cur = _currentCraftField.GetValue(cc);
+                    var curId = cur != null ? _craftDefIdField.GetValue(cur) as string : null;
+                    if (!string.IsNullOrEmpty(curId) && !curId.Contains(":r:"))
+                        list.Insert(0, new CraftQ { id = curId, n = 1, infinite = false });
+                }
+            }
+            catch { }
+            return list;
+        }
+        catch { return null; }
+    }
+
+    private static int CraftQueueHash(List<CraftQ> q)
+    {
+        if (q == null) return 0;
+        int h = 17;
+        foreach (var c in q) unchecked { h = h * 31 + (c.id?.GetHashCode() ?? 0); h = h * 31 + c.n; h = h * 31 + (c.infinite ? 1 : 0); }
+        return h;
+    }
+
+    // Викликається з Postfix EnqueueCraft (__instance = CraftComponent — НЕ MonoBehaviour, тому object).
+    public static void OnLocalCraftQueueChanged(object craftComponent)
+    {
+        if (ApplyingRemoteChop || !Connected() || craftComponent == null) return;
+        EnsureReflection();
+        if (_componentWgoProp == null) return;
+        try
+        {
+            var wgo = _componentWgoProp.GetValue(craftComponent) as MonoBehaviour;
+            if (wgo != null) SendCraftQueue(wgo);
+        }
+        catch { }
+    }
+
+    // Відправка черги верстата напарнику (0x17). Гейт близькості + дедуп по хешу.
+    public static void SendCraftQueue(MonoBehaviour wgo)
+    {
+        if (ApplyingRemoteChop || !Connected() || wgo == null) return;
+        EnsureReflection();
+        if (_craftComponentType == null || _uniqueIdField == null) return;
+        // МОГИЛИ ВИКЛЮЧЕНО: grave теж has_craft=True (крафт-інтеракція), але її черга = копання.
+        // Мирор чистив би активну чергу напарника при co-dig (q.Clear), а гра ще й АВТО-СТАРТУЄ
+        // чергу при роботі обʼєкта (декомпіл 88287: !IsCraftQueueEmpty && !is_crafting →
+        // TryStartCraftFromQueue) → примарне копання + подвійний двигун стадій. Стадії могил
+        // повністю покриває 0x0D — черга їм не потрібна.
+        if (!IsWorkbench(wgo) || IsGraveTarget(wgo)) return;
+        if (!NearLocalPlayer(wgo, WORKBENCH_SYNC_RANGE)) return;
+        try
+        {
+            var q = ReadCraftQueue(wgo);
+            if (q == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            int hash = CraftQueueHash(q);
+            if (_lastSentCraftQueueHash.TryGetValue(uid, out var prev) && prev == hash) return;
+            _lastSentCraftQueueHash[uid] = hash;
+            // Перехресне сіювання (анти-пінгпонг, як echo-sig у 0x0D): ця ж черга, прилетівши
+            // назад від напарника, буде розпізнана як уже застосована й не перебудує нашу живу.
+            _lastAppliedCraftQueueHash[uid] = hash;
+
+            // Підготувати байти id (пропустити порожні/завеликі), порахувати payload
+            var idBytes  = new List<byte[]>(q.Count);
+            var prepared = new List<CraftQ>(q.Count);
+            int payload = 0;
+            foreach (var c in q)
+            {
+                var b = System.Text.Encoding.UTF8.GetBytes(c.id);
+                if (b.Length == 0 || b.Length > 255) continue;
+                idBytes.Add(b); prepared.Add(c);
+                payload += 1 + b.Length + 4 + 1;
+            }
+            if (prepared.Count > 65535) return;
+
+            // packet: 0x17 uid(8) count(2) [idLen(1) id n(4) infinite(1)]*
+            var packet = new byte[11 + payload];
+            packet[0] = 0x17;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            BitConverter.GetBytes((ushort)prepared.Count).CopyTo(packet, 9);
+            int off = 11;
+            for (int i = 0; i < prepared.Count; i++)
+            {
+                packet[off++] = (byte)idBytes[i].Length;
+                Buffer.BlockCopy(idBytes[i], 0, packet, off, idBytes[i].Length); off += idBytes[i].Length;
+                BitConverter.GetBytes(prepared[i].n).CopyTo(packet, off); off += 4;
+                packet[off++] = (byte)(prepared[i].infinite ? 1 : 0);
+            }
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            Multiplayer.Log?.LogInfo($"[CHOP] Крафт-черга uid={uid} → {prepared.Count} пункт(ів) (0x17)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] SendCraftQueue: {e.Message}"); }
+    }
+
+    // Приймач: відбудовуємо craft_queue з пакета + RedrawBubble. Під echo-guard (EnqueueCraft не
+    // кличемо — будуємо пункти напряму, тож хук не зафаєриться й луни нема).
+    public static void ApplyRemoteCraftQueue(long uid, List<CraftQ> items)
+    {
+        EnsureReflection();
+        if (_craftQueueField == null || _craftQueueItemType == null || items == null) return;
+        var wgo = FindWgoByUniqueId(uid);
+        if (wgo == null) return;   // не завантажено в нас (далеко) — Етап 1 пропускає; pending — на потім
+        if (IsGraveTarget(wgo)) return;   // могили не миряться (див. SendCraftQueue); захист від змішаних збірок
+        var cc = GetCraftComponent(wgo);
+        if (cc == null) return;
+
+        int hash = CraftQueueHash(items);
+        if (_lastAppliedCraftQueueHash.TryGetValue(uid, out var prev) && prev == hash) return;
+        _lastAppliedCraftQueueHash[uid] = hash;
+        // Перехресне сіювання (анти-пінгпонг): наші локальні тригери, побачивши цю ж мирор-чергу,
+        // не пошлють її назад відправнику.
+        _lastSentCraftQueueHash[uid] = hash;
+
+        ApplyingRemoteChop = true;
+        try
+        {
+            var q = _craftQueueField.GetValue(cc) as System.Collections.IList;
+            if (q == null) return;
+            q.Clear();
+            foreach (var c in items)
+            {
+                var cqi = Activator.CreateInstance(_craftQueueItemType);
+                _cqiIdField?.SetValue(cqi, c.id);
+                _cqiNField?.SetValue(cqi, c.n);
+                _cqiInfiniteField?.SetValue(cqi, c.infinite);
+                q.Add(cqi);
+            }
+            if (_redrawBubbleMethod != null)
+            {
+                var pars = _redrawBubbleMethod.GetParameters();
+                _redrawBubbleMethod.Invoke(wgo, pars.Length == 1 ? new object[] { null } : new object[0]);
+            }
+            Multiplayer.Log?.LogInfo($"[CHOP] Крафт-черга uid={uid} застосовано ← {items.Count} пункт(ів)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteCraftQueue: {e.Message}"); }
+        finally { ApplyingRemoteChop = false; }
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
@@ -4748,6 +5051,14 @@ public static class ChopSync
     {
         if (ApplyingRemoteChop || !Connected()) return;
         if (!IsStateRepTarget(wgo)) return;   // могила АБО синкнута будівля (Фаза 2)
+        // ГЕЙТ БЛИЗЬКОСТІ для верстатів (фікс флуду bat_test, лайв-тест 2026-06-11): has_craft
+        // обʼєктів у світі багато (дев-тестові bat_test розкидані по всій мапі), і на завантаженні
+        // всі фаєрять RedrawPart → сплеск 0x0D, який приймач навіть не може застосувати (обʼєкт
+        // не в його завантаженій зоні → "не знайдено"). Стан верстата реплікуємо лише коли
+        // локальний гравець ПОРУЧ = реальний крафт/взаємодія. Могили/будівлі не чіпаємо: їх
+        // гравець копає/ставить впритул, вони не авто-операційні й не розкидані фоном.
+        if (IsWorkbench(wgo) && !IsGraveTarget(wgo) && !NearLocalPlayer(wgo, WORKBENCH_SYNC_RANGE))
+            return;
         EnsureReflection();
         if (!GraveStateReflectionReady()) return;
         try
@@ -4764,7 +5075,13 @@ public static class ChopSync
             // підпис кладення тіла в grave_empty не міняв → echo/дедуп ковтав 0x0D → тіло не синкалось
             // напарнику й виштовхувалось назад. Біт несеться в пакеті (поле variation, біт0).
             bool hasBody = GraveHasBody(wgo);
-            string sig = GraveStageSig(objId, json) + (hasBody ? "|B" : "");
+            // + ХЕШ ВМІСТУ ВЕРСТАТА (Фаза 2 крафт): вихід/матеріали сидять в інвентарі, не в obj_id,
+            // тож key-only підпис при крафті не міняється → дедуп глушив би. Хеш у пакеті (variation біти1+).
+            // МОГИЛИ ВИКЛЮЧЕНО (вони теж has_craft): їх покриває body-біт + key-sig — перевірений
+            // 8 ітераціями шлях; додавання inv-хешу ризикувало б echo-приглушенням (повернення
+            // дюп-петлі 2026-06-08), якби restore хоч якось нормалізував інвентар.
+            int invH = (IsWorkbench(wgo) && !IsGraveTarget(wgo)) ? WorkbenchInvHash(wgo) : 0;
+            string sig = GraveStageSig(objId, json) + (hasBody ? "|B" : "") + (invH != 0 ? "|w" + invH : "");
 
             // ECHO-ПРИГЛУШЕННЯ (фікс дюпу): якщо це РІВНО та стадія, яку ми щойно отримали
             // й застосували для цього uid — це наша ж луна (ми глядач), НЕ власна зміна.
@@ -4802,7 +5119,7 @@ public static class ChopSync
             BitConverter.GetBytes(uid).CopyTo(packet, 1);
             BitConverter.GetBytes(p.x).CopyTo(packet, 9);
             BitConverter.GetBytes(p.y).CopyTo(packet, 13);
-            BitConverter.GetBytes(hasBody ? 1 : 0).CopyTo(packet, 17);  // variation: біт0 = тіло в могилі
+            BitConverter.GetBytes((hasBody ? 1 : 0) | (invH << 1)).CopyTo(packet, 17);  // variation: біт0 = тіло, біти1-30 = хеш вмісту верстата
             int off = 21;
             BitConverter.GetBytes((ushort)idB.Length).CopyTo(packet, off); off += 2;
             Buffer.BlockCopy(idB, 0, packet, off, idB.Length); off += idB.Length;
@@ -4810,6 +5127,10 @@ public static class ChopSync
             Buffer.BlockCopy(dataB, 0, packet, off, dataB.Length);
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
             Multiplayer.Log?.LogInfo($"[CHOP] Могила uid={uid} obj={objId} — синк СТАНУ (json={dataB.Length}б)");
+
+            // Кооп-крафт Етап 1: для верстата піггібечимо чергу (старт/завершення міняють craft_queue,
+            // а ці тригери не EnqueueCraft). SendCraftQueue сам дедупить — зайвого не шле.
+            if (IsWorkbench(wgo)) SendCraftQueue(wgo);
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] OnLocalGraveStateChanged: {e.Message}"); }
     }
@@ -4907,7 +5228,10 @@ public static class ChopSync
         // тож підпис ОБОВ'ЯЗКОВО той самий (GraveStageSig) на обох шляхах.
         // Біт ТІЛА з пакета (variation біт0) — той самий, що відправник додав у свій підпис. Узгоджено:
         // після restore наша могила теж матиме тіло → майбутній GraveHasBody(wgo) дасть той самий біт.
-        string sig = GraveStageSig(objId, json) + (((variation & 1) != 0) ? "|B" : "");
+        // Хеш вмісту верстата з пакета (variation біти1-30) — той самий, що відправник додав у підпис.
+        // Узгоджено: після restore наш верстат матиме той самий інвентар → майбутній WorkbenchInvHash збіжиться.
+        int invH = variation >> 1;
+        string sig = GraveStageSig(objId, json) + (((variation & 1) != 0) ? "|B" : "") + (invH != 0 ? "|w" + invH : "");
         if (_lastAppliedGraveSig.TryGetValue(uid, out var prevSig) && prevSig == sig) return;
 
         // ГАРД МОНОТОННОСТІ (фікс leak B / дюпу, 2026-06-08) — ТЕПЕР ЛИШЕ ПРИ АКТИВНОМУ
@@ -6300,6 +6624,10 @@ public static class GraveWorkSyncPatch
     static void Postfix(MonoBehaviour __instance)
     {
         ChopSync.OnLocalGraveStateChanged(__instance);
+        // Кооп-крафт: завершення ОДИНОЧНОГО ручного крафту не міняє інвентар верстата (вихід падає
+        // на землю) → 0x0D-дедуп глушить піггібек → стейл-бабл у напарника. Шлемо чергу напряму:
+        // SendCraftQueue сам гейтить (верстат-не-могила, близькість, хеш-дедуп) — зайвого не шле.
+        ChopSync.SendCraftQueue(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
@@ -6331,6 +6659,29 @@ public static class GraveAddBodySyncPatch
     static void Postfix(MonoBehaviour __instance)
     {
         ChopSync.OnLocalGraveStateChanged(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// КООП-КРАФТ Етап 1: постановка крафту в чергу (CraftComponent.EnqueueCraft) → шлемо
+// напарнику оновлену craft_queue (0x17), щоб він бачив ті самі вікна-черги над станціями.
+// __instance = CraftComponent; WGO дістаємо через .wgo. Дедуп/гейт — усередині SendCraftQueue.
+[HarmonyPatch]
+public static class CraftEnqueueSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var cc = AccessTools.TypeByName("CraftComponent");
+        return cc?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "EnqueueCraft");
+    }
+
+    // __instance як object: CraftComponent не MonoBehaviour (WorldGameObjectComponentBase — звичайний
+    // клас) — типізований параметр дав би невалідний каст і мертвий хук.
+    static void Postfix(object __instance)
+    {
+        ChopSync.OnLocalCraftQueueChanged(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
