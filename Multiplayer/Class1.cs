@@ -6989,18 +6989,27 @@ public static class ChopSync
         EnsureReflection();
         if (!DropReflectionReady() || dropArgs == null || dropArgs.Length < 2) return;
         var item = dropArgs[1];                                   // Drop(pos, Item, parent, dir, force, curve, walls, stacked)
-        if (item == null || (_itemIdField.GetValue(item) as string) != "body") return;
+        if (item == null) return;
+        var itemId = _itemIdField.GetValue(item) as string ?? "";
         var go = resultGO as MonoBehaviour;
         if (go == null) return;
 
         if (ApplyingRemoteChop)
         {
-            // Це наш реплей (ApplyRemoteCorpseSpawn) → реєструємо під переданим uid, owner=False.
-            long ruid = _incomingCorpseUid ?? DateTime.UtcNow.Ticks;
-            RegisterCorpseBodyGO(go, ruid, owner: false);
+            // Наш 0x11-реплей → реєструємо мирор під переданим uid, owner=False. Інші echo-дропи
+            // (0x0B-лут тощо) НЕ реєструємо: _incomingCorpseUid ставить лише ApplyRemoteCorpseSpawn.
+            if (_incomingCorpseUid == null) return;
+            RegisterCorpseBodyGO(go, _incomingCorpseUid.Value, owner: false);
             return;
         }
         if (!Connected()) return;
+
+        // ЛИШЕ ТРУП мириться як єдиний спільний предмет. УЗАГАЛЬНЕННЯ НА НОСИМІ (руда/колода)
+        // ВІДКОЧЕНО 2026-06-11 (рішення Zonda після тестів 1-5): дюп на рівному місці (дроп-спам
+        // цикли vanilla «кинув-підняв» множили мирори), а обмін ресурсами ВЖЕ працює через
+        // скрині/стокпайли (0x19). Прийнята межа (повернулась): вихід із колодою в руках губить
+        // колоду зі світу напарника (DropOverheadOnExit кидає її лише локально+у сейв хоста).
+        if (itemId != "body") return;
 
         // Локальний спавн (ексгумація АБО кидок із рук) → новий uid, реєстрація власника, 0x11.
         long uid = DateTime.UtcNow.Ticks;
@@ -7027,7 +7036,7 @@ public static class ChopSync
         BitConverter.GetBytes(jb.Length).CopyTo(pk, 30);
         Buffer.BlockCopy(jb, 0, pk, 34, jb.Length);
         SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
-        Multiplayer.Log?.LogInfo($"[CHOP] Спавн трупа → uid={uid} pos=({pos.x:F1},{pos.y:F1}) json={jb.Length}б → 0x11");
+        Multiplayer.Log?.LogInfo($"[CHOP] Спавн носимого '{itemId}' → uid={uid} pos=({pos.x:F1},{pos.y:F1}) json={jb.Length}б → 0x11");
     }
 
     // Реєстрація трупа за ТОЧНИМ GameObject (з хука Drop) — без сканування сцени.
@@ -7073,8 +7082,11 @@ public static class ChopSync
         _incomingCorpseUid = uid;   // RegisterCorpseBody (постфікс) зареєструє під цим uid, owner=False
         try
         {
+            // "body" — лише ЗАГЛУШКА: FromJsonOverwrite перезаписує public-поля включно з id,
+            // тож реальний предмет (труп/колода/камінь) прийде з JSON відправника (узагальнення).
             var body = _itemCtor.Invoke(new object[] { "body", 1 });
-            // Влити повний стан трупа (органи/freshness) з JSON відправника.
+            if (string.IsNullOrEmpty(json))
+                Multiplayer.Log?.LogWarning($"[CHOP] 0x11 uid={uid}: json порожній — предмет лишиться 'body' (заглушка)!");
             if (!string.IsNullOrEmpty(json) && _fromJsonOverwriteMethod != null)
             {
                 try { _fromJsonOverwriteMethod.Invoke(null, new object[] { json, body }); }
@@ -7259,7 +7271,6 @@ public static class ChopSync
     }
     private static readonly List<BodyTrack> _bodies = new List<BodyTrack>();
     private static MethodInfo _destroyLinkedHintMethod;
-    private static FieldInfo _highlightedDropField;   // DropResGameObject.currently_higlighted_obj (static) — який дроп зараз підбираємо
 
     private const float BODY_SETTLE_SEC   = 1.5f;   // відстій фізики після спавну (не слати рух)
     private const float BODY_ECHO_SEC     = 0.4f;   // після 0x0F-руху не слати назад
@@ -7326,21 +7337,9 @@ public static class ChopSync
         // ще НЕ занулений грою — обнуляється рядком пізніше, декомпіл TryOtherInteractions 81559→81562),
         // то власність переходить до НАС. Шлемо 0x14 {uid}, щоб ВЛАСНИК прибрав свій наземний труп
         // (інакше дубль). Далі несемо (0x12 нижче); кинемо → Drop-хук зробить нас owner=true (0x11→мирор).
-        try
-        {
-            if (_highlightedDropField == null)
-                _highlightedDropField = AccessTools.TypeByName("DropResGameObject")
-                    ?.GetField("currently_higlighted_obj", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-            var hl = _highlightedDropField?.GetValue(null);
-            if (hl != null && TryGetMirrorUid(hl, out long muid))
-            {
-                var tp = new byte[9]; tp[0] = 0x14;
-                BitConverter.GetBytes(muid).CopyTo(tp, 1);
-                SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, tp);
-                Multiplayer.Log?.LogInfo($"[CHOP] Підняли труп-дзеркало uid={muid} → 0x14 (передача власності)");
-            }
-        }
-        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] 0x14 send впав: {e.Message}"); }
+        // (Старий 0x14-шлях звідси ВИДАЛЕНО 2026-06-11: він фаєрився на кадр РАНІШЕ за
+        // MirrorPickupTransferPatch і давав ПОДВІЙНИЙ 0x14 (тест #5). Тепер передачу шле
+        // ЛИШЕ детермінований хук TryOtherInteractions — він покриває і труп.)
         string icon = "";
         try { if (_getOverheadIconMethod != null) icon = _getOverheadIconMethod.Invoke(item, null) as string ?? ""; }
         catch { }
@@ -7438,7 +7437,13 @@ public static class ChopSync
         for (int i = _bodies.Count - 1; i >= 0; i--)
         {
             var b = _bodies[i];
-            if (b.go == null)   // знищено локально (кладення/споживання АБО авто-збір копії)
+            // «Зник» = знищено АБО ДЕАКТИВОВАНО (узагальнення carry-мирора 2026-06-11: руда/колода
+            // при підборі з землі НЕ знищується, а деактивується — труп несеться живим GO, тому
+            // старої перевірки на null вистачало; без цього мирор напарника висів на землі, поки
+            // власник ніс предмет, а другий кидок плодив дубль до vivантаження зони).
+            bool goneLocally = b.go == null;
+            try { goneLocally = goneLocally || !b.go.gameObject.activeInHierarchy; } catch { goneLocally = true; }
+            if (goneLocally)
             {
                 // ТІЛЬКИ власник транслює видалення. Глядачева копія могла зникнути від фізики/
                 // авто-збору — НЕ можна слати 0x10 (саме це стирало справжній труп у власника).
@@ -7450,8 +7455,32 @@ public static class ChopSync
                     SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, rm);
                     Multiplayer.Log?.LogInfo($"[CHOP] Труп uid={b.uid} зник у власника → 0x10");
                 }
+                // (Евристика «GONE+гравець поруч → 0x14» ВИДАЛЕНА: GetLocalPlayerWgo/overhead
+                // виявились ненадійними в кадрі підбору — діаг показав «руки порожні dist=-1».
+                // Передачу тепер шле детермінований хук MirrorPickupTransferPatch на
+                // TryOtherInteractions, який знімає трек ДО цього тіка.)
                 else
-                    Multiplayer.Log?.LogInfo($"[DIAG-BODY] uid={b.uid} GONE локально owner={b.isOwner} (0x10 НЕ слемо)");
+                {
+                    // ДІАГНОСТИКА (дубль-сага carry-мирора): ЧОМУ передача/видалення не слалось.
+                    string why;
+                    try
+                    {
+                        var lp = GetLocalPlayerWgo();
+                        var ov = GetLocalPlayerOverheadItem();
+                        float dist = -1f;
+                        if (lp != null)
+                        {
+                            var p = lp.transform.position;
+                            dist = Vector2.Distance(new Vector2(p.x, p.y), b.lastPos);
+                        }
+                        why = !b.alive ? "not-alive"
+                            : !Connected() ? "не підключено"
+                            : ov == null ? $"руки порожні (dist={dist:F0})"
+                            : $"далеко (dist={dist:F0}, ліміт 300)";
+                    }
+                    catch (Exception de) { why = "diag-впав: " + de.Message; }
+                    Multiplayer.Log?.LogInfo($"[DIAG-BODY] uid={b.uid} GONE owner={b.isOwner} — 0x14/0x10 НЕ слемо: {why}");
+                }
                 _bodies.RemoveAt(i);
                 continue;
             }
@@ -7474,6 +7503,35 @@ public static class ChopSync
             BitConverter.GetBytes(pos.y).CopyTo(pk, 13);
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
             Multiplayer.Log?.LogInfo($"[DIAG-BODY] uid={b.uid} рух {moved:F1} → 0x0F @({pos.x:F1},{pos.y:F1})");
+        }
+    }
+
+    // ── ДЕТЕРМІНОВАНА ПЕРЕДАЧА ВЛАСНОСТІ (фікс дубль-саги carry-мирора, 2026-06-11) ─────────
+    // Справжній момент РУЧНОГО підбору дропа = BaseCharacterComponent.TryOtherInteractions
+    // (декомпіл 81542): бере DropResGameObject.currently_higlighted_obj (СТАТИЧНЕ поле), створює
+    // НОВИЙ Item для рук (тому матч по руках провалювався) і ставить is_collected. Prefix ловить
+    // кандидата зі статичного поля (метод його обнуляє всередині), Postfix __result=true =
+    // підбір ВІДБУВСЯ. Якщо піднятий GO — наш мирор → 0x14 + зняття треку (GONE-тік і старий
+    // overhead-шлях більше не матчать → подвійної передачі нема).
+    private static MonoBehaviour _pendingPickupGo;
+    public static void CapturePickupCandidate(object go) { _pendingPickupGo = go as MonoBehaviour; }
+    public static void ConfirmPickup(bool result)
+    {
+        var go = _pendingPickupGo;
+        _pendingPickupGo = null;
+        if (!result || go == null || ApplyingRemoteChop || !Connected()) return;
+        for (int i = 0; i < _bodies.Count; i++)
+        {
+            var b = _bodies[i];
+            if (!b.isOwner && ReferenceEquals(b.go, go))
+            {
+                var tp = new byte[9]; tp[0] = 0x14;
+                BitConverter.GetBytes(b.uid).CopyTo(tp, 1);
+                SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, tp);
+                Multiplayer.Log?.LogInfo($"[CHOP] Підняли мирор uid={b.uid} (TryOtherInteractions) → 0x14 (передача власності)");
+                _bodies.RemoveAt(i);
+                return;
+            }
         }
     }
 
@@ -8124,6 +8182,36 @@ public static class ItemRemoveSyncPatch
     static void Postfix(object __instance, object __0, int __1, bool __result)
     {
         ChopSync.OnLocalDataItemRemoved(__instance, __0, __1, __result);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// CARRY-МИРОР: детермінована передача власності — хук справжнього моменту ручного підбору
+// (TryOtherInteractions, 81542). Кандидат = статичне DropResGameObject.currently_higlighted_obj
+// (метод обнуляє його всередині → ловимо в Prefix); __result=true = підбір відбувся.
+[HarmonyPatch]
+public static class MirrorPickupTransferPatch
+{
+    static FieldInfo _hlField;
+
+    static MethodBase TargetMethod()
+    {
+        _hlField = AccessTools.TypeByName("DropResGameObject")
+            ?.GetField("currently_higlighted_obj", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        return AccessTools.TypeByName("BaseCharacterComponent")
+            ?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "TryOtherInteractions" && m.GetParameters().Length == 0);
+    }
+
+    static void Prefix()
+    {
+        ChopSync.CapturePickupCandidate(_hlField?.GetValue(null));
+    }
+
+    static void Postfix(bool __result)
+    {
+        ChopSync.ConfirmPickup(__result);
     }
 
     static Exception Finalizer(Exception __exception) => null;
