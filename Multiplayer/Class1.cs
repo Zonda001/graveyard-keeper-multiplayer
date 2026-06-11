@@ -2056,6 +2056,9 @@ public class SteamManager : MonoBehaviour
             // Переносимий труп: щокадрове відстеження руху (внутрішній throttle на відправку).
             ChopSync.TickCarriedBodies();
 
+            // Етап 3a: ре-claim живих крафтів (тримає TTL у напарника) + прибирання мертвих.
+            ChopSync.TickCraftClaims();
+
             // Дерева, зрубані поки ми були в іншій локації — пробуємо знищити,
             // коли гравець дійде до них і вони завантажаться.
             _chopRetryTimer += Time.deltaTime;
@@ -2395,7 +2398,7 @@ public class SteamManager : MonoBehaviour
         {
             // ── Крафт-черга верстата (Фаза 2 кооп-крафт Етап 1): напарник змінив чергу →
             // відбудовуємо craft_queue + RedrawBubble, щоб бачити ті самі вікна над станціями ──
-            // type(1) uid(8) count(2) [idLen(1) id n(4) infinite(1)]*
+            // type(1) uid(8) count(2) [idLen(1) id n(4) infinite(1) flags(1)]*  (flags біт0 = синтетика)
             if (data.Length < 11) { _logger.LogWarning($"[CHOP] 0x17 замалий ({data.Length})"); return; }
             long cuid = BitConverter.ToInt64(data, 1);
             int ccount = BitConverter.ToUInt16(data, 9);
@@ -2406,14 +2409,29 @@ public class SteamManager : MonoBehaviour
             {
                 if (coff + 1 > data.Length) { cok = false; break; }
                 int idLen = data[coff++];
-                if (coff + idLen + 5 > data.Length) { cok = false; break; }
+                if (coff + idLen + 6 > data.Length) { cok = false; break; }
                 string id = System.Text.Encoding.UTF8.GetString(data, coff, idLen); coff += idLen;
                 int n = BitConverter.ToInt32(data, coff); coff += 4;
                 bool inf = data[coff++] != 0;
-                items.Add(new ChopSync.CraftQ { id = id, n = n, infinite = inf });
+                byte fl = data[coff++];
+                items.Add(new ChopSync.CraftQ { id = id, n = n, infinite = inf, synthetic = (fl & 1) != 0 });
             }
             if (cok) ChopSync.ApplyRemoteCraftQueue(cuid, items);
             else _logger.LogWarning("[CHOP] 0x17 пошкоджений");
+        }
+        else if (type == 0x18)
+        {
+            // ── Claim/release станції (Етап 3a, арбітраж власника): напарник стартував/закінчив
+            // крафт → блокуємо/звільняємо локальні старти на цій станції ──
+            // type(1) uid(8) flag(1: 1=старт 0=стоп) craftIdLen(1) craftId
+            if (data.Length < 11) { _logger.LogWarning($"[CHOP] 0x18 замалий ({data.Length})"); return; }
+            long auid = BitConverter.ToInt64(data, 1);
+            bool astart = data[9] != 0;
+            int aidLen = data[10];
+            string acraftId = "";
+            if (aidLen > 0 && 11 + aidLen <= data.Length)
+                acraftId = System.Text.Encoding.UTF8.GetString(data, 11, aidLen);
+            ChopSync.ApplyRemoteCraftClaim(auid, astart, acraftId);
         }
     }
 
@@ -4360,6 +4378,7 @@ public static class ChopSync
     private static PropertyInfo _componentWgoProp;      // WorldGameObjectComponent.wgo (дістати WGO з компонента)
     private static PropertyInfo _wgoComponentsProp;     // WGO.components (ComponentsManager — НЕ Unity-компоненти!)
     private static PropertyInfo _componentsCraftProp;   // ComponentsManager.craft (CraftComponent зі словника)
+    private static PropertyInfo _isRemovingProp;        // WGO.is_removing (станція в процесі знесення)
     private static MethodInfo _redrawBubbleMethod;      // WGO.RedrawBubble — перемалювати вікно черги
     private static Type       _treeDisappearType;       // TreeDisappearAnimation (компонент дерева)
     private static MethodInfo _startAnimationMethod;    // TreeDisappearAnimation.StartAnimation(VoidDelegate)
@@ -4487,6 +4506,7 @@ public static class ChopSync
         // Правильний шлях гри: wgo.components (ComponentsManager, 111820) → .craft (82514).
         _wgoComponentsProp   = _wgoType.GetProperty("components", f);
         _componentsCraftProp = _wgoComponentsProp?.PropertyType.GetProperty("craft", f);
+        _isRemovingProp      = _wgoType.GetProperty("is_removing", f);
         _redrawBubbleMethod = _wgoType.GetMethods(f).FirstOrDefault(m => m.Name == "RedrawBubble");
 
         // Анімація падіння дерева — компонент TreeDisappearAnimation на дереві.
@@ -4685,9 +4705,13 @@ public static class ChopSync
     // черги (постановка EnqueueCraft / старт / завершення) шлемо напарнику список {id,n,infinite};
     // він відбудовує craft_queue + RedrawBubble → бачить ті самі вікна над станціями. Прогрес уже
     // йде через 0x0D. Гейт по близькості (як 0x0D) + дедуп по хешу черги — без флуду.
-    public struct CraftQ { public string id; public int n; public bool infinite; }
+    public struct CraftQ { public string id; public int n; public bool infinite; public bool synthetic; }
     private static readonly Dictionary<long,int> _lastSentCraftQueueHash = new Dictionary<long,int>();
     private static readonly Dictionary<long,int> _lastAppliedCraftQueueHash = new Dictionary<long,int>();
+    // Інстанси СИНТЕТИЧНИХ CraftQueueItem, створених ApplyRemoteCraftQueue (мирор активного крафту
+    // напарника). При відправці власної черги пропускаємо їх (Етап 3a) — інакше енкʼю на чужій
+    // станції повернув би власнику його ж активний крафт як РЕАЛЬНИЙ пункт черги (дюп).
+    private static readonly Dictionary<long, object> _mirrorSyntheticItems = new Dictionary<long, object>();
 
     // CraftComponent з WGO — через wgo.components.craft (ComponentsManager). НЕ Unity GetComponent:
     // WorldGameObjectComponent не успадковує MonoBehaviour, гра тримає їх у власному словнику.
@@ -4702,7 +4726,7 @@ public static class ChopSync
         catch { return null; }
     }
 
-    private static List<CraftQ> ReadCraftQueue(MonoBehaviour wgo)
+    private static List<CraftQ> ReadCraftQueue(MonoBehaviour wgo, long uid)
     {
         var cc = GetCraftComponent(wgo);
         if (cc == null || _craftQueueField == null) return null;
@@ -4710,10 +4734,13 @@ public static class ChopSync
         {
             var q = _craftQueueField.GetValue(cc) as System.Collections.IList;
             if (q == null) return null;
+            _mirrorSyntheticItems.TryGetValue(uid, out var mirroredSynthetic);
             var list = new List<CraftQ>(q.Count);
             foreach (var it in q)
             {
                 if (it == null) continue;
+                // Мирор активного крафту НАПАРНИКА (Етап 3a): не відсилати назад як реальний пункт.
+                if (mirroredSynthetic != null && ReferenceEquals(it, mirroredSynthetic)) continue;
                 var cq = new CraftQ
                 {
                     id       = _cqiIdField?.GetValue(it) as string ?? "",
@@ -4735,7 +4762,7 @@ public static class ChopSync
                     var cur = _currentCraftField.GetValue(cc);
                     var curId = cur != null ? _craftDefIdField.GetValue(cur) as string : null;
                     if (!string.IsNullOrEmpty(curId) && !curId.Contains(":r:"))
-                        list.Insert(0, new CraftQ { id = curId, n = 1, infinite = false });
+                        list.Insert(0, new CraftQ { id = curId, n = 1, infinite = false, synthetic = true });
                 }
             }
             catch { }
@@ -4781,9 +4808,9 @@ public static class ChopSync
         if (!NearLocalPlayer(wgo, WORKBENCH_SYNC_RANGE)) return;
         try
         {
-            var q = ReadCraftQueue(wgo);
-            if (q == null) return;
             long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            var q = ReadCraftQueue(wgo, uid);
+            if (q == null) return;
             int hash = CraftQueueHash(q);
             if (_lastSentCraftQueueHash.TryGetValue(uid, out var prev) && prev == hash) return;
             _lastSentCraftQueueHash[uid] = hash;
@@ -4800,11 +4827,11 @@ public static class ChopSync
                 var b = System.Text.Encoding.UTF8.GetBytes(c.id);
                 if (b.Length == 0 || b.Length > 255) continue;
                 idBytes.Add(b); prepared.Add(c);
-                payload += 1 + b.Length + 4 + 1;
+                payload += 1 + b.Length + 4 + 1 + 1;
             }
             if (prepared.Count > 65535) return;
 
-            // packet: 0x17 uid(8) count(2) [idLen(1) id n(4) infinite(1)]*
+            // packet: 0x17 uid(8) count(2) [idLen(1) id n(4) infinite(1) flags(1)]*
             var packet = new byte[11 + payload];
             packet[0] = 0x17;
             BitConverter.GetBytes(uid).CopyTo(packet, 1);
@@ -4816,6 +4843,7 @@ public static class ChopSync
                 Buffer.BlockCopy(idBytes[i], 0, packet, off, idBytes[i].Length); off += idBytes[i].Length;
                 BitConverter.GetBytes(prepared[i].n).CopyTo(packet, off); off += 4;
                 packet[off++] = (byte)(prepared[i].infinite ? 1 : 0);
+                packet[off++] = (byte)(prepared[i].synthetic ? 1 : 0);
             }
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
             Multiplayer.Log?.LogInfo($"[CHOP] Крафт-черга uid={uid} → {prepared.Count} пункт(ів) (0x17)");
@@ -4848,6 +4876,7 @@ public static class ChopSync
             var q = _craftQueueField.GetValue(cc) as System.Collections.IList;
             if (q == null) return;
             q.Clear();
+            _mirrorSyntheticItems.Remove(uid);   // старий синтетичний інстанс пішов разом із Clear
             foreach (var c in items)
             {
                 var cqi = Activator.CreateInstance(_craftQueueItemType);
@@ -4855,6 +4884,7 @@ public static class ChopSync
                 _cqiNField?.SetValue(cqi, c.n);
                 _cqiInfiniteField?.SetValue(cqi, c.infinite);
                 q.Add(cqi);
+                if (c.synthetic) _mirrorSyntheticItems[uid] = cqi;   // мирор активного крафту напарника
             }
             if (_redrawBubbleMethod != null)
             {
@@ -4865,6 +4895,272 @@ public static class ChopSync
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteCraftQueue: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
+    }
+
+    // ── ЕТАП 3a: АРБІТРАЖ ВЛАСНИКА СТАНЦІЇ (0x18 claim/release) ──────────────────────────────
+    // Подвійний вихід крафту можливий ЛИШЕ якщо ОБИДВІ машини довели is_crafting=true на одній
+    // станції (CraftComponent.DoAction гейтиться is_crafting, декомпіл 83086). CraftReally (83821)
+    // — єдина лійка ВСІХ стартів (GUI/черга/зомбі/gratitude/авто), матеріали списуються всередині.
+    // Модель: мій старт → claim 0x18; напарник блокує локальні старти на зайнятій станції.
+    // Блок на ДВОХ рівнях: TryStartCraftFromQueue (бо вона робить --n і видаляє пункт ДО
+    // CraftReally, декомпіл 83782 — блок лише CraftReally тихо зʼїдав би чергу) + CraftReally
+    // (прямий шлях Craft() з GUI). Fail-open: claim без оновлень вмирає за CRAFT_CLAIM_TTL;
+    // власник ре-claim-ить у TickCraftClaims, поки крафт живий (включно з паузою крафту).
+    private const float CRAFT_CLAIM_TTL     = 60f;
+    private const float CRAFT_CLAIM_REFRESH = 20f;
+    private struct CraftClaim { public string craftId; public float time; }
+    private static readonly Dictionary<long, CraftClaim> _remoteCrafting = new Dictionary<long, CraftClaim>();
+    private static readonly Dictionary<long, CraftClaim> _localCrafting  = new Dictionary<long, CraftClaim>();
+    private static readonly Dictionary<long, float> _lastBlockLogTime = new Dictionary<long, float>();
+    private static float _claimRefreshTimer;
+    // Момент останнього блоку старту — для підміни ігрового «not_enough_resources» (гра показує
+    // його одразу після заблокованого старту, декомпіл 88292) на чесне «зайнято напарником».
+    private static float _lastCraftBlockTime = -999f;
+    public static bool WasCraftBlockedRecently => Time.realtimeSinceStartup - _lastCraftBlockTime < 1f;
+
+    // «Зайнято напарником» під УСІ локалізації гри. Коди — GJL.LANGUAGES (firstpass-декомпіл):
+    // en de fr pt-br es ru it pl ja zh_cn ko. Поточна мова — GameSettings.me.language (92625);
+    // порожня/невідома → en (так чинить і сама гра: "Language not found. Loading EN").
+    // CJK-гліфи безпечні: текст іде рідним Say-пайплайном, який ставить шрифт поточної локалі.
+    private static readonly Dictionary<string, string> _busyMessages = new Dictionary<string, string>
+    {
+        { "en",    "In use by your partner!" },
+        { "de",    "Wird von deinem Partner benutzt!" },
+        { "fr",    "Occupé par votre partenaire !" },
+        { "pt-br", "Em uso pelo seu parceiro!" },
+        { "es",    "¡Ocupado por tu compañero!" },
+        { "ru",    "Занято напарником!" },
+        { "it",    "Occupato dal tuo compagno!" },
+        { "pl",    "Zajęte przez partnera!" },
+        { "ja",    "仲間が使用中！" },
+        { "zh_cn", "同伴正在使用！" },
+        { "ko",    "동료가 사용 중!" },
+    };
+    private static PropertyInfo _gameSettingsMeProp;       // GameSettings.me (static)
+    private static FieldInfo   _gameSettingsLanguageField; // GameSettings.language
+
+    public static string GetStationBusyMessage()
+    {
+        try
+        {
+            if (_gameSettingsMeProp == null)
+            {
+                var gs = AccessTools.TypeByName("GameSettings");
+                _gameSettingsMeProp       = gs?.GetProperty("me", BindingFlags.Public | BindingFlags.Static);
+                _gameSettingsLanguageField = gs?.GetField("language", BindingFlags.Public | BindingFlags.Instance);
+            }
+            var me   = _gameSettingsMeProp?.GetValue(null);
+            var lang = me != null ? _gameSettingsLanguageField?.GetValue(me) as string : null;
+            if (!string.IsNullOrEmpty(lang) && _busyMessages.TryGetValue(lang, out var msg)) return msg;
+        }
+        catch { }
+        return _busyMessages["en"];
+    }
+
+    // Станція під арбітражем = верстат, але НЕ могила (у могил власна перевірена co-dig модель).
+    private static bool IsArbitratedStation(MonoBehaviour wgo) => IsWorkbench(wgo) && !IsGraveTarget(wgo);
+
+    private static bool IsWgoRemoving(MonoBehaviour wgo)
+    {
+        if (_isRemovingProp == null || wgo == null) return false;
+        try { return Convert.ToBoolean(_isRemovingProp.GetValue(wgo)); }
+        catch { return false; }
+    }
+
+    // Prefix TryStartCraftFromQueue + CraftReally: блокувати ЛОКАЛЬНИЙ старт, якщо станцію
+    // зайняв напарник. Лог із throttle (88287 кличе TryStart щотік роботи). craftArg — аргумент
+    // craft із CraftReally (другий шар захисту знесення, незалежний від рефлексії is_removing).
+    public static bool ShouldBlockLocalCraftStart(object craftComponent, object craftArg = null)
+    {
+        if (ApplyingRemoteChop || !Connected() || craftComponent == null) return false;
+        if (_remoteCrafting.Count == 0) return false;
+        EnsureReflection();
+        if (_componentWgoProp == null || _uniqueIdField == null) return false;
+        try
+        {
+            // Remove-крафт НЕ блокуємо (другий шар, по самому крафту): блок → ProcessRemove →
+            // миттєвий DestroyMe (декомпіл 44299/115655). Перший шар — IsWgoRemoving нижче.
+            if (craftArg != null && _craftDefIdField != null)
+            {
+                var argId = _craftDefIdField.GetValue(craftArg) as string;
+                if (argId != null && argId.Contains(":r:")) return false;
+            }
+            var wgo = _componentWgoProp.GetValue(craftComponent) as MonoBehaviour;
+            if (wgo == null || !IsArbitratedStation(wgo)) return false;
+            // ЗНЕСЕННЯ НЕ БЛОКУЄМО НІКОЛИ: заблокований Craft() у ProcessRemovingCraft (декомпіл
+            // 44299) одразу кличе wgo.ProcessRemove() = МИТТЄВИЙ DestroyMe в обхід крафту —
+            // зніс би будівлю миттю. Контест знесення лишається на старій моделі (race-тест ✓ + 0x16).
+            if (IsWgoRemoving(wgo)) return false;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (!_remoteCrafting.TryGetValue(uid, out var claim)) return false;
+            if (Time.realtimeSinceStartup - claim.time > CRAFT_CLAIM_TTL)
+            {
+                _remoteCrafting.Remove(uid);   // fail-open: стейл-claim не блокує вічно
+                return false;
+            }
+            _lastCraftBlockTime = Time.realtimeSinceStartup;
+            if (!_lastBlockLogTime.TryGetValue(uid, out var lt) || Time.realtimeSinceStartup - lt > 2f)
+            {
+                _lastBlockLogTime[uid] = Time.realtimeSinceStartup;
+                Multiplayer.Log?.LogInfo($"[CHOP] Старт заблоковано: станцію uid={uid} зайняв напарник ({claim.craftId})");
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // Postfix CraftReally (__result=true): крафт реально стартував — клеймимо станцію.
+    public static void OnLocalCraftStarted(object craftComponent)
+    {
+        if (ApplyingRemoteChop || !Connected() || craftComponent == null) return;
+        EnsureReflection();
+        if (_componentWgoProp == null || _uniqueIdField == null) return;
+        try
+        {
+            var wgo = _componentWgoProp.GetValue(craftComponent) as MonoBehaviour;
+            if (wgo == null || !IsArbitratedStation(wgo)) return;
+            if (IsWgoRemoving(wgo)) return;   // знесення поза арбітражем (стара модель + 0x16)
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            string craftId = "";
+            if (_currentCraftField != null && _craftDefIdField != null)
+            {
+                var cur = _currentCraftField.GetValue(craftComponent);
+                if (cur != null) craftId = _craftDefIdField.GetValue(cur) as string ?? "";
+            }
+            if (craftId.Contains(":r:")) return;   // remove-крафт — теж поза арбітражем
+            // Throttle: zero-time крафти йдуть циклом до 500 CraftReally за ОДИН виклик черги
+            // (декомпіл 83787-93) — не слати 500 claim-ів; той самий craftId у межах 1с = заклеймлено.
+            if (_localCrafting.TryGetValue(uid, out var prev) && prev.craftId == craftId &&
+                Time.realtimeSinceStartup - prev.time < 1f)
+            {
+                prev.time = Time.realtimeSinceStartup;
+                _localCrafting[uid] = prev;
+                return;
+            }
+            _localCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
+            SendCraftClaim(uid, true, craftId);
+        }
+        catch { }
+    }
+
+    // Викликається з GraveWorkSyncPatch (OnWorkFinished/OnCraftStateChanged): крафт скінчився →
+    // release; ще живий (батч amount>1 / пауза) → освіжити claim.
+    public static void CheckLocalCraftStopped(MonoBehaviour wgo)
+    {
+        if (ApplyingRemoteChop || !Connected() || wgo == null || _localCrafting.Count == 0) return;
+        EnsureReflection();
+        if (_uniqueIdField == null || _isCraftingField == null) return;
+        try
+        {
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (!_localCrafting.TryGetValue(uid, out var claim)) return;
+            var cc = GetCraftComponent(wgo);
+            if (cc == null) return;
+            if (Convert.ToBoolean(_isCraftingField.GetValue(cc)))
+            {
+                claim.time = Time.realtimeSinceStartup;
+                _localCrafting[uid] = claim;
+                return;
+            }
+            _localCrafting.Remove(uid);
+            SendCraftClaim(uid, false, "");
+        }
+        catch { }
+    }
+
+    // Періодичний тік (з SteamManager.Update): ре-claim живих крафтів (тримає TTL напарника),
+    // прибирання мертвих (пропущений стоп: cancel через GUI, знесення станції тощо).
+    public static void TickCraftClaims()
+    {
+        if (_localCrafting.Count == 0) { _claimRefreshTimer = 0f; return; }
+        _claimRefreshTimer += Time.deltaTime;
+        if (_claimRefreshTimer < CRAFT_CLAIM_REFRESH) return;
+        _claimRefreshTimer = 0f;
+        EnsureReflection();
+        var uids = new List<long>(_localCrafting.Keys);
+        foreach (var uid in uids)
+        {
+            try
+            {
+                var wgo = FindWgoByUniqueId(uid);
+                var cc  = wgo != null ? GetCraftComponent(wgo) : null;
+                bool crafting = cc != null && _isCraftingField != null &&
+                                Convert.ToBoolean(_isCraftingField.GetValue(cc));
+                if (crafting)
+                {
+                    var claim = _localCrafting[uid];
+                    claim.time = Time.realtimeSinceStartup;
+                    _localCrafting[uid] = claim;
+                    SendCraftClaim(uid, true, claim.craftId);
+                }
+                else
+                {
+                    _localCrafting.Remove(uid);
+                    SendCraftClaim(uid, false, "");
+                }
+            }
+            catch { }
+        }
+    }
+
+    private static void SendCraftClaim(long uid, bool start, string craftId)
+    {
+        if (!Connected()) return;
+        try
+        {
+            var idB = System.Text.Encoding.UTF8.GetBytes(craftId ?? "");
+            if (idB.Length > 255) idB = new byte[0];
+            var packet = new byte[11 + idB.Length];
+            packet[0] = 0x18;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            packet[9]  = (byte)(start ? 1 : 0);
+            packet[10] = (byte)idB.Length;
+            Buffer.BlockCopy(idB, 0, packet, 11, idB.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+            Multiplayer.Log?.LogInfo($"[CHOP] Claim станції uid={uid}: {(start ? "СТАРТ " + craftId : "СТОП")} (0x18)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] SendCraftClaim: {e.Message}"); }
+    }
+
+    public static void ApplyRemoteCraftClaim(long uid, bool start, string craftId)
+    {
+        if (!start) { _remoteCrafting.Remove(uid); return; }
+        // ГОНКА одночасного старту (вікно ~RTT): обидва стартували й обмінялись claim.
+        // Детермінований tiebreak: ХОСТ виграє. Хост ігнорує чужий claim (клієнт сам скасує,
+        // отримавши хостів); клієнт робить mini-cancel свого крафту й реєструє блок.
+        if (_localCrafting.ContainsKey(uid))
+        {
+            if (SteamNetwork.Role == NetworkRole.Host)
+            {
+                Multiplayer.Log?.LogWarning($"[CHOP] Гонка стартів uid={uid}: я хост — лишаюсь власником");
+                return;
+            }
+            Multiplayer.Log?.LogWarning($"[CHOP] Гонка стартів uid={uid}: поступаюсь хосту (mini-cancel, витрачені матеріали втрачено)");
+            MiniCancelLocalCraft(uid);
+        }
+        _remoteCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
+    }
+
+    // Програна гонка: зняти власний крафт без завершення. Матеріали вже списані CraftReally —
+    // прийнята втрата (рідкісний випадок, лог попереджає). Прогрес не чіпаємо (старт скидає в 0).
+    private static void MiniCancelLocalCraft(long uid)
+    {
+        _localCrafting.Remove(uid);
+        try
+        {
+            var wgo = FindWgoByUniqueId(uid);
+            if (wgo == null) return;
+            var cc = GetCraftComponent(wgo);
+            if (cc == null) return;
+            _isCraftingField?.SetValue(cc, false);
+            _currentCraftField?.SetValue(cc, null);
+            if (_redrawBubbleMethod != null)
+            {
+                var pars = _redrawBubbleMethod.GetParameters();
+                _redrawBubbleMethod.Invoke(wgo, pars.Length == 1 ? new object[] { null } : new object[0]);
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] MiniCancelLocalCraft: {e.Message}"); }
     }
 
     private static bool IsPlayerActor(MonoBehaviour actor)
@@ -6628,6 +6924,8 @@ public static class GraveWorkSyncPatch
         // на землю) → 0x0D-дедуп глушить піггібек → стейл-бабл у напарника. Шлемо чергу напряму:
         // SendCraftQueue сам гейтить (верстат-не-могила, близькість, хеш-дедуп) — зайвого не шле.
         ChopSync.SendCraftQueue(__instance);
+        // Етап 3a: крафт скінчився → release claim (станція вільна напарнику); живий → освіжити.
+        ChopSync.CheckLocalCraftStopped(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
@@ -6682,6 +6980,86 @@ public static class CraftEnqueueSyncPatch
     static void Postfix(object __instance)
     {
         ChopSync.OnLocalCraftQueueChanged(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ЕТАП 3a (арбітраж): блок стартів із ЧЕРГИ на станції, зайнятій напарником. Окремо від
+// CraftReally, бо TryStartCraftFromQueue робить --n і видаляє пункт ДО виклику CraftReally
+// (декомпіл 83782) — блок нижче по стеку тихо зʼїдав би чергу. Prefix=false скіпає оригінал
+// цілком (черга лишається недоторканою, пункти стартують у власника через 0x17-мирор).
+[HarmonyPatch]
+public static class CraftQueueStartArbiterPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var cc = AccessTools.TypeByName("CraftComponent");
+        return cc?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "TryStartCraftFromQueue");
+    }
+
+    static bool Prefix(object __instance)
+    {
+        return !ChopSync.ShouldBlockLocalCraftStart(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ЕТАП 3a (арбітраж): CraftReally — єдина лійка ВСІХ стартів крафту (Craft 83818 з GUI,
+// TryStartCraftFromQueue 83786; матеріали списуються всередині). Prefix блокує старт на
+// зайнятій станції ДО списання матеріалів; Postfix (__result=true) шле claim 0x18 напарнику.
+[HarmonyPatch]
+public static class CraftReallyArbiterPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var cc = AccessTools.TypeByName("CraftComponent");
+        return cc?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "CraftReally");
+    }
+
+    // craft — перший аргумент CraftReally (Harmony біндить за іменем): дає другий шар захисту
+    // знесення (remove-крафт не блокується навіть якщо рефлексія is_removing не збіндилась).
+    static bool Prefix(object __instance, object craft, ref bool __result)
+    {
+        if (ChopSync.ShouldBlockLocalCraftStart(__instance, craft))
+        {
+            __result = false;   // гра бачить «старт не вдався» — як нестачу матеріалів
+            return false;
+        }
+        return true;
+    }
+
+    static void Postfix(object __instance, bool __result)
+    {
+        if (__result) ChopSync.OnLocalCraftStarted(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ЕТАП 3a (UX): чесне повідомлення замість «not enough resources». Після нашого блоку старту
+// гра показує гравцю «нестачу ресурсів» (робочий цикл, декомпіл 88292: !is_crafting →
+// ShowCustomNeedBubble("not_enough_resources")) — вводить в оману. Перехоплюємо ТЕКСТ у
+// ShowCustomNeedBubble (BaseCharacterComponent, 81495 → wgo.Say → бабл) і, якщо блок був у
+// межах 1с, підміняємо на «зайнято напарником». Йде рідним пайплайном гри (latch/шрифт/бабл).
+// Текст без специфічно-українських гліфів (і/ї/є/ґ) — шрифт гри гарантовано має RU-кирилицю.
+[HarmonyPatch]
+public static class BlockedCraftBubblePatch
+{
+    static MethodBase TargetMethod()
+    {
+        return AccessTools.TypeByName("BaseCharacterComponent")?
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "ShowCustomNeedBubble");
+    }
+
+    static void Prefix(ref string text)
+    {
+        if (text == "not_enough_resources" && ChopSync.WasCraftBlockedRecently)
+            text = ChopSync.GetStationBusyMessage();
     }
 
     static Exception Finalizer(Exception __exception) => null;
