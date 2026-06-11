@@ -4382,6 +4382,7 @@ public static class ChopSync
     private static FieldInfo  _isCraftingField;         // CraftComponent.is_crafting (активний крафт)
     private static FieldInfo  _currentCraftField;       // CraftComponent.current_craft (CraftDefinition)
     private static FieldInfo  _craftDefIdField;         // CraftDefinition.id (успадковане з BalanceBaseObject)
+    private static FieldInfo  _craftDefHiddenField;     // CraftDefinition.hidden (системні/амбієнтні крафти)
     private static PropertyInfo _componentWgoProp;      // WorldGameObjectComponent.wgo (дістати WGO з компонента)
     private static PropertyInfo _wgoComponentsProp;     // WGO.components (ComponentsManager — НЕ Unity-компоненти!)
     private static PropertyInfo _componentsCraftProp;   // ComponentsManager.craft (CraftComponent зі словника)
@@ -4512,6 +4513,7 @@ public static class ChopSync
         _isCraftingField    = _craftComponentType?.GetField("is_crafting", f);
         _currentCraftField  = _craftComponentType?.GetField("current_craft", f);
         _craftDefIdField    = AccessTools.TypeByName("CraftDefinition")?.GetField("id", f);
+        _craftDefHiddenField = AccessTools.TypeByName("CraftDefinition")?.GetField("hidden", f);
         _componentWgoProp   = AccessTools.TypeByName("WorldGameObjectComponent")?.GetProperty("wgo", f);
         // CraftComponent — НЕ MonoBehaviour (WorldGameObjectComponentBase = звичайний клас, декомпіл
         // 100354), GetComponentInChildren його НІКОЛИ не знайде (лайв-тест 2026-06-11: 0x17 мовчав).
@@ -4824,6 +4826,23 @@ public static class ChopSync
         catch { }
     }
 
+    // Скасування крафту (діалог Cancel: craft_queue.Clear()+Cancel(), декомпіл 48233): шлемо
+    // спорожнілу чергу + одразу release claim (не чекаючи 20с-тіка). Рефанд матеріалів іде
+    // DropItems → спільний лут 0x0B (консистентно з моделлю «обидва отримують»).
+    public static void OnLocalCraftCancelled(object craftComponent)
+    {
+        if (ApplyingRemoteChop || !Connected() || craftComponent == null) return;
+        EnsureReflection();
+        try
+        {
+            var wgo = _componentWgoProp?.GetValue(craftComponent) as MonoBehaviour;
+            if (wgo == null) return;
+            SendCraftQueue(wgo);
+            CheckLocalCraftStopped(wgo);
+        }
+        catch { }
+    }
+
     // Відправка черги верстата напарнику (0x17). Гейт близькості + дедуп по хешу.
     public static void SendCraftQueue(MonoBehaviour wgo)
     {
@@ -4998,6 +5017,18 @@ public static class ChopSync
         catch { return false; }
     }
 
+    // hidden-крафти = системні/амбієнтні (bat_remove/slime_remove спавнерів тощо): гравець їх
+    // НЕ драйвить (гейт 83086: is_player && hidden → false) і бабл не показує (84519). Арбітраж
+    // для них безглуздий і ШКІДЛИВИЙ: вони стартують самі на КОЖНІЙ машині (зона завантажилась)
+    // → вічні claim-и (лайв-тест фіксів 2026-06-11: ~14 станцій 37xxx ре-claim-ились по колу) і
+    // взаємний блок амбієнт-механік, якщо обидва гравці в одній зоні.
+    private static bool IsHiddenCraftDef(object craftDef)
+    {
+        if (craftDef == null || _craftDefHiddenField == null) return false;
+        try { return Convert.ToBoolean(_craftDefHiddenField.GetValue(craftDef)); }
+        catch { return false; }
+    }
+
     // Prefix TryStartCraftFromQueue + CraftReally: блокувати ЛОКАЛЬНИЙ старт, якщо станцію
     // зайняв напарник. Лог із throttle (88287 кличе TryStart щотік роботи). craftArg — аргумент
     // craft із CraftReally (другий шар захисту знесення, незалежний від рефлексії is_removing).
@@ -5011,9 +5042,11 @@ public static class ChopSync
         {
             // Remove-крафт НЕ блокуємо (другий шар, по самому крафту): блок → ProcessRemove →
             // миттєвий DestroyMe (декомпіл 44299/115655). Перший шар — IsWgoRemoving нижче.
-            if (craftArg != null && _craftDefIdField != null)
+            // hidden-крафти (амбієнтні спавнери) — теж ніколи не блокуємо (системна механіка).
+            if (craftArg != null)
             {
-                var argId = _craftDefIdField.GetValue(craftArg) as string;
+                if (IsHiddenCraftDef(craftArg)) return false;
+                var argId = _craftDefIdField?.GetValue(craftArg) as string;
                 if (argId != null && argId.Contains(":r:")) return false;
             }
             var wgo = _componentWgoProp.GetValue(craftComponent) as MonoBehaviour;
@@ -5056,7 +5089,13 @@ public static class ChopSync
             if (_currentCraftField != null && _craftDefIdField != null)
             {
                 var cur = _currentCraftField.GetValue(craftComponent);
-                if (cur != null) craftId = _craftDefIdField.GetValue(cur) as string ?? "";
+                if (cur != null)
+                {
+                    // Амбієнтні/системні hidden-крафти (bat_remove/slime_remove…) НЕ клеймимо:
+                    // вони крутяться самі на обох машинах вічно → флуд claim-ів + взаємний блок.
+                    if (IsHiddenCraftDef(cur)) return;
+                    craftId = _craftDefIdField.GetValue(cur) as string ?? "";
+                }
             }
             if (craftId.Contains(":r:")) return;   // remove-крафт — теж поза арбітражем
             // Throttle: zero-time крафти йдуть циклом до 500 CraftReally за ОДИН виклик черги
@@ -5071,6 +5110,11 @@ public static class ChopSync
             _localCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
             _lastSentProgressQ[uid] = -1;   // 3b: свіжий крафт → перший тік прогресу зайде (q=0)
             SendCraftClaim(uid, true, craftId);
+            // БАГФІКС (тест 3b): крафт, запущений НЕ через EnqueueCraft (Craft() напряму — піч,
+            // «постав на роботу» з GUI), не оновлював мирор черги → у напарника бар без бабла
+            // (піч) або стейл-іконка старої черги. CraftReally — лійка ВСІХ стартів, тож свіжа
+            // черга (з синтетичним активним пунктом) летить на кожному старті. Дедуп глушить дублі.
+            SendCraftQueue(wgo);
         }
         catch { }
     }
@@ -7217,6 +7261,81 @@ public static class BlockedCraftBubblePatch
     {
         if (text == "not_enough_resources" && ChopSync.WasCraftBlockedRecently)
             text = ChopSync.GetStationBusyMessage();
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// БАГФІКС черги (тест 3b): GUI-редагування черги міняє craft_queue НАПРЯМУ, без EnqueueCraft —
+// жоден хук не фаєрився → у напарника стейл-іконка (видалив рамку → поставив руду, а напарник
+// далі бачить рамку). Видалення йде через CraftQueueGUI.OnDeleteItemPressed (декомпіл 48434,
+// _craft_component на інстансі GUI) — Postfix шле свіжу чергу.
+[HarmonyPatch]
+public static class CraftQueueDeleteSyncPatch
+{
+    static FieldInfo _ccField;
+
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("CraftQueueGUI");
+        _ccField = t?.GetField("_craft_component", BindingFlags.NonPublic | BindingFlags.Instance);
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .FirstOrDefault(m => m.Name == "OnDeleteItemPressed");
+    }
+
+    static void Postfix(object __instance)
+    {
+        if (_ccField != null) ChopSync.OnLocalCraftQueueChanged(_ccField.GetValue(__instance));
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// БАГФІКС черги (тест 3b): кнопки ±/∞ на пункті черги (CraftQueueItemGUI 48644/48658/48670)
+// мутують _ci.n/_ci.infinite напряму. WGO станції — приватне поле _craftery_wgo на GUI-пункті.
+[HarmonyPatch]
+public static class CraftQueueButtonsSyncPatch
+{
+    static FieldInfo _wgoField;
+
+    static IEnumerable<MethodBase> TargetMethods()
+    {
+        var t = AccessTools.TypeByName("CraftQueueItemGUI");
+        if (t == null) yield break;
+        _wgoField = t.GetField("_craftery_wgo", BindingFlags.NonPublic | BindingFlags.Instance);
+        var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        foreach (var name in new[] { "OnIncreasePressed", "OnDecreasePressed", "OnInfinityButtonPressed" })
+        {
+            var m = t.GetMethods(flags).FirstOrDefault(x => x.Name == name && x.GetParameters().Length == 0);
+            if (m != null) yield return m;
+        }
+    }
+
+    static void Postfix(object __instance)
+    {
+        var wgo = _wgoField?.GetValue(__instance) as MonoBehaviour;
+        if (wgo != null) ChopSync.SendCraftQueue(wgo);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// БАГФІКС черги (тест 3b): скасування крафту з діалога (craft_queue.Clear()+Cancel(), 48233) —
+// теж повз EnqueueCraft. Postfix CraftComponent.Cancel → свіжа черга + миттєвий release claim.
+[HarmonyPatch]
+public static class CraftCancelSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var cc = AccessTools.TypeByName("CraftComponent");
+        return cc?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                              BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "Cancel" && m.GetParameters().Length == 0);
+    }
+
+    static void Postfix(object __instance)
+    {
+        ChopSync.OnLocalCraftCancelled(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
