@@ -2421,17 +2421,24 @@ public class SteamManager : MonoBehaviour
         }
         else if (type == 0x18)
         {
-            // ── Claim/release станції (Етап 3a, арбітраж власника): напарник стартував/закінчив
-            // крафт → блокуємо/звільняємо локальні старти на цій станції ──
-            // type(1) uid(8) flag(1: 1=старт 0=стоп) craftIdLen(1) craftId
+            // ── Claim/release/прогрес станції (Етап 3a/3b, арбітраж власника):
+            // flag=1 старт {uid, craftIdLen, craftId}; flag=0 стоп; flag=2 прогрес {uid, 0-100} ──
             if (data.Length < 11) { _logger.LogWarning($"[CHOP] 0x18 замалий ({data.Length})"); return; }
             long auid = BitConverter.ToInt64(data, 1);
-            bool astart = data[9] != 0;
-            int aidLen = data[10];
-            string acraftId = "";
-            if (aidLen > 0 && 11 + aidLen <= data.Length)
-                acraftId = System.Text.Encoding.UTF8.GetString(data, 11, aidLen);
-            ChopSync.ApplyRemoteCraftClaim(auid, astart, acraftId);
+            byte aflag = data[9];
+            if (aflag == 2)
+            {
+                ChopSync.ApplyRemoteCraftProgress(auid, data[10] / 100f);
+            }
+            else
+            {
+                bool astart = aflag != 0;
+                int aidLen = data[10];
+                string acraftId = "";
+                if (aidLen > 0 && 11 + aidLen <= data.Length)
+                    acraftId = System.Text.Encoding.UTF8.GetString(data, 11, aidLen);
+                ChopSync.ApplyRemoteCraftClaim(auid, astart, acraftId);
+            }
         }
     }
 
@@ -4379,6 +4386,11 @@ public static class ChopSync
     private static PropertyInfo _wgoComponentsProp;     // WGO.components (ComponentsManager — НЕ Unity-компоненти!)
     private static PropertyInfo _componentsCraftProp;   // ComponentsManager.craft (CraftComponent зі словника)
     private static PropertyInfo _isRemovingProp;        // WGO.is_removing (станція в процесі знесення)
+    private static PropertyInfo _wgoProgressProp;       // WGO.progress (float 0..1 → _data.progress)
+    private static MethodInfo _setBubbleWidgetDataMethod; // WGO.SetBubbleWidgetData(BubbleWidgetData, WidgetID)
+    private static Type _bubbleProgressDataType;        // BubbleWidgetProgressData
+    private static Type _progressDelegateType;          // BubbleWidgetProgressData.ProgressDelegate (вкладений)
+    private static object _widgetIdCraftingProgress;    // enum BubbleWidgetData.WidgetID.CraftingProgress
     private static MethodInfo _redrawBubbleMethod;      // WGO.RedrawBubble — перемалювати вікно черги
     private static Type       _treeDisappearType;       // TreeDisappearAnimation (компонент дерева)
     private static MethodInfo _startAnimationMethod;    // TreeDisappearAnimation.StartAnimation(VoidDelegate)
@@ -4507,6 +4519,25 @@ public static class ChopSync
         _wgoComponentsProp   = _wgoType.GetProperty("components", f);
         _componentsCraftProp = _wgoComponentsProp?.PropertyType.GetProperty("craft", f);
         _isRemovingProp      = _wgoType.GetProperty("is_removing", f);
+        // Прогрес-бар напарника (Етап 3b): wgo.progress (112161) + рідний віджет бару.
+        // BubbleWidgetProgressData(ProgressDelegate, int, int) — 42346; WidgetID.CraftingProgress
+        // — той самий слот, що гра ставить/стирає у RefreshComponentBubbleData (84597/84633).
+        _wgoProgressProp           = _wgoType.GetProperty("progress", f);
+        // УВАГА: SetBubbleWidgetData має кілька оверлоадів (BubbleWidgetData/string) — беремо
+        // саме той, що приймає BubbleWidgetData (інакше Invoke з віджетом упав би на касті).
+        _setBubbleWidgetDataMethod = _wgoType.GetMethods(f).FirstOrDefault(m =>
+            m.Name == "SetBubbleWidgetData" && m.GetParameters().Length == 2 &&
+            m.GetParameters()[0].ParameterType.Name == "BubbleWidgetData");
+        _bubbleProgressDataType    = AccessTools.TypeByName("BubbleWidgetProgressData");
+        _progressDelegateType      = _bubbleProgressDataType?.GetNestedType("ProgressDelegate",
+                                         BindingFlags.Public | BindingFlags.NonPublic);
+        try
+        {
+            var widType = AccessTools.TypeByName("BubbleWidgetData")?.GetNestedType("WidgetID",
+                              BindingFlags.Public | BindingFlags.NonPublic);
+            if (widType != null) _widgetIdCraftingProgress = Enum.Parse(widType, "CraftingProgress");
+        }
+        catch { }
         _redrawBubbleMethod = _wgoType.GetMethods(f).FirstOrDefault(m => m.Name == "RedrawBubble");
 
         // Анімація падіння дерева — компонент TreeDisappearAnimation на дереві.
@@ -5038,6 +5069,7 @@ public static class ChopSync
                 return;
             }
             _localCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
+            _lastSentProgressQ[uid] = -1;   // 3b: свіжий крафт → перший тік прогресу зайде (q=0)
             SendCraftClaim(uid, true, craftId);
         }
         catch { }
@@ -5063,6 +5095,7 @@ public static class ChopSync
                 return;
             }
             _localCrafting.Remove(uid);
+            _lastSentProgressQ.Remove(uid);
             SendCraftClaim(uid, false, "");
         }
         catch { }
@@ -5096,6 +5129,7 @@ public static class ChopSync
                 else
                 {
                     _localCrafting.Remove(uid);
+                    _lastSentProgressQ.Remove(uid);
                     SendCraftClaim(uid, false, "");
                 }
             }
@@ -5124,7 +5158,7 @@ public static class ChopSync
 
     public static void ApplyRemoteCraftClaim(long uid, bool start, string craftId)
     {
-        if (!start) { _remoteCrafting.Remove(uid); return; }
+        if (!start) { _remoteCrafting.Remove(uid); ClearRemoteProgressBar(uid); return; }
         // ГОНКА одночасного старту (вікно ~RTT): обидва стартували й обмінялись claim.
         // Детермінований tiebreak: ХОСТ виграє. Хост ігнорує чужий claim (клієнт сам скасує,
         // отримавши хостів); клієнт робить mini-cancel свого крафту й реєструє блок.
@@ -5139,6 +5173,129 @@ public static class ChopSync
             MiniCancelLocalCraft(uid);
         }
         _remoteCrafting[uid] = new CraftClaim { craftId = craftId, time = Time.realtimeSinceStartup };
+    }
+
+    // ── ЕТАП 3b: ЖИВИЙ ПРОГРЕС-БАР У НАПАРНИКА (0x18 flag=2) ─────────────────────────────────
+    // Власник шле квантований прогрес (10%-кроки) з Postfix CraftComponent.DoAction. Приймач
+    // ставить wgo.progress (та сама властивість, з якої малює рідний бар) і інжектить
+    // BubbleWidgetProgressData у слот CraftingProgress. is_crafting НЕ чіпаємо (інакше
+    // ReallyUpdateComponent сам затікає is_auto = подвійний драйв, декомпіл 84155). Рідний
+    // RefreshComponentBubbleData стирає бар при is_crafting=false (84633) → Postfix повертає.
+    private static readonly Dictionary<long, int> _lastSentProgressQ = new Dictionary<long, int>();
+    private static readonly Dictionary<long, object> _remoteBarWidgets = new Dictionary<long, object>();
+
+    // Джерело для ProgressDelegate бару: читає живий wgo.progress (оновлюється пакетами).
+    private sealed class RemoteProgressSource
+    {
+        public MonoBehaviour wgo;
+        public float Get()
+        {
+            try
+            {
+                return wgo != null && _wgoProgressProp != null
+                    ? Convert.ToSingle(_wgoProgressProp.GetValue(wgo)) : 0f;
+            }
+            catch { return 0f; }
+        }
+    }
+
+    // Postfix CraftComponent.DoAction (кожен робочий тік власника): прогрес на 10%-кроках.
+    public static void OnLocalCraftProgressTick(object craftComponent)
+    {
+        if (ApplyingRemoteChop || !Connected() || craftComponent == null) return;
+        if (_localCrafting.Count == 0) return;
+        try
+        {
+            var wgo = _componentWgoProp?.GetValue(craftComponent) as MonoBehaviour;
+            if (wgo == null || _uniqueIdField == null || _wgoProgressProp == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (!_localCrafting.ContainsKey(uid)) return;
+            float p = Convert.ToSingle(_wgoProgressProp.GetValue(wgo));
+            int q = Mathf.Clamp((int)(p * 10f), 0, 10);
+            if (_lastSentProgressQ.TryGetValue(uid, out var prev) && prev == q) return;
+            _lastSentProgressQ[uid] = q;
+
+            var packet = new byte[11];
+            packet[0] = 0x18;
+            BitConverter.GetBytes(uid).CopyTo(packet, 1);
+            packet[9]  = 2;                       // flag=2: прогрес
+            packet[10] = (byte)(q * 10);          // 0-100
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
+        }
+        catch { }
+    }
+
+    // Приймач прогресу: wgo.progress + бар + освіження TTL claim-а (прогрес = сигнал життя).
+    public static void ApplyRemoteCraftProgress(long uid, float p)
+    {
+        EnsureReflection();
+        // Прогрес без claim (пропущений старт) — зареєструвати блок захисно: станція явно працює.
+        if (_remoteCrafting.TryGetValue(uid, out var claim))
+        {
+            claim.time = Time.realtimeSinceStartup;
+            _remoteCrafting[uid] = claim;
+        }
+        else
+            _remoteCrafting[uid] = new CraftClaim { craftId = "", time = Time.realtimeSinceStartup };
+        try
+        {
+            var wgo = FindWgoByUniqueId(uid);
+            if (wgo == null || _wgoProgressProp == null) return;
+            _wgoProgressProp.SetValue(wgo, Mathf.Clamp01(p));
+            EnsureRemoteProgressBar(wgo, uid);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteCraftProgress: {e.Message}"); }
+    }
+
+    // Рідний віджет бару в слот CraftingProgress (той, що гра ставить при is_crafting).
+    // Делегат читає wgo.progress → бар живе сам, пакети лише рухають значення.
+    private static void EnsureRemoteProgressBar(MonoBehaviour wgo, long uid)
+    {
+        if (_setBubbleWidgetDataMethod == null || _bubbleProgressDataType == null ||
+            _progressDelegateType == null || _widgetIdCraftingProgress == null) return;
+        try
+        {
+            if (!_remoteBarWidgets.TryGetValue(uid, out var wdata))
+            {
+                var src = new RemoteProgressSource { wgo = wgo };
+                var del = Delegate.CreateDelegate(_progressDelegateType, src,
+                              typeof(RemoteProgressSource).GetMethod("Get"));
+                wdata = Activator.CreateInstance(_bubbleProgressDataType, del, 0, 2);
+                _remoteBarWidgets[uid] = wdata;
+            }
+            _setBubbleWidgetDataMethod.Invoke(wgo, new object[] { wdata, _widgetIdCraftingProgress });
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] EnsureRemoteProgressBar: {e.Message}"); }
+    }
+
+    // Стоп/звільнення станції: прибрати бар (слот → null, як робить сама гра в 84633).
+    private static void ClearRemoteProgressBar(long uid)
+    {
+        if (!_remoteBarWidgets.Remove(uid)) return;
+        try
+        {
+            var wgo = FindWgoByUniqueId(uid);
+            if (wgo != null && _setBubbleWidgetDataMethod != null && _widgetIdCraftingProgress != null)
+                _setBubbleWidgetDataMethod.Invoke(wgo, new object[] { null, _widgetIdCraftingProgress });
+        }
+        catch { }
+    }
+
+    // Postfix CraftComponent.RefreshComponentBubbleData: рідний рефреш стер бар (is_crafting=false
+    // у нас) → повертаємо, поки станція під активним claim напарника.
+    public static void ReinjectRemoteProgressBar(object craftComponent)
+    {
+        if (craftComponent == null || _remoteCrafting.Count == 0) return;
+        try
+        {
+            var wgo = _componentWgoProp?.GetValue(craftComponent) as MonoBehaviour;
+            if (wgo == null || _uniqueIdField == null) return;
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (!_remoteCrafting.TryGetValue(uid, out var claim)) return;
+            if (Time.realtimeSinceStartup - claim.time > CRAFT_CLAIM_TTL) return;
+            EnsureRemoteProgressBar(wgo, uid);
+        }
+        catch { }
     }
 
     // Програна гонка: зняти власний крафт без завершення. Матеріали вже списані CraftReally —
@@ -7064,3 +7221,47 @@ public static class BlockedCraftBubblePatch
 
     static Exception Finalizer(Exception __exception) => null;
 }
+
+// ЕТАП 3b: прогрес власника → напарнику. CraftComponent.DoAction тікає прогрес щороботи
+// (гравець/зомбі/авто, декомпіл 83157) — Postfix шле 0x18 flag=2 на 10%-кроках (дедуп
+// квантом усередині OnLocalCraftProgressTick, гейт _localCrafting).
+[HarmonyPatch]
+public static class CraftProgressSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var cc = AccessTools.TypeByName("CraftComponent");
+        return cc?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                              BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "DoAction");
+    }
+
+    static void Postfix(object __instance)
+    {
+        ChopSync.OnLocalCraftProgressTick(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// ЕТАП 3b: рідний RefreshComponentBubbleData стирає прогрес-бар, коли is_crafting=false
+// (декомпіл 84633, SetBubbleWidgetData(null)) — а в напарника воно завжди false. Postfix
+// повертає бар, поки станція під активним claim (гейт у ReinjectRemoteProgressBar).
+[HarmonyPatch]
+public static class RemoteCraftBarPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var cc = AccessTools.TypeByName("CraftComponent");
+        return cc?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                              BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "RefreshComponentBubbleData");
+    }
+
+    static void Postfix(object __instance)
+    {
+        ChopSync.ReinjectRemoteProgressBar(__instance);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}   
