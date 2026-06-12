@@ -2244,6 +2244,7 @@ public class SteamManager : MonoBehaviour
                 _chopRetryTimer = 0f;
                 ChopSync.RetryPendingDestroys();
                 ChopSync.RetryPendingDrops();
+                ChopSync.RetryPendingBigPickups();
             }
         }
     }
@@ -2760,6 +2761,18 @@ public class SteamManager : MonoBehaviour
             }
             if (wok) ChopSync.ApplyRemoteWeather(wday, wslots, wnames);
             else _logger.LogWarning("[CHOP] 0x1A пошкоджений");
+        }
+        else if (type == 0x1B)
+        {
+            // ── Підбір нетрекнутого ВЕЛИКОГО дропа: type x(4) y(4) idLen(1) id ──
+            // Напарник підняв свою сейв-копію глиби/колоди → прибираємо нашу за id+позицією.
+            if (data.Length < 11) { _logger.LogWarning($"[CHOP] 0x1B замалий ({data.Length})"); return; }
+            float bx = BitConverter.ToSingle(data, 1);
+            float by = BitConverter.ToSingle(data, 5);
+            int bidLen = data[9];
+            if (10 + bidLen > data.Length) { _logger.LogWarning("[CHOP] 0x1B пошкоджений"); return; }
+            string bid = System.Text.Encoding.UTF8.GetString(data, 10, bidLen);
+            ChopSync.ApplyRemoteBigPickup(bid, bx, by);
         }
     }
 
@@ -7418,21 +7431,57 @@ public static class ChopSync
             // Наш 0x11-реплей → реєструємо мирор під переданим uid, owner=False. Інші echo-дропи
             // (0x0B-лут тощо) НЕ реєструємо: _incomingCorpseUid ставить лише ApplyRemoteCorpseSpawn.
             if (_incomingCorpseUid == null) return;
-            RegisterCorpseBodyGO(go, _incomingCorpseUid.Value, owner: false);
+            RegisterCorpseBodyGO(go, _incomingCorpseUid.Value, owner: false, itemId);
             return;
         }
         if (!Connected()) return;
 
-        // ЛИШЕ ТРУП мириться як єдиний спільний предмет. УЗАГАЛЬНЕННЯ НА НОСИМІ (руда/колода)
-        // ВІДКОЧЕНО 2026-06-11 (рішення Zonda після тестів 1-5): дюп на рівному місці (дроп-спам
-        // цикли vanilla «кинув-підняв» множили мирори), а обмін ресурсами ВЖЕ працює через
-        // скрині/стокпайли (0x19). Прийнята межа (повернулась): вихід із колодою в руках губить
-        // колоду зі світу напарника (DropOverheadOnExit кидає її лише локально+у сейв хоста).
-        if (itemId != "body") return;
+        // CARRY-МИРОР v2 (2026-06-12): узагальнення ПОВЕРНУТО з анти-спамом. Мириться:
+        // труп (body, ексгумація+кидок) АБО будь-який предмет, що кидається З РУК
+        // (overhead == item: DropOverheadItem кличе Drop ДО SetOverheadItem(null),
+        // декомпіл 82071-72 → у Postfix overhead ще збігається). Зрубані колоди/лут ідуть
+        // через DropItems(множина) → overhead-гейт НЕ проходять → спільний 0x0B недоторканий.
+        bool isBody = itemId == "body";
+        bool isHandDrop = false;
+        try { isHandDrop = ReferenceEquals(GetLocalPlayerOverheadItem(), item); } catch { }
+        // ВЕЛИКЕ = ОДНЕ НА ДВОХ: item_size>=2 (глиба/мармур/колода з жили чи пилорами)
+        // трекається з НАРОДЖЕННЯ → 0x11-мирор; з 0x0B такі виключено (OnLocalDropItems).
+        bool isBig = false;
+        try
+        {
+            var ti = item as Item;
+            isBig = ti != null && ti.definition != null && ti.definition.item_size >= 2;
+        }
+        catch { }
+        if (!isBody && !isHandDrop && !isBig) return;
 
-        // Локальний спавн (ексгумація АБО кидок із рук) → новий uid, реєстрація власника, 0x11.
-        long uid = DateTime.UtcNow.Ticks;
-        RegisterCorpseBodyGO(go, uid, owner: true);
+        // АНТИ-СПАМ: re-drop того ж предмета поруч у вікні TTL → реюз uid (мирор напарника
+        // живе далі; запланований 0x10 скасовується). Інакше — свіжий uid (Ticks).
+        long uid = 0;
+        var p0 = go.transform.position;
+        for (int pi = _pendingCarry.Count - 1; pi >= 0; pi--)
+        {
+            var pc = _pendingCarry[pi];
+            if (pc.itemId == itemId &&
+                Vector2.Distance(pc.pos, new Vector2(p0.x, p0.y)) < CARRY_UID_REUSE_RADIUS)
+            {
+                uid = pc.uid;
+                Multiplayer.Log?.LogInfo($"[CHOP] Re-drop '{itemId}' → реюз uid={uid} " +
+                    $"(0x10 {(pc.removeSent ? "вже пішов — приймач переспавнить за 0x11" : "скасовано")})");
+                _pendingCarry.RemoveAt(pi);
+                break;
+            }
+        }
+        // Ticks має гранулярність ~10-15мс → 3-4 колоди з перка в ОДНОМУ кадрі отримували
+        // ОДНАКОВИЙ uid (у напарника всі 0x11 падали в один мирор, який «пінгувало» між
+        // позиціями). Монотонний лічильник гарантує унікальність у межах кадру.
+        if (uid == 0)
+        {
+            uid = DateTime.UtcNow.Ticks;
+            if (uid <= _lastIssuedUid) uid = _lastIssuedUid + 1;
+            _lastIssuedUid = uid;
+        }
+        RegisterCorpseBodyGO(go, uid, owner: true, itemId);
 
         var pos = go.transform.position;                          // фактична позиція заспавненого трупа
         int dir = (dropArgs.Length > 3 && dropArgs[3] != null) ? Convert.ToInt32(dropArgs[3]) : 0;
@@ -7459,19 +7508,26 @@ public static class ChopSync
     }
 
     // Реєстрація трупа за ТОЧНИМ GameObject (з хука Drop) — без сканування сцени.
-    public static void RegisterCorpseBodyGO(MonoBehaviour go, long uid, bool owner)
+    public static void RegisterCorpseBodyGO(MonoBehaviour go, long uid, bool owner, string itemId = "body")
     {
         if (go == null) return;
         var existing = FindBodyByUid(uid);
-        if (existing != null && existing.go != null) return;
+        if (existing != null && existing.go != null)
+        {
+            // v2: ДЕАКТИВОВАНИЙ старий GO (підбір руди/колоди деактивує, не нищить) — стейл,
+            // не блокуємо ре-реєстрацію нового GO під реюзнутим uid у тому ж кадрі.
+            bool act = false;
+            try { act = existing.go.gameObject.activeInHierarchy; } catch { }
+            if (act && !ReferenceEquals(existing.go, go)) return;
+        }
         if (_bodies.Any(b => ReferenceEquals(b.go, go))) return;   // вже відстежується
         var p = go.transform.position;
         _bodies.RemoveAll(b => b.uid == uid);
         _bodies.Add(new BodyTrack {
-            go = go, uid = uid, lastPos = new Vector2(p.x, p.y),
+            go = go, uid = uid, itemId = itemId, lastPos = new Vector2(p.x, p.y),
             registeredTime = Time.time, lastRemoteTime = -99f, lastSendTime = -99f, isOwner = owner
         });
-        Multiplayer.Log?.LogInfo($"[CHOP] Труп зареєстровано → uid={uid} owner={owner} pos=({p.x:F1},{p.y:F1})");
+        Multiplayer.Log?.LogInfo($"[CHOP] Носиме '{itemId}' зареєстровано → uid={uid} owner={owner} pos=({p.x:F1},{p.y:F1})");
     }
 
     // Приймач 0x11: відтворити ПОВНИЙ труп на граві глядача через ту саму DropItem (під
@@ -7490,12 +7546,26 @@ public static class ChopSync
             Multiplayer.Log?.LogWarning($"[CHOP] 0x11: ні джерела uid={uid}, ні локального wgo — труп не заспавнено");
             return;
         }
-        // Уже є живий труп цього uid? (повторний 0x11) — не дублюємо.
+        // Уже є живий мирор цього uid? (повторний 0x11 / реюз uid при re-drop) — НЕ дублюємо:
+        // живий+активний → репозиція на позицію з пакета; мертвий/деактивований → переспавн.
         var existed = FindBodyByUid(uid);
         if (existed != null && existed.go != null)
         {
-            Multiplayer.Log?.LogInfo($"[CHOP] 0x11: труп uid={uid} вже існує — пропуск");
-            return;
+            bool act = false;
+            try { act = existed.go.gameObject.activeInHierarchy; } catch { }
+            if (act)
+            {
+                try
+                {
+                    existed.go.transform.position = new Vector3(x, y, z);
+                    existed.lastRemoteTime = Time.time;   // echo-guard: тік не відішле цей рух назад
+                    existed.lastPos = new Vector2(x, y);
+                }
+                catch { }
+                Multiplayer.Log?.LogInfo($"[CHOP] 0x11: мирор uid={uid} вже живий — репозиція ✓");
+                return;
+            }
+            _bodies.Remove(existed);   // стейл-трек — нижче переспавнимо чисто
         }
         ApplyingRemoteChop = true;
         _incomingCorpseUid = uid;   // RegisterCorpseBody (постфікс) зареєструє під цим uid, owner=False
@@ -7545,6 +7615,17 @@ public static class ChopSync
             foreach (var it in list)
             {
                 if (it == null) continue;
+                // ВЕЛИКЕ = ОДНЕ НА ДВОХ (2026-06-12, рішення Zonda): носимі в руках
+                // (item_size>=2 — глиби/мармур/колоди) НЕ дублюються спільним лутом —
+                // вони миряться єдиним об'єктом через 0x11 (хук Drop трекає їх при
+                // спавні). Інакше копія напарника + мирор від кидка з рук = 2 глиби
+                // (лайв-тест carry v2). Дрібний лут — як був («обидва отримують»).
+                try
+                {
+                    var ti = it as Item;
+                    if (ti != null && ti.definition != null && ti.definition.item_size >= 2) continue;
+                }
+                catch { }
                 var id = _itemIdField.GetValue(it) as string;
                 if (string.IsNullOrEmpty(id)) continue;
                 int val = Convert.ToInt32(_itemValueField.GetValue(it));
@@ -7681,6 +7762,7 @@ public static class ChopSync
     {
         public MonoBehaviour go;       // локальний DropResGameObject(body)
         public long uid;               // uid могили-джерела (спільний ключ)
+        public string itemId = "body"; // id предмета (carry-мирор v2: реюз uid при re-drop)
         public Vector2 lastPos;
         public float registeredTime;   // для відстою фізики при спавні
         public float lastRemoteTime;   // коли востаннє рухнули за 0x0F (echo-guard)
@@ -7695,6 +7777,25 @@ public static class ChopSync
     private const float BODY_ECHO_SEC     = 0.4f;   // після 0x0F-руху не слати назад
     private const float BODY_SEND_MIN_SEC = 0.06f;  // throttle ~16/с
     private const float BODY_MOVE_EPS     = 0.1f;   // поріг «рухнувся»
+
+    // ── CARRY-МИРОР v2: анти-спам дроп-циклів (2026-06-12, повернення узагальнення) ──────────
+    // Vanilla тримання кнопки = цикл «кинув-підняв» щокадру → v1 плодив 12 мирорів за секунди
+    // (кожен Drop = новий uid, 0x10 відставав). v2: зникнення у власника кладе трек у
+    // _pendingCarry; 0x10 летить лише через дебаунс; re-drop того ж itemId поруч у вікні
+    // TTL РЕЮЗИТЬ uid і скасовує 0x10 → у напарника живе ОДИН мирор без блимань і дублів.
+    private class PendingCarry
+    {
+        public long uid;
+        public string itemId;
+        public Vector2 pos;
+        public float goneTime;
+        public bool removeSent;
+    }
+    private static readonly List<PendingCarry> _pendingCarry = new List<PendingCarry>();
+    private static long _lastIssuedUid;                   // монотонні uid (Ticks колізять у кадрі)
+    private const float CARRY_REMOVE_DEBOUNCE   = 0.5f;  // 0x10 не раніше ніж через 0.5с
+    private const float CARRY_UID_REUSE_TTL     = 3f;    // вікно реюзу uid після зникнення
+    private const float CARRY_UID_REUSE_RADIUS  = 300f;  // re-drop поруч = той самий предмет
 
     private static BodyTrack FindBodyByUid(long uid)
     {
@@ -7851,6 +7952,26 @@ public static class ChopSync
     // (покладено в могилу/спожито) — транслюємо видалення (0x10) і чистимо трек.
     public static void TickCarriedBodies()
     {
+        float nowP = Time.time;
+        // v2: відкладені 0x10 — дебаунс пережив (re-drop не скасував) → шлемо; TTL вийшов → чистимо.
+        for (int pi = _pendingCarry.Count - 1; pi >= 0; pi--)
+        {
+            var pc = _pendingCarry[pi];
+            if (!pc.removeSent && nowP - pc.goneTime >= CARRY_REMOVE_DEBOUNCE)
+            {
+                pc.removeSent = true;
+                if (Connected())
+                {
+                    var rm = new byte[9];
+                    rm[0] = 0x10;
+                    BitConverter.GetBytes(pc.uid).CopyTo(rm, 1);
+                    SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, rm);
+                    Multiplayer.Log?.LogInfo($"[CHOP] Носиме '{pc.itemId}' uid={pc.uid} зникло (дебаунс минув) → 0x10");
+                }
+            }
+            if (nowP - pc.goneTime > CARRY_UID_REUSE_TTL) _pendingCarry.RemoveAt(pi);
+        }
+
         if (_bodies.Count == 0) return;
         float now = Time.time;
         for (int i = _bodies.Count - 1; i >= 0; i--)
@@ -7866,13 +7987,14 @@ public static class ChopSync
             {
                 // ТІЛЬКИ власник транслює видалення. Глядачева копія могла зникнути від фізики/
                 // авто-збору — НЕ можна слати 0x10 (саме це стирало справжній труп у власника).
+                // v2: НЕ шлемо одразу — у дебаунс-чергу: re-drop у вікні реюзне uid і скасує
+                // 0x10 (анти-спам циклів «кинув-підняв» при триманні кнопки).
                 if (b.alive && b.isOwner && Connected())
                 {
-                    var rm = new byte[9];
-                    rm[0] = 0x10;
-                    BitConverter.GetBytes(b.uid).CopyTo(rm, 1);
-                    SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, rm);
-                    Multiplayer.Log?.LogInfo($"[CHOP] Труп uid={b.uid} зник у власника → 0x10");
+                    _pendingCarry.Add(new PendingCarry {
+                        uid = b.uid, itemId = b.itemId, pos = b.lastPos, goneTime = now
+                    });
+                    Multiplayer.Log?.LogInfo($"[CHOP] Носиме '{b.itemId}' uid={b.uid} зникло у власника → 0x10 у дебаунс ({CARRY_REMOVE_DEBOUNCE}с)");
                 }
                 // (Евристика «GONE+гравець поруч → 0x14» ВИДАЛЕНА: GetLocalPlayerWgo/overhead
                 // виявились ненадійними в кадрі підбору — діаг показав «руки порожні dist=-1».
@@ -7942,8 +8064,9 @@ public static class ChopSync
         for (int i = 0; i < _bodies.Count; i++)
         {
             var b = _bodies[i];
-            if (!b.isOwner && ReferenceEquals(b.go, go))
+            if (ReferenceEquals(b.go, go))
             {
+                if (b.isOwner) return;   // власний трек → GONE-тік/дебаунс 0x10 усе зробить
                 var tp = new byte[9]; tp[0] = 0x14;
                 BitConverter.GetBytes(b.uid).CopyTo(tp, 1);
                 SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, tp);
@@ -7951,6 +8074,94 @@ public static class ChopSync
                 _bodies.RemoveAt(i);
                 return;
             }
+        }
+        // НЕтрекнутий ВЕЛИКИЙ дроп (зі старого сейва: обидва мають незалежні копії з 3.dat,
+        // народжені ДО з'єднання) → 0x1B: напарник прибирає СВОЮ копію за id+позицією
+        // (сейв-дропи лежать нерухомо — позиційний матч надійний, на відміну від свіжих
+        // фізичних дропів). Fail-open: не знайде — лишиться стара поведінка (копія висить).
+        try
+        {
+            var dr = go as DropResGameObject;
+            var res = dr != null ? dr.res : null;
+            if (res == null || res.definition == null || res.definition.item_size < 2) return;
+            var p = go.transform.position;
+            var idb = System.Text.Encoding.UTF8.GetBytes(res.id ?? "");
+            if (idb.Length == 0 || idb.Length > 255) return;
+            var pk = new byte[10 + idb.Length];
+            pk[0] = 0x1B;
+            BitConverter.GetBytes(p.x).CopyTo(pk, 1);
+            BitConverter.GetBytes(p.y).CopyTo(pk, 5);
+            pk[9] = (byte)idb.Length;
+            Buffer.BlockCopy(idb, 0, pk, 10, idb.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+            Multiplayer.Log?.LogInfo($"[CHOP] Підбір нетрекнутого великого '{res.id}' @({p.x:F1},{p.y:F1}) → 0x1B");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] 0x1B-відправка: {e.Message}"); }
+    }
+
+    // Приймач 0x1B: прибрати СВОЮ копію нетрекнутого великого дропа (id + позиція ≤64).
+    // Трекнуті (мирори/власні) пропускаємо — ними керують 0x10/0x14. Зона не завантажена
+    // (напарник далеко — лайв-тест: wood біля бази, хост у кар'єрі) → у ЧЕРГУ з ретраєм,
+    // приберемо коли наш гравець підійде й чанк прокинеться (патерн RetryPendingDestroys).
+    private class PendingBigPickup { public string id; public Vector2 pos; }
+    private static readonly List<PendingBigPickup> _pendingBigPickups = new List<PendingBigPickup>();
+    private const int PENDING_BIG_MAX = 64;
+
+    public static void ApplyRemoteBigPickup(string id, float x, float y)
+    {
+        if (TryRemoveBigCopy(id, x, y))
+        {
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x1B: копію '{id}' прибрано ✓");
+            return;
+        }
+        var pos = new Vector2(x, y);
+        if (_pendingBigPickups.Count < PENDING_BIG_MAX &&
+            !_pendingBigPickups.Any(p => p.id == id && Vector2.Distance(p.pos, pos) < 1f))
+        {
+            _pendingBigPickups.Add(new PendingBigPickup { id = id, pos = pos });
+            Multiplayer.Log?.LogInfo($"[CHOP] 0x1B: копію '{id}' @({x:F1},{y:F1}) не знайдено — у чергу (зона не завантажена?)");
+        }
+    }
+
+    // З SteamManager.Update (таймер ретраїв, раз на 2с): зона довантажилась → прибрати.
+    public static void RetryPendingBigPickups()
+    {
+        for (int i = _pendingBigPickups.Count - 1; i >= 0; i--)
+        {
+            var p = _pendingBigPickups[i];
+            if (TryRemoveBigCopy(p.id, p.pos.x, p.pos.y))
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] 0x1B-ретрай: копію '{p.id}' прибрано ✓");
+                _pendingBigPickups.RemoveAt(i);
+            }
+        }
+    }
+
+    private static bool TryRemoveBigCopy(string id, float x, float y)
+    {
+        try
+        {
+            DropResGameObject best = null;
+            float bestD = 64f;
+            foreach (var dr in UnityEngine.Object.FindObjectsOfType<DropResGameObject>())
+            {
+                if (dr == null || dr.res == null || dr.res.id != id) continue;
+                bool tracked = false;
+                for (int i = 0; i < _bodies.Count; i++)
+                    if (ReferenceEquals(_bodies[i].go, dr)) { tracked = true; break; }
+                if (tracked) continue;
+                var dp = dr.transform.position;
+                float d = Vector2.Distance(new Vector2(dp.x, dp.y), new Vector2(x, y));
+                if (d < bestD) { bestD = d; best = dr; }
+            }
+            if (best == null) return false;
+            CleanDestroyDrop(best);
+            return true;
+        }
+        catch (Exception e)
+        {
+            Multiplayer.Log?.LogWarning($"[CHOP] TryRemoveBigCopy: {e.Message}");
+            return false;
         }
     }
 
@@ -8414,10 +8625,13 @@ public static class DropItemsBroadcastPatch
     static Exception Finalizer(Exception __exception) => null;
 }
 
-// ТРУП — ЄДИНИЙ ХУК на статичний `DropResGameObject.Drop(Vector3, Item, Transform, Direction,
-// float, int, bool, bool)`: спільний шлях УСІХ спавнів трупа (ексгумація: WGO.DropItem→Drop;
-// кидок із рук: DropOverheadItem→Drop напряму). Постфікс дає __result = заспавнений DropResGameObject.
-// Фільтр id=="body" у OnCorpseDropped. Замінив старий хук WGO.DropItem (не ловив кидок із рук).
+// НОСИМІ — ЄДИНИЙ ХУК на статичний `DropResGameObject.DoDrop(Vector3, Item, Transform,
+// Direction, float, int, bool)` (декомпіл 90093): викликається РІВНО раз на КОЖЕН фізичний
+// наземний об'єкт і завжди повертає GO. Раніше хукали Drop — але Drop для Item із value>1
+// (колоди з перка!) РОЗЩЕПЛЮЄ на цикл DoDrop по одній і повертає NULL (90060-88) → хук
+// бачив null і пропускав усі такі колоди (лайв-тест v3 #2: «в напарника одна колода з 3-4»).
+// Індекси аргументів збігаються з Drop: [1]=Item, [3]=Direction, [4]=force. Item у DoDrop
+// для value>1 — це split-копія з value=1 (нею і трекаємо).
 [HarmonyPatch]
 public static class CorpseDropBroadcastPatch
 {
@@ -8426,7 +8640,7 @@ public static class CorpseDropBroadcastPatch
         var t = AccessTools.TypeByName("DropResGameObject");
         return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
                              BindingFlags.Static | BindingFlags.DeclaredOnly)
-            .FirstOrDefault(m => m.Name == "Drop"
+            .FirstOrDefault(m => m.Name == "DoDrop"
                               && m.GetParameters().Length >= 2
                               && m.GetParameters()[1].ParameterType.Name == "Item"
                               && m.ReturnType.Name == "DropResGameObject");
