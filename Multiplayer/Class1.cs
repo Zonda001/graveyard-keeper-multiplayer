@@ -557,10 +557,16 @@ public class Multiplayer : BaseUnityPlugin
         EnableAllRenderers(_remotePlayerGO);
         DisableFireAndParticles(_remotePlayerGO);
         FixOverheadObj(_remotePlayerGO);
+        CacheCloneLight(p1, _remotePlayerGO);
+        RegisterCloneLights(_remotePlayerGO);
 
         // RemotePlayerController — плавне переміщення до позиції з мережі
         var ctrl = _remotePlayerGO.AddComponent<RemotePlayerController>();
         ctrl.Init(startPos, Logger, p1.transform); // ← передаємо transform локального гравця для scale
+
+        // Сліди клона (відбитки ніг на снігу/багні) — дзеркало LeaveTrailComponent
+        _remotePlayerGO.AddComponent<RemoteTrailEmitter>();
+        Logger.LogInfo("[REMOTE] Емітер слідів клона додано ✓");
 
         // ── КАМЕРА НЕ ЧІПАЄТЬСЯ ──────────────────────────────────────────────
         // Кожен гравець має свою камеру на своєму ПК.
@@ -600,6 +606,7 @@ public class Multiplayer : BaseUnityPlugin
     {
         if (_remotePlayerGO != null)
         {
+            UnregisterCloneLights(_remotePlayerGO);
             Destroy(_remotePlayerGO);
             Logger.LogInfo("[REMOTE] Клон видалено — інший гравець вийшов ✓");
         }
@@ -854,8 +861,17 @@ public class Multiplayer : BaseUnityPlugin
 
     private void DisableFireAndParticles(GameObject obj)
     {
-        var fireNames = new[] { "fire", "fire (1)", "Point light", "ground light",
-            "ground light (small)", "garlic_cloud",
+        // "Point light"/"ground light"(+small) ПРИБРАНО зі списку (2026-06-12): це і є
+        // нічне коло світла гравця — Light під GroundLight/DynamicLight, інтенсивність
+        // веде DynamicLights.Update за часом доби (декомпіл 98337). Час синкнутий 0x08 →
+        // світло клона з'являється/гасне само, синхронно з напарником.
+        // "dynamic shadow" ПОВЕРНУТО в список (2026-06-12 вечір, лайв-тест #2): копії
+        // дин.тіней на клоні — СИРОТИ (_child_shadows приватний несеріалізований список →
+        // порожній після Instantiate, а _shadows_initialized=true копіюється → ніхто не
+        // ре-інітить і не веде спрайт/колір) — застигла біла фігура, що лише фліпається.
+        // Тінь клона = звичайна "shadow"-пляма (ванільний вигляд). Оживлення дин.тіней —
+        // окрема задача (ре-ініт рефлексією: _shadows_initialized=false + EnsureObjectHasShadows).
+        var fireNames = new[] { "fire", "fire (1)", "garlic_cloud",
             "memories_fx", "water_fx", "fx_memory_cloud",
             "eating_memory_cloud", "eyes_memory_cloud",
             "dynamic shadow", "[dynamic shadow] #0", "[dynamic shadow] #1",
@@ -884,7 +900,11 @@ public class Multiplayer : BaseUnityPlugin
             "Seeker", "CustomNetworkAnimatorSync", "ChunkedGameObject",
             "SimpleSmoothModifierXY", "AIPath", "AILerp", "FunnelModifier",
             "PixelPerfect",
-            "DynamicLight", "GroundLight", "LightFlicker", "RandomCoordinate",
+            // DynamicLight/GroundLight/LightFlicker ПРИБРАНО (2026-06-12): це світло
+            // гравця вночі — лишаємо живим, інтенсивність веде DynamicLights за часом доби.
+            // ObjectDynamicShadow(Child) ПОВЕРНУТО (2026-06-12 вечір): копії-сироти на
+            // клоні ніким не ведуться (білий застиглий силует) — див. DisableFireAndParticles.
+            "RandomCoordinate",
             "ObjectDynamicShadow", "ObjectDynamicShadowChild",
             // Вимикаємо компоненти управління гравцем — інакше гра рухає клон
             // тим самим інпутом що і локального гравця
@@ -907,11 +927,8 @@ public class Multiplayer : BaseUnityPlugin
             }
         }
 
-        foreach (var light in obj.GetComponentsInChildren<Light>(true))
-        {
-            light.enabled = false;
-            Logger.LogInfo($"[P2] Light вимкнено: {light.gameObject.name}");
-        }
+        // Light-компоненти НЕ вимикаємо (2026-06-12): нічне коло світла гравця має
+        // працювати й на клоні. Реєстрація в DynamicLights — RegisterCloneLights.
     }
 
     // ── WorldGameObject ───────────────────────────────────────────────────────
@@ -988,6 +1005,10 @@ public class Multiplayer : BaseUnityPlugin
     {
         foreach (var r in obj.GetComponentsInChildren<Renderer>(true))
         {
+            // Спрайти динамічної тіні НЕ чіпаємо (2026-06-12): їх enabled/альфу веде сама
+            // гра (ObjectDynamicShadow, тепер живий на клоні). Форс alpha 0→1 малював
+            // БІЛИЙ непрозорий силует під ногами клона (фото лайв-тесту #2).
+            if (r.gameObject.name.Contains("dynamic shadow")) continue;
             r.enabled = true;
             r.gameObject.SetActive(true);
             if (r is SpriteRenderer sr && sr.color.a < 0.01f)
@@ -1081,6 +1102,94 @@ public class Multiplayer : BaseUnityPlugin
         sr.sprite = null;
         sr.enabled = false;
         Logger.LogInfo("[CHOP] Overhead клона: прибрано + поза Standard");
+    }
+
+    // ── Світло ФАКЕЛА на КЛОНІ напарника (біт у 0x06) ────────────────────────────
+    // НІЧНЕ коло світла гравця — НЕ тут: воно завжди активне, інтенсивність веде
+    // DynamicLights за часом доби (див. DisableGameplayBehaviours/RegisterCloneLights).
+    // А це — РУЧНИЙ факел: light_go, дочірній GO гравця (поле PlayerComponent, декомпіл
+    // 87407), гра вмикає його SetActive(tool==Torch=9). Дзеркалимо activeSelf власника.
+    // Ре-увімкнення компонентів при першому вкл — підстраховка (DisableFireAndParticles
+    // міг деактивувати дітей типу "fire" під light_go).
+    private GameObject _cloneLightGo;
+    private bool _cloneTorchOn;
+    private bool _cloneLightCompsEnabled;
+
+    // Шлях light_go знімаємо з ЛОКАЛЬНОГО гравця (його PlayerComponent живий; у клона
+    // він стрипнутий до Awake) і знаходимо того самого нащадка в клоні — Instantiate
+    // зберігає імена та ієрархію.
+    private void CacheCloneLight(GameObject localPlayer, GameObject clone)
+    {
+        _cloneLightGo = null;
+        _cloneTorchOn = false;
+        _cloneLightCompsEnabled = false;
+        try
+        {
+            var pc = localPlayer.GetComponentsInChildren<MonoBehaviour>(true)
+                .FirstOrDefault(m => m != null && m.GetType().Name == "PlayerComponent");
+            var lightGo = pc?.GetType().GetField("light_go")?.GetValue(pc) as GameObject;
+            if (lightGo == null) { Logger.LogWarning("[REMOTE] light_go локального гравця не знайдено"); return; }
+
+            var parts = new System.Collections.Generic.List<string>();
+            var t = lightGo.transform;
+            while (t != null && t != localPlayer.transform) { parts.Insert(0, t.name); t = t.parent; }
+            if (t == null) { Logger.LogWarning($"[REMOTE] light_go ({lightGo.name}) не нащадок гравця"); return; }
+
+            var path = string.Join("/", parts.ToArray());
+            var found = clone.transform.Find(path);
+            if (found == null) { Logger.LogWarning($"[REMOTE] light_go клона не знайдено за шляхом '{path}'"); return; }
+
+            _cloneLightGo = found.gameObject;
+            _cloneLightGo.SetActive(false); // стартуємо темним; біт у 0x06 виставить стан за ~50мс
+            Logger.LogInfo($"[REMOTE] light_go клона закешовано: '{path}' ✓");
+        }
+        catch (Exception e) { Logger.LogWarning($"[REMOTE] CacheCloneLight: {e.Message}"); }
+    }
+
+    // Реєструє Light-и клона в DynamicLights — у гри це робить WorldGameObject.Awake
+    // (декомпіл 112390), але ми зносимо WGO клона ДО Awake. Без реєстрації інтенсивність
+    // не їде за часом доби (DynamicLights.Update: базова × TimeOfDay.light_intensity_k ×
+    // intensity_k × preset.EvaluateAlpha) — світло або завжди мертве, або застигле.
+    private void RegisterCloneLights(GameObject clone)
+    {
+        try
+        {
+            DynamicLights.SearchForLightsInNewObject(clone);
+            Logger.LogInfo("[REMOTE] Світло клона зареєстровано в DynamicLights ✓");
+        }
+        catch (Exception e) { Logger.LogWarning($"[REMOTE] RegisterCloneLights: {e.Message}"); }
+    }
+
+    // Симетричне зняття при деспавні — інакше статичні списки DynamicLights
+    // накопичують мертві Light-и (гра знімає через WGO.OnDestroy, якого в клона нема).
+    private void UnregisterCloneLights(GameObject clone)
+    {
+        if (clone == null) return;
+        try { DynamicLights.SearchForLightsInDestroyedObject(clone); } catch { }
+    }
+
+    // Викликається з кожного 0x06 (20/с) — діє лише на зміну стану.
+    public void SetRemoteTorch(bool on)
+    {
+        if (_cloneLightGo == null || on == _cloneTorchOn) return;
+        _cloneTorchOn = on;
+        try
+        {
+            if (on && !_cloneLightCompsEnabled)
+            {
+                _cloneLightCompsEnabled = true;
+                var lightTypes = new[] { "DynamicLight", "GroundLight", "LightFlicker" };
+                foreach (var b in _cloneLightGo.GetComponentsInChildren<MonoBehaviour>(true))
+                    if (b != null && lightTypes.Contains(b.GetType().Name)) b.enabled = true;
+                foreach (var l in _cloneLightGo.GetComponentsInChildren<Light>(true))
+                    l.enabled = true;
+                foreach (Transform tr in _cloneLightGo.GetComponentsInChildren<Transform>(true))
+                    tr.gameObject.SetActive(true);
+            }
+            _cloneLightGo.SetActive(on);
+            Logger.LogInfo($"[REMOTE] Факел клона: {(on ? "увімкнено" : "вимкнено")} ✓");
+        }
+        catch (Exception e) { Logger.LogWarning($"[REMOTE] SetRemoteTorch: {e.Message}"); }
     }
 
     private void EnableAnimations(GameObject obj)
@@ -1256,6 +1365,63 @@ public class Multiplayer : BaseUnityPlugin
             else
                 _animator?.SetInteger("global_state", 0);
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RemoteTrailEmitter — сліди (відбитки ніг) клона напарника.
+// Дзеркало LeaveTrailComponent.CustomUpdate (декомпіл 111172) БЕЗ BaseCharacterComponent
+// (у клона він стрипнутий): тип ґрунту — WorldMap.GetGroundType(pos) (статичний, 99502),
+// спрайт — TrailDefinition("Trails/human").GetByType().GetByDirection(), спавн —
+// TrailObject.Spawn (статичний, 111341; сам кладе в trails_root під world_root).
+// СПРОЩЕННЯ проти ванілли (прийнято): без переносу «бруду» на чисті поверхні
+// (_dirty_amount-логіка) і is_outside=true завжди (впливає лише на швидкість
+// зникнення сліду в приміщенні — косметика).
+// ─────────────────────────────────────────────────────────────────────────────
+public class RemoteTrailEmitter : MonoBehaviour
+{
+    private TrailDefinition _def;
+    private Vector2 _prevPos;
+    private bool _leftFoot = true;
+    private const float TRAIL_DIST_SQR    = 370f;    // LEAVE_TRAIL_DISTANCE (порівнюється з sqrMagnitude!)
+    private const float TELEPORT_DIST_SQR = 40000f;  // 200² — телепорт клона, слід не малюємо
+
+    public void Start()
+    {
+        _def = Resources.Load<TrailDefinition>("Trails/human");
+        _prevPos = transform.position;
+        if (_def == null)
+            Multiplayer.Log?.LogWarning("[REMOTE] Trails/human не завантажився — слідів клона не буде");
+    }
+
+    public void Update()
+    {
+        if (_def == null) return;
+        try
+        {
+            Vector2 pos = transform.position;
+            Vector2 dir = _prevPos - pos;            // як у гри: prev - cur (111179)
+            float sqr = dir.sqrMagnitude;
+            if (sqr > TELEPORT_DIST_SQR) { _prevPos = pos; return; }
+
+            var ground = WorldMap.GetGroundType(pos);
+            var byType = ground == Ground.GroudType.None ? null : _def.GetByType(ground);
+            float need = (byType != null && byType.custom_trail_dist) ? byType.leave_trail_dist : TRAIL_DIST_SQR;
+            if (sqr < need) return;
+            _prevPos = pos;
+            if (byType == null) return;              // поверхня без слідів (немає дефініції)
+
+            bool flip;
+            var spr = byType.GetByDirection(dir, _leftFoot, out flip);
+            if (spr == null) return;
+            var trail = TrailObject.Spawn(pos, spr, flip, is_outside: true);
+            if (trail != null)
+            {
+                _leftFoot = !_leftFoot;
+                trail.SetColor(byType.color, 1f);
+            }
+        }
+        catch { /* сліди — косметика, не шумимо в лог щокадру */ }
     }
 }
 
@@ -2057,6 +2223,10 @@ public class SteamManager : MonoBehaviour
                 SendTimeSync();
             }
 
+            // 🔬 TIME-DIAG (2026-06-12): «період дня в напарника не міняється» —
+            // повний зріз домену часу раз на 15с на ОБОХ машинах. Прибрати після кореня.
+            TickTimeDiag();
+
             // Переносимий труп: щокадрове відстеження руху (внутрішній throttle на відправку).
             ChopSync.TickCarriedBodies();
 
@@ -2080,6 +2250,92 @@ public class SteamManager : MonoBehaviour
 
     private float _chopRetryTimer = 0f;
     private const float CHOP_RETRY_INTERVAL = 2f;
+
+    // 🔬 TIME-DIAG: зріз домену часу (день/_cur_time/гальма годинника/TimeOfDay/пресет).
+    // Гіпотези під перевірку: (а) _auto_adjust_time=false (хтось вимкнув EnableTime(false)
+    // і не ввімкнув — тоді stopped=True при ctrl=True); (б) EnvironmentEngine.time_of_day
+    // == null (годинник іде, візуал мертвий); (в) cur_preset="inside" застряг (фіксоване
+    // освітлення); (г) усе тікає — тоді проблема в іншому домені.
+    private float _timeDiagTimer = 0f;
+    private const float TIME_DIAG_INTERVAL = 15f;
+
+    private void TickTimeDiag()
+    {
+        _timeDiagTimer += Time.deltaTime;
+        if (_timeDiagTimer < TIME_DIAG_INTERVAL) return;
+        _timeDiagTimer = 0f;
+        try
+        {
+            GameTimeSync.TryRead(out int day, out float curTime);
+            string auto = "?", stopped = "?", ctrl = "?", envTod = "?", state = "?";
+            var env = EnvironmentEngine.me;
+            if (env != null)
+            {
+                auto    = env.auto_adjust_time.ToString();
+                stopped = env.IsTimeStopped().ToString();
+                envTod  = env.time_of_day == null ? "NULL!" : "ok";
+                state   = env.data != null ? env.data.state.ToString() : "data=null";
+            }
+            string preset = EnvironmentEngine.cur_preset == null ? "-" : EnvironmentEngine.cur_preset.name;
+            try
+            {
+                var pc = MainGame.me != null ? MainGame.me.player_char : null;
+                ctrl = pc != null ? pc.control_enabled.ToString() : "char=null";
+            }
+            catch { }
+            string tod = "me=NULL!";
+            var t = TimeOfDay.me;
+            if (t != null) tod = $"{t.time_of_day:F3}({t.time_of_day_enum})";
+            // Живі ЗНАЧЕННЯ погоди (не розклад!) — порівняння цих чисел між машинами
+            // показує реальну розбіжність неба без порівняння очима. en= — _enabled
+            // стану Rain (вимкнений стан жене controller.value=0 попри здорове value —
+            // саме так друг «не бачив дощ» при rain=1.50).
+            string weather = "?";
+            try
+            {
+                if (env != null)
+                {
+                    if (_weatherEnabledField == null)
+                        _weatherEnabledField = typeof(SmartWeatherState).GetField("_enabled",
+                            BindingFlags.NonPublic | BindingFlags.Instance);
+                    var rainSt = env.FindStateByType(SmartWeatherState.WeatherType.Rain);
+                    string en = _weatherEnabledField != null && rainSt != null
+                        ? ((bool)_weatherEnabledField.GetValue(rainSt)).ToString() : "?";
+                    weather = $"rain={rainSt.value:F2}(en={en}) " +
+                              $"fog={env.FindStateByType(SmartWeatherState.WeatherType.Fog).value:F2} " +
+                              $"wind={env.FindStateByType(SmartWeatherState.WeatherType.Wind).value:F2}";
+                }
+            }
+            catch { }
+            _logger.LogInfo($"[TIME-DIAG] day={day} cur={curTime:F3} auto={auto} stopped={stopped} " +
+                            $"ctrl={ctrl} tod={tod} envTod={envTod} preset={preset} state={state} " +
+                            $"lightK={TimeOfDay.light_intensity_k:F2} {weather}");
+
+            // Кожен 4-й тік (60с) — компактний дамп nature-лінії: видно, чи доживає
+            // запис розкладу до свого t_start, чи хтось його прибирає достроково.
+            if (++_lineDumpCounter >= 4)
+            {
+                _lineDumpCounter = 0;
+                try
+                {
+                    var line = env?.data?.nature_weather_line;
+                    if (line != null)
+                    {
+                        var parts = new List<string>();
+                        foreach (var st in line)
+                            if (st != null)
+                                parts.Add($"{st.preset_name}/{st.type}@{st.t_start:F2}" +
+                                          (st.start_removing_time > 1f ? $"(rem@{st.start_removing_time:F2})" : ""));
+                        _logger.LogInfo($"[LINE-DIAG] {(parts.Count > 0 ? string.Join("; ", parts.ToArray()) : "ПОРОЖНЯ")}");
+                    }
+                }
+                catch { }
+            }
+        }
+        catch (Exception e) { _logger.LogWarning($"[TIME-DIAG] впав: {e.Message}"); }
+    }
+    private int _lineDumpCounter;
+    private FieldInfo _weatherEnabledField;   // SmartWeatherState._enabled (DIAG en=)
 
     // Пакет 0x08: type(1) + day(4 int) + cur_time(4 float) = 9 байт
     private readonly byte[] _timePacket = new byte[9];
@@ -2224,7 +2480,8 @@ public class SteamManager : MonoBehaviour
         else if (type == 0x06)
         {
             // ── Фаза 3: позиція іншого гравця ────────────────────────────────────
-            // Надсилається 20 разів/сек. Формат: pos(xyz) + angle + state + dirX + dirY = 26 байт
+            // Надсилається 20 разів/сек. Формат: pos(xyz) + angle + state + dirX + dirY
+            // [+ torch(1) = 27б] — мінімум 26 для толерантності до старого формату
             if (data.Length < 26)
             {
                 _logger.LogWarning($"[SYNC] 0x06 замалий: {data.Length}б, пропускаємо");
@@ -2260,6 +2517,10 @@ public class SteamManager : MonoBehaviour
 
             // Оновлюємо позицію і анімацію клону
             Multiplayer.Instance?.UpdateRemotePlayer(remotePos, angle, state, dirX, dirY);
+
+            // Біт факела (байт 26, з'явився коли 0x06 виріс до 27б) — світло клона
+            if (data.Length >= 27)
+                Multiplayer.Instance?.SetRemoteTorch(data[26] == 1);
         }
         else if (type == 0x08)
         {
@@ -2479,21 +2740,25 @@ public class SteamManager : MonoBehaviour
         }
         else if (type == 0x1A)
         {
-            // ── Погода від хоста (добовий розклад пресетів): type day(4) count(1) [len(1)+name]* ──
+            // ── Погода від хоста (v2): type day(4) count(1) [slotIdx(1)+len(1)+name]* ──
+            // Слоти явні: late-join шле лише поточний+майбутні (минулі гра видаляє з лінії).
             if (data.Length < 6) { _logger.LogWarning($"[CHOP] 0x1A замалий ({data.Length})"); return; }
             int wday = BitConverter.ToInt32(data, 1);
             int wcount = data[5];
+            var wslots = new List<int>(wcount);
             var wnames = new List<string>(wcount);
             int woff = 6;
             bool wok = true;
             for (int i = 0; i < wcount; i++)
             {
-                if (woff + 1 > data.Length) { wok = false; break; }
+                if (woff + 2 > data.Length) { wok = false; break; }
+                int sidx = data[woff++];
                 int nlen = data[woff++];
                 if (woff + nlen > data.Length) { wok = false; break; }
+                wslots.Add(sidx);
                 wnames.Add(System.Text.Encoding.UTF8.GetString(data, woff, nlen)); woff += nlen;
             }
-            if (wok) ChopSync.ApplyRemoteWeather(wday, wnames);
+            if (wok) ChopSync.ApplyRemoteWeather(wday, wslots, wnames);
             else _logger.LogWarning("[CHOP] 0x1A пошкоджений");
         }
     }
@@ -2574,9 +2839,11 @@ public class SteamManager : MonoBehaviour
     }
 
     // ── Фаза 3: надсилаємо свою позицію іншому гравцю ────────────────────────
-    // Пакет 0x06: type(1) + x(4) + y(4) + z(4) + angle(4) + state(1) + dirX(4) + dirY(4) = 26 байт
+    // Пакет 0x06: type(1) + x(4) + y(4) + z(4) + angle(4) + state(1) + dirX(4) + dirY(4)
+    //             + torch(1) = 27 байт (torch = light_go.activeSelf, синк світла факела)
     // Буфер виділяємо один раз — без алокацій кожні 50мс
-    private readonly byte[] _posPacket  = new byte[26];
+    private readonly byte[] _posPacket  = new byte[27];
+    private GameObject _cachedLocalLightGo; // light_go локального гравця (рефлексія, кеш 2с)
     private readonly byte[] _animPacket = new byte[17]; // 0x07(1) + angle(4) + state(4) + dirX(4) + dirY(4) = 17 байт
     private float _localPlayerRefreshTimer = 0f;
     private const float LOCAL_PLAYER_REFRESH_INTERVAL = 2f;
@@ -2605,6 +2872,7 @@ public class SteamManager : MonoBehaviour
                 if (mb == null) return;
                 _cachedLocalPlayer  = mb.gameObject;
                 _cachedLocalAnimator = _cachedLocalPlayer.GetComponentInChildren<Animator>();
+                _cachedLocalLightGo  = mb.GetType().GetField("light_go")?.GetValue(mb) as GameObject;
             }
             if (_cachedLocalPlayer == null) return;
 
@@ -2648,6 +2916,7 @@ public class SteamManager : MonoBehaviour
             _posPacket[17] = (byte)(state + 128);
             BitConverter.GetBytes(dirX).CopyTo(_posPacket, 18);
             BitConverter.GetBytes(dirY).CopyTo(_posPacket, 22);
+            _posPacket[26] = (byte)(_cachedLocalLightGo != null && _cachedLocalLightGo.activeSelf ? 1 : 0);
 
             SendPacket(SteamNetwork.RemoteID, _posPacket);
         }
@@ -2821,6 +3090,11 @@ public class SteamManager : MonoBehaviour
                 SteamNetwork.IsInGame = true;
                 SteamNetwork.IsInGameSince = UnityEngine.Time.time;
                 _logger.LogInfo("[UNLOCK] IsInGame=true — позиційний синк активовано ✓");
+
+                // Сейв хоста пишеться у сні (Inside) → погодні стани приїжджають
+                // ВИМКНЕНИМИ; клієнт спавниться надворі без переходу Inside→RealTime,
+                // який би їх увімкнув → форсимо (інакше друг не бачить дощ/туман).
+                ChopSync.ForceWeatherStatesEnabledOutside();
 
                 yield break;
             }
@@ -6190,6 +6464,9 @@ public static class ChopSync
 
     public static void OnWeatherGenEnd()
     {
+        // Prefix-skip на клієнті → колектор не стартував → Postfix не має чого фіксувати
+        // (інакше стейл-колект минулого ролла записався б із поточним днем).
+        if (!_collectingWeather) return;
         _collectingWeather = false;
         if (_weatherCollect.Count != 4) return;
         // Зберігаємо НЕЗАЛЕЖНО від ролі: хост генерує добовий розклад ще ДО створення лобі
@@ -6205,43 +6482,146 @@ public static class ChopSync
 
     // З SteamManager.Update (хост): дослати збережений розклад, щойно є кому (включно з
     // late-join — клієнт зайшов посеред дня). Один раз на підключення/розклад.
+    // LATE-JOIN ДІРА (лайв-тест #3, 2026-06-12): розклад дня входу часто з СЕЙВА хоста
+    // (ролл був у минулій сесії) → _lastWeatherNames порожній → день входу не синкався
+    // ВЗАГАЛІ. Фікс: жнива розкладу поточного дня прямо з nature-лінії хоста.
     public static void TickWeatherSync()
     {
         if (SteamNetwork.Role != NetworkRole.Host) return;
         if (!Connected()) { _weatherSyncedToPeer = false; return; }
-        if (_weatherSyncedToPeer || _lastWeatherNames == null) return;
+        // Клієнт ще ВАНТАЖИТЬСЯ: 0x1A, надісланий до його входу в світ, ЗАТИРАЄТЬСЯ
+        // завантаженням сейва (DeserializeData замінює data; лайв-тест #6: apply при
+        // game_time=1.0 на титулці). Маркер «клієнт у грі» = його клон заспавнено
+        // (прийшов його 0x06). До того тримаємо синк скинутим → дошлемо після входу.
+        if (!SteamNetwork.RemotePlayerSpawned) { _weatherSyncedToPeer = false; return; }
+        int today = GetGameDay();
+        // Новий день без ролла (стрибок дня від сну клієнта обходить OnEndOfDay обох) —
+        // потрібен пересинк: жнива або власний ролл хоста нижче.
+        if (today >= 0 && _lastWeatherDay != today) _weatherSyncedToPeer = false;
+        if (_weatherSyncedToPeer) return;
+        if (_lastWeatherNames == null || _lastWeatherDay != today) TryHarvestTodaySchedule();
+        if (_lastWeatherNames == null || _lastWeatherDay != today) return;
         try
         {
+            // Формат v2 (2026-06-12): [slotIdx(1)+len(1)+name]* — слоти ЯВНІ, бо жнива
+            // посеред дня дають лише поточний+майбутні (минулі гра ФІЗИЧНО видаляє з
+            // лінії після згасання — лайв-тест #4/#5: «неповний 1/4 → 2/4» весь день).
+            // Минулі слоти клієнту й не потрібні: йому треба погода ВІД ЗАРАЗ.
             int payload = 0;
-            var nb = new List<byte[]>(4);
-            foreach (var n in _lastWeatherNames)
+            var entries = new List<KeyValuePair<int, byte[]>>(4);
+            for (int i = 0; i < _lastWeatherNames.Length; i++)
             {
-                var b = System.Text.Encoding.UTF8.GetBytes(n ?? "");
-                if (b.Length > 255) b = new byte[0];
-                nb.Add(b); payload += 1 + b.Length;
+                if (string.IsNullOrEmpty(_lastWeatherNames[i])) continue;   // минулий слот
+                var b = System.Text.Encoding.UTF8.GetBytes(_lastWeatherNames[i]);
+                if (b.Length > 255) continue;
+                entries.Add(new KeyValuePair<int, byte[]>(i, b));
+                payload += 2 + b.Length;
             }
+            if (entries.Count == 0) return;
             var packet = new byte[6 + payload];
             packet[0] = 0x1A;
             BitConverter.GetBytes(_lastWeatherDay).CopyTo(packet, 1);
-            packet[5] = (byte)nb.Count;
+            packet[5] = (byte)entries.Count;
             int off = 6;
-            foreach (var b in nb)
+            foreach (var e in entries)
             {
-                packet[off++] = (byte)b.Length;
-                Buffer.BlockCopy(b, 0, packet, off, b.Length); off += b.Length;
+                packet[off++] = (byte)e.Key;
+                packet[off++] = (byte)e.Value.Length;
+                Buffer.BlockCopy(e.Value, 0, packet, off, e.Value.Length); off += e.Value.Length;
             }
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, packet);
             _weatherSyncedToPeer = true;
-            Multiplayer.Log?.LogInfo($"[CHOP] Погода дня {_lastWeatherDay} → {string.Join("/", _lastWeatherNames)} (0x1A)");
+            Multiplayer.Log?.LogInfo($"[CHOP] Погода дня {_lastWeatherDay} → " +
+                string.Join("/", entries.Select(e => $"{e.Key}:{_lastWeatherNames[e.Key]}").ToArray()) + " (0x1A)");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] TickWeatherSync: {e.Message}"); }
     }
 
-    // Клієнт: відтворити розклад хоста (дзеркало тіла UpdateWeather, але з ЗАДАНИМИ пресетами).
-    public static void ApplyRemoteWeather(int day, List<string> names)
+    // ФІКС «друг не бачить дощ» (лайв-тест #8: rain=1.50 у DIAG, а неба чистого):
+    // сейв хоста пишеться У СНІ (в ліжку, state=Inside) → SmartWeatherState._enabled=false
+    // СЕРІАЛІЗУЄТЬСЯ (SerializedWeatherState.enabled, декомпіл 37352-67); вимкнений стан
+    // жене controller.value=0 попри здорове value (37327-30). Хост лікується сам
+    // (прокидається INSIDE → вихід надвір = перехід Inside→RealTime → SetWeatherEnabled
+    // (true), 36271-78), а КЛІЄНТ телепортується одразу НАДВІР — переходу НЕМає →
+    // стани вимкнені назавжди. Форс-увімкнення після входу в світ (лише не-Inside).
+    public static void ForceWeatherStatesEnabledOutside()
     {
-        if (SteamNetwork.Role == NetworkRole.Host || names == null || names.Count == 0) return;
+        try
+        {
+            var env = EnvironmentEngine.me;
+            if (env == null || env.data == null || env.states == null) return;
+            if (env.data.state == EnvironmentEngine.State.Inside) return; // у приміщенні так і має бути
+            int n = 0;
+            foreach (var st in env.states)
+                if (st != null) { st.SetEnabled(true); n++; }
+            Multiplayer.Log?.LogInfo($"[CHOP] Погодні стани форс-увімкнено після входу ({n}) ✓");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] ForceWeatherStatesEnabled: {e.Message}"); }
+    }
+
+    // Жнива розкладу ПОТОЧНОГО дня з nature-лінії хоста (late-join: ролл був у минулій
+    // сесії і живе лише в сейві). Слот = стани з t_start == day+offset (тріади Rain/Fog/
+    // Wind одного пресета — беремо перше ім'я). Усі 4 порожні → день без розкладу
+    // (нічий ролл) → хост ролить сам, дужки WeatherGenBracketPatch зберуть і надішлють.
+    private static float _lastHarvestTry;
+    private static void TryHarvestTodaySchedule()
+    {
+        if (Time.realtimeSinceStartup - _lastHarvestTry < 5f) return;
+        _lastHarvestTry = Time.realtimeSinceStartup;
+        try
+        {
+            var env = EnvironmentEngine.me;
+            int day = GetGameDay();
+            if (env == null || env.data == null || env.data.nature_weather_line == null || day < 0) return;
+            var names = new string[WEATHER_DAY_OFFSETS.Length];
+            int filled = 0;
+            foreach (var st in env.data.nature_weather_line)
+            {
+                // Маркер видалення НЕ відсіюємо (лайв-тест #4: «неповний 1/4» весь день) —
+                // гра сама маркує минулі слоти дня в міру програвання, це норма життєвого
+                // циклу; t_start при маркуванні незмінний → слот ідентифікується точно.
+                if (st == null || string.IsNullOrEmpty(st.preset_name)) continue;
+                for (int i = 0; i < WEATHER_DAY_OFFSETS.Length; i++)
+                {
+                    if (names[i] == null && Mathf.Abs(st.t_start - (day + WEATHER_DAY_OFFSETS[i])) < 0.005f)
+                    {
+                        names[i] = st.preset_name;
+                        filled++;
+                        break;
+                    }
+                }
+            }
+            if (filled == 0)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] Погода: день {day} без розкладу — хост ролить сам");
+                SmartWeatherEngine.me?.UpdateWeather();
+                return;
+            }
+            // ЧАСТКОВИЙ розклад — НОРМА посеред дня (минулі слоти гра фізично видалила з
+            // лінії після згасання). Шлемо що є: поточний + майбутні (формат v2 зі slotIdx).
+            _lastWeatherDay = day;
+            _lastWeatherNames = names;
+            _weatherSyncedToPeer = false;
+            Multiplayer.Log?.LogInfo($"[CHOP] Погода: розклад дня {day} зібрано з лінії ({filled}/4, late-join)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] TryHarvestTodaySchedule: {e.Message}"); }
+    }
+
+    // Клієнт: відтворити розклад хоста (дзеркало тіла UpdateWeather, але з ЗАДАНИМИ
+    // пресетами). v2: слоти ЯВНІ (slots[i] = індекс у WEATHER_DAY_OFFSETS) — late-join
+    // шле частковий розклад (поточний+майбутні слоти), минулі не реплеюються.
+    public static void ApplyRemoteWeather(int day, List<int> slots, List<string> names)
+    {
+        if (SteamNetwork.Role == NetworkRole.Host || names == null || names.Count == 0 ||
+            slots == null || slots.Count != names.Count) return;
         if (day < 0) { Multiplayer.Log?.LogWarning("[CHOP] 0x1A: день<0 — розклад відкинуто (захист)"); return; }
+        // Ще не в світі (вантажимось) — env буде замінено DeserializeData, застосовувати
+        // нема куди; хост дошле після нашого спавну (гейт RemotePlayerSpawned у нього).
+        if (!SteamNetwork.IsInGame)
+        {
+            Multiplayer.Log?.LogWarning("[CHOP] 0x1A до входу в світ — відкинуто (хост дошле після спавну)");
+            return;
+        }
         EnsureReflection();
         if (_envMeProp == null || _addNatureMethod == null || _tryRemoveNatureMethod == null ||
             _weatherPresetGetMethod == null || _getStatesFromPresetMethod == null || _findNatureMethod == null) return;
@@ -6249,9 +6629,10 @@ public static class ChopSync
         {
             var env = _envMeProp.GetValue(null);
             if (env == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x1A: EnvironmentEngine ще не готовий"); return; }
-            for (int i = 0; i < names.Count && i < WEATHER_DAY_OFFSETS.Length; i++)
+            for (int i = 0; i < names.Count; i++)
             {
-                float t = day + WEATHER_DAY_OFFSETS[i];
+                if (slots[i] < 0 || slots[i] >= WEATHER_DAY_OFFSETS.Length) continue;
+                float t = day + WEATHER_DAY_OFFSETS[slots[i]];
                 var existing = _findNatureMethod.Invoke(env, null) as System.Collections.IEnumerable;
                 if (existing != null)
                 {
@@ -6266,7 +6647,42 @@ public static class ChopSync
                 if (states == null) continue;
                 foreach (var st in states) _addNatureMethod.Invoke(env, new object[] { st });
             }
-            Multiplayer.Log?.LogInfo($"[CHOP] Погода від хоста: день {day} → {string.Join("/", names.ToArray())} ✓");
+            Multiplayer.Log?.LogInfo($"[CHOP] Погода від хоста: день {day} → " +
+                string.Join("/", names.Select((n, i) => $"{slots[i]}:{n}").ToArray()) + " ✓");
+            // ДІАГНОСТИКА late-apply (дощ був лише у хоста, 2026-06-11): game_time у момент
+            // застосування + nature-лінія ПІСЛЯ — щоб побачити, який стан реально активний.
+            try
+            {
+                float gt = -1f;
+                var gtProp = AccessTools.TypeByName("MainGame")?.GetProperty("game_time",
+                    BindingFlags.Public | BindingFlags.Static);
+                var gtField = AccessTools.TypeByName("MainGame")?.GetField("game_time",
+                    BindingFlags.Public | BindingFlags.Static);
+                var gtv = gtProp != null ? gtProp.GetValue(null) : gtField?.GetValue(null);
+                if (gtv != null) gt = Convert.ToSingle(gtv);
+                var lineInfo = "?";
+                var dataField = env.GetType().GetField("data",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var envData = dataField?.GetValue(env);
+                var natLine = envData?.GetType().GetField("nature_weather_line",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?.GetValue(envData) as System.Collections.IEnumerable;
+                if (natLine != null)
+                {
+                    var parts = new List<string>();
+                    foreach (var st in natLine)
+                    {
+                        var t = st.GetType();
+                        var pn = t.GetField("preset_name")?.GetValue(st) as string ?? "?";
+                        var ts = t.GetField("t_start", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(st);
+                        var tp = t.GetField("type", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(st);
+                        parts.Add($"{pn}/{tp}@{ts}");
+                    }
+                    lineInfo = parts.Count > 0 ? string.Join("; ", parts.ToArray()) : "ПОРОЖНЯ";
+                }
+                Multiplayer.Log?.LogInfo($"[CHOP] 0x1A DIAG: game_time={gt:F3}, nature-лінія: {lineInfo}");
+            }
+            catch (Exception de) { Multiplayer.Log?.LogWarning($"[CHOP] 0x1A DIAG впав: {de.Message}"); }
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] ApplyRemoteWeather: {e.Message}"); }
     }
@@ -6284,6 +6700,9 @@ public static class ChopSync
 
     private static bool Connected() =>
         SteamNetwork.IsConnected && SteamNetwork.IsInGame && SteamNetwork.RemoteID != 0;
+
+    // Для патчів поза ChopSync (гейт глушіння погодного ролла на клієнті).
+    public static bool IsPeerConnected() => Connected();
 
     // type(1) + x(4) + y(4) + amount(4) = 13 байт (amount не використовується для 0x0A)
     private static void SendTreePacket(byte type, float x, float y, float amount)
@@ -8229,7 +8648,21 @@ public static class WeatherGenBracketPatch
             .FirstOrDefault(m => m.Name == "UpdateWeather" && m.GetParameters().Length == 0);
     }
 
-    static void Prefix()  { ChopSync.OnWeatherGenStart(); }
+    // КЛІЄНТ при з'єднанні НЕ ролить погоду сам (хост-авторитарний 0x1A): власний ролл
+    // на власній опівночі лив поверх хостового розкладу (лайв-тест 2026-06-12: fog_big/
+    // rain_mid у лінії клієнта, яких хост не оголошував; graceful-ремув лишає ~10с хвости
+    // і гонки на межі доби). Prefix-skip → OnEndOfDay решту робить, ролл чекає 0x1A.
+    // Фейл-опен: без з'єднання (соло / лоад до конекту) ролимо як ваніла.
+    static bool Prefix()
+    {
+        if (SteamNetwork.Role == NetworkRole.Client && ChopSync.IsPeerConnected())
+        {
+            Multiplayer.Log?.LogInfo("[CHOP] Ролл погоди на клієнті пропущено (чекаємо 0x1A хоста) ✓");
+            return false;
+        }
+        ChopSync.OnWeatherGenStart();
+        return true;
+    }
     static void Postfix() { ChopSync.OnWeatherGenEnd(); }
 
     static Exception Finalizer(Exception __exception) => null;
