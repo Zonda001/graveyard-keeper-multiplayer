@@ -9305,15 +9305,30 @@ public static class StorySync
 {
     public static bool ApplyingRemote;
 
-    private static readonly HashSet<string> _personalParams = new HashSet<string>
+    // ── МОДЕЛЬ STARDEW (2026-06-13) ─────────────────────────────────────────────
+    // Світ спільний, ПЕРСОНАЖНІ квести персональні (у кожного свій журнал/діалоги).
+    // Журнал QuestSystem (0x1E) і задачі KnownNPC (0x1F) БІЛЬШЕ НЕ дзеркаляться.
+    // Парами 0x1C звужено з чорного фільтра до БІЛОГО списку СВІТОВИХ воріт
+    // (доступ/прогресія/спавни) — решта (наратив «met_*», гілки діалогів) персональна.
+    // Код лишено за прапорами для оборотності: true → стара шеред-поведінка.
+    // static readonly (не const) — щоб не згорталось у compile-time константу й не давало
+    // CS0162 на гейтнутому коді; оборотність та сама (зміна джерела + ребілд).
+    private static readonly bool MIRROR_QUESTS = false;     // 0x1E — журнал QuestSystem
+    private static readonly bool MIRROR_NPC_TASKS = false;  // 0x1F — задачі KnownNPC
+
+    // Білий список СВІТОВИХ парамів (синк 0x1C). Класифікація recon 2026-06-13
+    // (див. памʼять project-ppar-story-plan): lock_tp підтверджено в коді (SetParam ноди
+    // лока тп, декомпіл 136775), решта — за змістом P1-словника, ростиме з лайв-логом.
+    // Щедрий на ворота: пропущене ворото = друг не отримає анлок (поломка коопу), а
+    // зайвий прапор = лише легкий витік наративу (стара поведінка, безпечна).
+    private static readonly HashSet<string> _worldParams = new HashSet<string>
     {
-        "hp", "energy", "sanity", "max_hp", "max_energy", "max_sanity",
-        "craft_tut", "in_tutorial", "prayed_this_week",
+        "church_level", "skull_digged", "take_tools_from_grave_chest",
+        "waiting_for_first_bureal", "rednecks_spawned", "do_spawn_rednecks",
+        "donkey_on_scene", "donkey_coming_chance", "witch_hill_is_closed",
     };
 
     private static readonly Dictionary<string, float> _lastSent = new Dictionary<string, float>();
-    private static string _lastKey;
-    private static float _lastKeyTime;
 
     // Опи, що прийшли ДО входу в світ (завантаження) — черга, флаш зі SteamManager.Update
     // у порядку надходження (порядок критичний: ключ стартує квест, який читає парами).
@@ -9323,13 +9338,15 @@ public static class StorySync
     private static readonly List<PendingOp> _pendingOps = new List<PendingOp>();
     private const int PENDING_OPS_MAX = 512;
 
-    public static bool IsStoryParam(string name)
+    // Світовий парам = у білому списку АБО родина воріт телепорта (lock_tp/lock_tp_param +
+    // tp_*_locked / tp_from_* — усі або з префіксом "tp_", або з підрядком "lock_tp").
+    // Решта (наратив, стати hp/energy/sanity, tut_*, *_quality) — персональна, НЕ синк.
+    public static bool IsWorldParam(string name)
     {
         if (string.IsNullOrEmpty(name) || name.Length > 200) return false;
-        if (_personalParams.Contains(name)) return false;
-        if (name.StartsWith("tut_")) return false;
-        if (name.EndsWith("_quality") || name.EndsWith("_qual")) return false;
-        return true;
+        if (_worldParams.Contains(name)) return true;
+        if (name.StartsWith("tp_") || name.Contains("lock_tp")) return true;   // ворота телепорта
+        return false;
     }
 
     public static bool IsActionKey(string key)
@@ -9343,7 +9360,7 @@ public static class StorySync
     {
         try
         {
-            if (ApplyingRemote || !ChopSync.IsPeerConnected() || !IsStoryParam(name)) return;
+            if (ApplyingRemote || !ChopSync.IsPeerConnected() || !IsWorldParam(name)) return;
             if (_lastSent.TryGetValue(name, out var v) && Mathf.Abs(v - value) < 0.0001f) return;
             _lastSent[name] = value;
             var nb = System.Text.Encoding.UTF8.GetBytes(name);
@@ -9380,7 +9397,7 @@ public static class StorySync
 
     public static void ApplyRemoteParam(string name, float value)
     {
-        if (!IsStoryParam(name)) return;   // захисний пояс (відправник теж фільтрує)
+        if (!IsWorldParam(name)) return;   // захисний пояс (відправник теж фільтрує)
         if (!ReadyToApply())
         {
             if (_pendingOps.Count < PENDING_OPS_MAX)
@@ -9405,6 +9422,7 @@ public static class StorySync
     // Приймач 0x1E: життєвий цикл квеста напарника (kind: 0=старт, 1=успіх, 2=провал).
     public static void ApplyRemoteQuestEvent(int kind, string id)
     {
+        if (!MIRROR_QUESTS) return;   // Stardew: журнал персональний — вхідні ігноруємо
         if (string.IsNullOrEmpty(id) || kind < 0 || kind > 2) return;
         if (!ReadyToApply())
         {
@@ -9440,6 +9458,7 @@ public static class StorySync
     {
         try
         {
+            if (!MIRROR_NPC_TASKS) return;   // Stardew: NPC-задачі персональні
             if (ApplyingRemote || !ChopSync.IsPeerConnected()) return;
             var npc = knownNpc as KnownNPC;
             if (npc == null || string.IsNullOrEmpty(npc.npc_id) || string.IsNullOrEmpty(taskId)) return;
@@ -9461,6 +9480,7 @@ public static class StorySync
 
     public static void ApplyRemoteNpcTask(string npcId, string taskId, int state)
     {
+        if (!MIRROR_NPC_TASKS) return;   // Stardew: NPC-задачі персональні — вхідні ігноруємо
         if (string.IsNullOrEmpty(npcId) || string.IsNullOrEmpty(taskId)) return;
         if (!ReadyToApply())
         {
@@ -9516,6 +9536,7 @@ public static class StorySync
     {
         try
         {
+            if (!MIRROR_QUESTS) return;   // Stardew: журнал персональний
             if (ApplyingRemote || !ChopSync.IsPeerConnected()) return;
             var def = questDef as QuestDefinition;
             if (def == null || string.IsNullOrEmpty(def.id)) return;
@@ -9529,6 +9550,7 @@ public static class StorySync
     {
         try
         {
+            if (!MIRROR_QUESTS) return;   // Stardew: журнал персональний
             if (ApplyingRemote || !ChopSync.IsPeerConnected()) return;
             var st = questState as QuestState;
             if (st == null || st.definition == null || string.IsNullOrEmpty(st.definition.id)) return;
