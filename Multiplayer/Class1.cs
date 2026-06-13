@@ -502,6 +502,26 @@ public class Multiplayer : BaseUnityPlugin
 
         Logger.LogInfo($"[REMOTE] Локальний гравець знайдений: {p1.name}, спавнимо клон на {startPos}");
 
+        // ── СИНГЛТОН-ГАРД (фікс дубль-клонів при довгому вході, лайв-тест 2026-06-13) ──
+        // Поки сцена вантажилась (3МБ сейв, кілька 30с-таймаутів), despawn на «пакети
+        // зникли 5с» скидав _spawnCoroutineRunning (615) → встигало накопичитись кілька
+        // корутин; усі, дочекавшись гравця, інстанціювали клон → 3-4 шт стосом («жовтий»
+        // хост у напарника). Тут, ПЕРЕД Instantiate (далі немає yield до присвоєння 522 →
+        // послідовні корутини в кадрі бачать чужий результат): якщо клон уже трекається —
+        // виходимо; підчищаємо будь-які неконтрольовані леф-овер RemotePlayer_Clone.
+        if (_remotePlayerGO != null)
+        {
+            Logger.LogInfo("[REMOTE] Клон уже існує — дубль-спавн скасовано ✓");
+            _spawnCoroutineRunning = false;
+            yield break;
+        }
+        foreach (var stray in FindObjectsOfType<GameObject>(true))
+            if (stray.name == "RemotePlayer_Clone")
+            {
+                Logger.LogInfo("[REMOTE] Прибрано леф-овер клон ✓");
+                Destroy(stray);
+            }
+
         var allGOs = FindObjectsOfType<GameObject>(true)
             .Where(o => o.name.Contains("Player"))
             .ToList();
@@ -3697,11 +3717,24 @@ public static class TutorialGUIBlockAllPatch
         }
     }
 
+    // Фазовий гейт (2026-06-13): блокуємо туторіали ЛИШЕ у вікні входу/інтро (пачка лізе
+    // саме там, поки клієнт заходить у світ хоста). Після входу+вікна — ПРОПУСКАЄМО, бо
+    // геймплейні туторіали (енергія/техно) МУСЯТЬ програтись у клієнта: tut_shown_<id>
+    // ставиться на Open (декомпіл 67022), а техно йде через _on_closed колбек у Hide (67058)
+    // — глухий блок з'їдав і прапор, і колбек → софт-лок + техно не відкривалось (лайв-тест
+    // 2026-06-13, друг завис у коваля). Stardew-модель: клієнт проживає свої туторіали сам.
+    // Якщо інтро затягнеться й попап прослизне за вікно — він просто покажеться нормально
+    // (return true), не залочить (безпечна деградація). Gameplay-туторіали на свіжому спавні
+    // фізично не встигають за 60с (треба дійти до коваля й заточити) — колізії вікна нема.
+    private const float INTRO_BLOCK_WINDOW = 60f;
+
     static bool Prefix(MethodBase __originalMethod)
     {
         if (!SteamNetwork.IsClientMode) return true;
-        // StackTrace прибрано — дуже дорога операція для hot path
-        Multiplayer.Log?.LogInfo($"[TUT] ЗАБЛОКОВАНО: {__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}");
+        float since = SteamNetwork.IsInGameSince;
+        bool introPhase = since < 0f || (UnityEngine.Time.time - since) < INTRO_BLOCK_WINDOW;
+        if (!introPhase) return true;   // давно у грі — даємо геймплейний туторіал програтись
+        Multiplayer.Log?.LogInfo($"[TUT] ЗАБЛОКОВАНО (інтро-фаза): {__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}");
         return false;
     }
 }
