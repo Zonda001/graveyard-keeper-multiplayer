@@ -2236,6 +2236,9 @@ public class SteamManager : MonoBehaviour
             // Погода: дослати розклад хоста, щойно є кому (включно з late-join).
             ChopSync.TickWeatherSync();
 
+            // Сюжет: флаш стори-опів, що прийшли до входу в світ.
+            StorySync.TickFlushPending();
+
             // Дерева, зрубані поки ми були в іншій локації — пробуємо знищити,
             // коли гравець дійде до них і вони завантажаться.
             _chopRetryTimer += Time.deltaTime;
@@ -2773,6 +2776,48 @@ public class SteamManager : MonoBehaviour
             if (10 + bidLen > data.Length) { _logger.LogWarning("[CHOP] 0x1B пошкоджений"); return; }
             string bid = System.Text.Encoding.UTF8.GetString(data, 10, bidLen);
             ChopSync.ApplyRemoteBigPickup(bid, bx, by);
+        }
+        else if (type == 0x1C)
+        {
+            // ── Сюжет: стори-парам напарника: type nameLen(1) name value(4) ──
+            if (data.Length < 7) { _logger.LogWarning($"[STORY] 0x1C замалий ({data.Length})"); return; }
+            int snLen = data[1];
+            if (2 + snLen + 4 > data.Length) { _logger.LogWarning("[STORY] 0x1C пошкоджений"); return; }
+            string sname = System.Text.Encoding.UTF8.GetString(data, 2, snLen);
+            float sval = BitConverter.ToSingle(data, 2 + snLen);
+            StorySync.ApplyRemoteParam(sname, sval);
+        }
+        else if (type == 0x1D)
+        {
+            // ── Сюжет: квест-ключ-дія напарника: type keyLen(1) key ──
+            if (data.Length < 3) { _logger.LogWarning($"[STORY] 0x1D замалий ({data.Length})"); return; }
+            int skLen = data[1];
+            if (2 + skLen > data.Length) { _logger.LogWarning("[STORY] 0x1D пошкоджений"); return; }
+            string skey = System.Text.Encoding.UTF8.GetString(data, 2, skLen);
+            StorySync.ApplyRemoteKey(skey);
+        }
+        else if (type == 0x1E)
+        {
+            // ── Сюжет: життєвий цикл квеста: type kind(1: 0=старт,1=успіх,2=провал) idLen(1) id ──
+            if (data.Length < 4) { _logger.LogWarning($"[STORY] 0x1E замалий ({data.Length})"); return; }
+            int qkind = data[1];
+            int qidLen = data[2];
+            if (3 + qidLen > data.Length) { _logger.LogWarning("[STORY] 0x1E пошкоджений"); return; }
+            string qid = System.Text.Encoding.UTF8.GetString(data, 3, qidLen);
+            StorySync.ApplyRemoteQuestEvent(qkind, qid);
+        }
+        else if (type == 0x1F)
+        {
+            // ── Сюжет: NPC-задача журналу: type state(1) npcLen(1) npc taskLen(1) task ──
+            if (data.Length < 5) { _logger.LogWarning($"[STORY] 0x1F замалий ({data.Length})"); return; }
+            int nstate = data[1];
+            int nnLen = data[2];
+            if (3 + nnLen + 1 > data.Length) { _logger.LogWarning("[STORY] 0x1F пошкоджений"); return; }
+            string nnpc = System.Text.Encoding.UTF8.GetString(data, 3, nnLen);
+            int ntLen = data[3 + nnLen];
+            if (4 + nnLen + ntLen > data.Length) { _logger.LogWarning("[STORY] 0x1F пошкоджений"); return; }
+            string ntask = System.Text.Encoding.UTF8.GetString(data, 4 + nnLen, ntLen);
+            StorySync.ApplyRemoteNpcTask(nnpc, ntask, nstate);
         }
     }
 
@@ -9191,3 +9236,511 @@ public static class RemoteCraftBarPatch
 
     static Exception Finalizer(Exception __exception) => null;
 }   
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔬 PPAR-RECON (P1 синку сюжету, 2026-06-12): тихий словник сюжетних парамів і
+// квест-ключів із ЖИВОЇ гри (соло теж). Усі Ppar-лійки FlowCanvas (SetPpar/AddPpar/
+// DecPpar, декомпіл 74000-74113) сходяться у WGO.SetParam гравця; квести стартують
+// через QuestSystem.CheckKeyQuests(key). Лог цих двох точок за звичайну сесію дасть
+// реальну межу «сюжетний прапор vs особистий стат» (hp/energy летять часто — троттл
+// 5с на ім'я). Прибрати після проєктування фільтра (етап P2).
+// ─────────────────────────────────────────────────────────────────────────────
+public static class PparRecon
+{
+    private static readonly Dictionary<string, float> _lastLogTime = new Dictionary<string, float>();
+
+    public static void OnPlayerSetParam(MonoBehaviour wgo, string name, float value)
+    {
+        try
+        {
+            var mg = MainGame.me;
+            if (wgo == null || mg == null) return;
+            if (!ReferenceEquals(wgo, mg.player))
+            {
+                // 🔬 DIAG діалог-рестарту (P2d, лайв-тест: «діалоги почались заново»):
+                // гіпотеза — прогрес гілки пишеться в парами САМОГО NPC (self_wgo у
+                // діалогових скриптах). Логуємо НЕ-гравцеві SetParam, щоб побачити куди.
+                var w = wgo as WorldGameObject;
+                string objId = w != null ? w.obj_id : wgo.gameObject.name;
+                string k = objId + "." + name;
+                float nowN = Time.realtimeSinceStartup;
+                if (_lastLogTime.TryGetValue(k, out var tn) && nowN - tn < 5f) return;
+                _lastLogTime[k] = nowN;
+                Multiplayer.Log?.LogInfo($"[PPAR-DIAG] NPC-парам {objId}.{name}={value:F2}");
+                return;
+            }
+            StorySync.OnLocalParam(name, value);   // синк (P2) — без троттла, дедуп за значенням усередині
+            float now = Time.realtimeSinceStartup;
+            if (_lastLogTime.TryGetValue(name, out var t) && now - t < 5f) return;
+            _lastLogTime[name] = now;
+            Multiplayer.Log?.LogInfo($"[PPAR-DIAG] SetParam {name}={value:F2}");
+        }
+        catch { }
+    }
+
+    public static void OnKeyQuest(string key)
+    {
+        try
+        {
+            StorySync.OnLocalKey(key);             // синк (P2)
+            Multiplayer.Log?.LogInfo($"[PPAR-DIAG] CheckKeyQuests '{key}'");
+        }
+        catch { }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// СИНК СЮЖЕТУ (P2, 2026-06-12): двосторонній оп-синк стори-парамів (0x1C) і
+// квест-ключів-дій (0x1D). Обидва квестові двигуни бачать ОБ'ЄДНАННЯ дій гравців
+// і йдуть синхронно: парами синкані (IsReadyToStart детермінований), база при
+// вході спільна (квест-стан серіалізується в сейв трансферу).
+// Фільтр — ЧОРНИЙ список особистого (P1-словник, лог туторіалу 2026-06-12):
+// стати (hp/energy/sanity), туторіал-UI (tut_*/craft_tut/in_tutorial), похідні
+// (*_quality/*_qual — рахуються щодня з зон). Решта = сюжет → синк.
+// Echo-guard ApplyingRemote: реплей ключа каскадить SetParam/CheckKeyQuests
+// усередині двигуна — каскад НЕ ре-бродкаститься (ініціатор уже надіслав свої
+// опи; SetParam несе АБСОЛЮТНЕ значення → подвійних нагород нема).
+// quest_finished — внутрішній ключ двигуна, НЕ реплеїться (петля/дубль).
+// ─────────────────────────────────────────────────────────────────────────────
+public static class StorySync
+{
+    public static bool ApplyingRemote;
+
+    private static readonly HashSet<string> _personalParams = new HashSet<string>
+    {
+        "hp", "energy", "sanity", "max_hp", "max_energy", "max_sanity",
+        "craft_tut", "in_tutorial", "prayed_this_week",
+    };
+
+    private static readonly Dictionary<string, float> _lastSent = new Dictionary<string, float>();
+    private static string _lastKey;
+    private static float _lastKeyTime;
+
+    // Опи, що прийшли ДО входу в світ (завантаження) — черга, флаш зі SteamManager.Update
+    // у порядку надходження (порядок критичний: ключ стартує квест, який читає парами).
+    // op: 0=парам, 1=ключ, 2=квест-старт, 3=квест-успіх, 4=квест-провал,
+    // 5=NPC-задача (name=npc_id, extra=task_id, value=state).
+    private class PendingOp { public int op; public string name; public string extra; public float value; }
+    private static readonly List<PendingOp> _pendingOps = new List<PendingOp>();
+    private const int PENDING_OPS_MAX = 512;
+
+    public static bool IsStoryParam(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length > 200) return false;
+        if (_personalParams.Contains(name)) return false;
+        if (name.StartsWith("tut_")) return false;
+        if (name.EndsWith("_quality") || name.EndsWith("_qual")) return false;
+        return true;
+    }
+
+    public static bool IsActionKey(string key)
+    {
+        if (string.IsNullOrEmpty(key) || key.Length > 200) return false;
+        if (key == "quest_finished") return false;
+        return true;
+    }
+
+    public static void OnLocalParam(string name, float value)
+    {
+        try
+        {
+            if (ApplyingRemote || !ChopSync.IsPeerConnected() || !IsStoryParam(name)) return;
+            if (_lastSent.TryGetValue(name, out var v) && Mathf.Abs(v - value) < 0.0001f) return;
+            _lastSent[name] = value;
+            var nb = System.Text.Encoding.UTF8.GetBytes(name);
+            if (nb.Length > 255) return;
+            var pk = new byte[6 + nb.Length];
+            pk[0] = 0x1C;
+            pk[1] = (byte)nb.Length;
+            Buffer.BlockCopy(nb, 0, pk, 2, nb.Length);
+            BitConverter.GetBytes(value).CopyTo(pk, 2 + nb.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+            Multiplayer.Log?.LogInfo($"[STORY] Парам {name}={value:F2} → 0x1C");
+        }
+        catch { }
+    }
+
+    // 0x1D ВИМКНЕНО (лайв-тест P2c #1): реплей ключа в CheckKeyQuests на репліці стартує
+    // квести ЗІ СКРИПТАМИ (вікна/нагороди/лок руху) — той самий клас бага, що 0x1E-скрипти.
+    // Життєвий цикл квестів тепер їде ПОВНІСТЮ через 0x1E (state-only), парами — 0x1C,
+    // NPC-задачі — 0x1F. Ключі лишаються лише в PPAR-DIAG (локальний лог).
+    public static void OnLocalKey(string key)
+    {
+        // вимкнено — див. коментар вище
+    }
+
+    private static bool ReadyToApply()
+    {
+        try
+        {
+            return SteamNetwork.IsInGame && MainGame.me != null &&
+                   MainGame.me.player != null && MainGame.me.save != null;
+        }
+        catch { return false; }
+    }
+
+    public static void ApplyRemoteParam(string name, float value)
+    {
+        if (!IsStoryParam(name)) return;   // захисний пояс (відправник теж фільтрує)
+        if (!ReadyToApply())
+        {
+            if (_pendingOps.Count < PENDING_OPS_MAX)
+                _pendingOps.Add(new PendingOp { op = 0, name = name, value = value });
+            return;
+        }
+        DoApplyParam(name, value);
+    }
+
+    public static void ApplyRemoteKey(string key)
+    {
+        if (!IsActionKey(key)) return;
+        if (!ReadyToApply())
+        {
+            if (_pendingOps.Count < PENDING_OPS_MAX)
+                _pendingOps.Add(new PendingOp { op = 1, name = key });
+            return;
+        }
+        DoApplyKey(key);
+    }
+
+    // Приймач 0x1E: життєвий цикл квеста напарника (kind: 0=старт, 1=успіх, 2=провал).
+    public static void ApplyRemoteQuestEvent(int kind, string id)
+    {
+        if (string.IsNullOrEmpty(id) || kind < 0 || kind > 2) return;
+        if (!ReadyToApply())
+        {
+            if (_pendingOps.Count < PENDING_OPS_MAX)
+                _pendingOps.Add(new PendingOp { op = 2 + kind, name = id });
+            return;
+        }
+        DoApplyQuestEvent(kind, id);
+    }
+
+    // З SteamManager.Update: флаш черги опів після входу в світ.
+    public static void TickFlushPending()
+    {
+        if (_pendingOps.Count == 0 || !ReadyToApply()) return;
+        Multiplayer.Log?.LogInfo($"[STORY] Флаш {_pendingOps.Count} відкладених опів (світ готовий)");
+        foreach (var op in _pendingOps)
+        {
+            if (op.op == 0) DoApplyParam(op.name, op.value);
+            else if (op.op == 1) DoApplyKey(op.name);
+            else if (op.op == 5) DoApplyNpcTask(op.name, op.extra, (int)op.value);
+            else DoApplyQuestEvent(op.op - 2, op.name);
+        }
+        _pendingOps.Clear();
+    }
+
+    // ── NPC-ЗАДАЧІ (0x1F) — лайв-тест P2b #1: квест голови села так і не з'явився ─────────
+    // У GK ДВІ квестові системи: QuestSystem (goto_tavern_* — закрили 0x1E) і ЖУРНАЛ ЗАДАЧ
+    // ПО NPC — KnownNPC.TaskState (Visible/Complete/Unknown), який ставлять діалоги через
+    // KnownNPC.SetQuestState(task_id, state). Квест голови села («реднеки») — саме тут.
+    // Хук SetQuestState → 0x1F {state, npc_id, task_id}; приймач:
+    // save.known_npcs.GetOrCreateNPC(npc).SetQuestState(task, state). Ідемпотентно.
+    public static void OnLocalNpcTask(object knownNpc, string taskId, int state)
+    {
+        try
+        {
+            if (ApplyingRemote || !ChopSync.IsPeerConnected()) return;
+            var npc = knownNpc as KnownNPC;
+            if (npc == null || string.IsNullOrEmpty(npc.npc_id) || string.IsNullOrEmpty(taskId)) return;
+            var nb = System.Text.Encoding.UTF8.GetBytes(npc.npc_id);
+            var tb = System.Text.Encoding.UTF8.GetBytes(taskId);
+            if (nb.Length > 255 || tb.Length > 255) return;
+            var pk = new byte[4 + nb.Length + tb.Length];
+            pk[0] = 0x1F;
+            pk[1] = (byte)state;
+            pk[2] = (byte)nb.Length;
+            Buffer.BlockCopy(nb, 0, pk, 3, nb.Length);
+            pk[3 + nb.Length] = (byte)tb.Length;
+            Buffer.BlockCopy(tb, 0, pk, 4 + nb.Length, tb.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+            Multiplayer.Log?.LogInfo($"[STORY] NPC-задача {npc.npc_id}/{taskId}={state} → 0x1F");
+        }
+        catch { }
+    }
+
+    public static void ApplyRemoteNpcTask(string npcId, string taskId, int state)
+    {
+        if (string.IsNullOrEmpty(npcId) || string.IsNullOrEmpty(taskId)) return;
+        if (!ReadyToApply())
+        {
+            if (_pendingOps.Count < PENDING_OPS_MAX)
+                _pendingOps.Add(new PendingOp { op = 5, name = npcId, extra = taskId, value = state });
+            return;
+        }
+        DoApplyNpcTask(npcId, taskId, state);
+    }
+
+    private static void DoApplyNpcTask(string npcId, string taskId, int state)
+    {
+        ApplyingRemote = true;
+        try
+        {
+            var npc = MainGame.me.save.known_npcs.GetOrCreateNPC(npcId);
+            if (npc == null) { Multiplayer.Log?.LogWarning($"[STORY] 0x1F: NPC '{npcId}' не створився"); return; }
+            npc.SetQuestState(taskId, (KnownNPC.TaskState.State)state);
+            Multiplayer.Log?.LogInfo($"[STORY] 0x1F: задача {npcId}/{taskId}={state} застосована ✓");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[STORY] 0x1F застосування: {e.Message}"); }
+        finally { ApplyingRemote = false; }
+    }
+
+    private static void DoApplyParam(string name, float value)
+    {
+        ApplyingRemote = true;
+        try
+        {
+            MainGame.me.player.SetParam(name, value);
+            _lastSent[name] = value;   // не відсилати назад те саме при локальному повторі
+            Multiplayer.Log?.LogInfo($"[STORY] 0x1C: парам {name}={value:F2} застосовано ✓");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[STORY] 0x1C застосування: {e.Message}"); }
+        finally { ApplyingRemote = false; }
+    }
+
+    private static void DoApplyKey(string key)
+    {
+        // 0x1D вимкнено (скрипт-небезпека на репліці) — старі пакети просто логуються.
+        Multiplayer.Log?.LogInfo($"[STORY] 0x1D: ключ '{key}' проігноровано (вимкнено, цикл їде 0x1E)");
+    }
+
+    // ── ЖИТТЄВИЙ ЦИКЛ КВЕСТІВ (0x1E) — лайв-тест P2 #1 показав, що ключів МАЛО ──────────
+    // Старт квеста живе в ДІАЛОЗІ (вибори реплік — локальні), фініш — в УМОВАХ над
+    // ЛОКАЛЬНИМ інвентарем (роздільний за дизайном) → двигун напарника не може дійти
+    // тих самих висновків сам. Тому старт/фініш реплікуються ЯВНО: хук StartQuest +
+    // EndQuest (єдиний chokepoint і природного, і форсованого кінця) → 0x1E {kind,id};
+    // приймач: StartQuest(def за id з GameBalance.quests_data) / ForceQuestEnd(id, ok)
+    // в обхід локальних умов. Скрипти кінця (нагороди) виконуються на ОБОХ — парам-
+    // нагороди ідемпотентні (0x1C абсолютні значення), предметні = «обидва отримують».
+    public static void OnLocalQuestStart(object questDef)
+    {
+        try
+        {
+            if (ApplyingRemote || !ChopSync.IsPeerConnected()) return;
+            var def = questDef as QuestDefinition;
+            if (def == null || string.IsNullOrEmpty(def.id)) return;
+            SendQuestEvent(0, def.id);
+            Multiplayer.Log?.LogInfo($"[STORY] Квест СТАРТ '{def.id}' → 0x1E");
+        }
+        catch { }
+    }
+
+    public static void OnLocalQuestEnd(object questState)
+    {
+        try
+        {
+            if (ApplyingRemote || !ChopSync.IsPeerConnected()) return;
+            var st = questState as QuestState;
+            if (st == null || st.definition == null || string.IsNullOrEmpty(st.definition.id)) return;
+            int kind = st.state == QuestState.State.Succeeded ? 1 : 2;
+            SendQuestEvent(kind, st.definition.id);
+            Multiplayer.Log?.LogInfo($"[STORY] Квест {(kind == 1 ? "УСПІХ" : "ПРОВАЛ")} '{st.definition.id}' → 0x1E");
+        }
+        catch { }
+    }
+
+    private static void SendQuestEvent(int kind, string id)
+    {
+        var ib = System.Text.Encoding.UTF8.GetBytes(id);
+        if (ib.Length == 0 || ib.Length > 255) return;
+        var pk = new byte[3 + ib.Length];
+        pk[0] = 0x1E;
+        pk[1] = (byte)kind;
+        pk[2] = (byte)ib.Length;
+        Buffer.BlockCopy(ib, 0, pk, 3, ib.Length);
+        SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+    }
+
+    private static QuestDefinition FindQuestDef(string id)
+    {
+        try
+        {
+            foreach (var d in GameBalance.me.quests_data)
+                if (d != null && d.id == id) return d;
+        }
+        catch { }
+        return null;
+    }
+
+    // STATE-ONLY реплей (лайв-тест P2c #1): StartQuest/ForceQuestEnd на репліці запускали
+    // СКРИПТИ квеста (стартові/фінішні) — а ті відкривають вікна (інструктаж/анлок
+    // рецепта), лочать рух і видають нагороди → невидимий блокуючий модал у напарника
+    // (зіткнення з його живим діалогом). Тому репліка чіпає ЛИШЕ СТАН (списки квестів,
+    // прямо в полях QuestSystem) + Redraw журналу. Усі ефекти скриптів виконуються
+    // ТІЛЬКИ в ініціатора й доїжджають своїми каналами (0x1C парами, 0x0D світ).
+    // Компроміс (прийнято): предметні нагороди квеста отримує лише ініціатор.
+    private static FieldInfo _qsCurrentField, _qsSuccedField, _qsFailedField, _qsExecutedField;
+    private static bool _qsReflectionTried;
+
+    private static void EnsureQuestReflection()
+    {
+        if (_qsReflectionTried) return;
+        _qsReflectionTried = true;
+        var t = typeof(QuestSystem);
+        var f = BindingFlags.NonPublic | BindingFlags.Instance;
+        _qsCurrentField  = t.GetField("_currnet_quests", f);   // typo гри — так у декомпілі
+        _qsSuccedField   = t.GetField("_succed_quests", f);
+        _qsFailedField   = t.GetField("_failed_quests", f);
+        _qsExecutedField = t.GetField("_executed_quests", f);
+        Multiplayer.Log?.LogInfo($"[STORY] квест-рефлексія: cur={_qsCurrentField != null} " +
+            $"ok={_qsSuccedField != null} fail={_qsFailedField != null} exec={_qsExecutedField != null}");
+    }
+
+    private static void RedrawQuestList()
+    {
+        try { GUIElements.me?.quest_list?.Redraw(); } catch { }
+    }
+
+    private static void DoApplyQuestEvent(int kind, string id)
+    {
+        ApplyingRemote = true;
+        try
+        {
+            var qs = MainGame.me.save.quests;
+            EnsureQuestReflection();
+            var current = _qsCurrentField?.GetValue(qs) as List<QuestState>;
+            if (current == null) { Multiplayer.Log?.LogWarning("[STORY] 0x1E: _currnet_quests не зчитався"); return; }
+
+            if (kind == 0)
+            {
+                // Старт: лише якщо квест ще не йде і не закритий (ідемпотентність).
+                if (qs.IsQuestCurrent(id) || qs.IsQuestSucced(id) || qs.IsQuestFaild(id)) return;
+                var def = FindQuestDef(id);
+                if (def == null) { Multiplayer.Log?.LogWarning($"[STORY] 0x1E: квест '{id}' не знайдено в quests_data"); return; }
+                current.Add(new QuestState { definition = def });
+                var ex = _qsExecutedField?.GetValue(qs) as List<string>;
+                if (ex != null && !ex.Contains(id)) ex.Add(id);
+                RedrawQuestList();
+                Multiplayer.Log?.LogInfo($"[STORY] 0x1E: квест '{id}' у журнал (state-only) ✓");
+            }
+            else
+            {
+                bool ok = kind == 1;
+                if (qs.IsQuestSucced(id) || qs.IsQuestFaild(id)) return;   // вже закритий
+                for (int i = current.Count - 1; i >= 0; i--)
+                    if (current[i] != null && current[i].definition != null && current[i].definition.id == id)
+                        current.RemoveAt(i);
+                var doneList = (ok ? _qsSuccedField : _qsFailedField)?.GetValue(qs) as List<string>;
+                if (doneList != null && !doneList.Contains(id)) doneList.Add(id);
+                var ex = _qsExecutedField?.GetValue(qs) as List<string>;
+                if (ex != null && !ex.Contains(id)) ex.Add(id);
+                RedrawQuestList();
+                Multiplayer.Log?.LogInfo($"[STORY] 0x1E: квест '{id}' закрито ({(ok ? "успіх" : "провал")}, state-only) ✓");
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[STORY] 0x1E застосування '{id}': {e.Message}"); }
+        finally { ApplyingRemote = false; }
+    }
+}
+
+[HarmonyPatch]
+public static class PparSetParamReconPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var wgo = AccessTools.TypeByName("WorldGameObject");
+        return wgo?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                               BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "SetParam"
+                              && m.GetParameters().Length == 2
+                              && m.GetParameters()[0].ParameterType == typeof(string)
+                              && m.GetParameters()[1].ParameterType == typeof(float));
+    }
+
+    static void Postfix(MonoBehaviour __instance, string param_name, float value)
+    {
+        PparRecon.OnPlayerSetParam(__instance, param_name, value);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+[HarmonyPatch]
+public static class PparKeyQuestReconPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var qs = AccessTools.TypeByName("QuestSystem");
+        return qs?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                              BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "CheckKeyQuests"
+                              && m.GetParameters().Length == 1
+                              && m.GetParameters()[0].ParameterType == typeof(string));
+    }
+
+    static void Postfix(string key)
+    {
+        PparRecon.OnKeyQuest(key);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// СЮЖЕТ (0x1E): старт квеста — QuestSystem.StartQuest(QuestDefinition), публічний,
+// спільний шлях природного старту (ProcessNextStartingQuest) і реплею. Гейт echo —
+// StorySync.ApplyingRemote усередині OnLocalQuestStart.
+[HarmonyPatch]
+public static class QuestStartSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var qs = AccessTools.TypeByName("QuestSystem");
+        return qs?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "StartQuest"
+                              && m.GetParameters().Length == 1
+                              && m.GetParameters()[0].ParameterType.Name == "QuestDefinition");
+    }
+
+    static void Postfix(object quest)
+    {
+        StorySync.OnLocalQuestStart(quest);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// СЮЖЕТ (0x1E): кінець квеста — QuestSystem.EndQuest(QuestState), приватний, ЄДИНИЙ
+// chokepoint природного (CheckQuestsState→ProcessNextEndingQuest) і форсованого
+// (ForceQuestEnd) кінця; q_to_end.state на момент виклику вже виставлений (декомпіл 104168).
+[HarmonyPatch]
+public static class QuestEndSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var qs = AccessTools.TypeByName("QuestSystem");
+        return qs?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "EndQuest"
+                              && m.GetParameters().Length == 1
+                              && m.GetParameters()[0].ParameterType.Name == "QuestState");
+    }
+
+    static void Postfix(object q_to_end)
+    {
+        StorySync.OnLocalQuestEnd(q_to_end);
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
+
+// СЮЖЕТ (0x1F): задачі журналу NPC — KnownNPC.SetQuestState(task_id, state) — це те,
+// що діалоги пишуть у журнал по персонажах (Visible/Complete/Unknown). Гейт echo —
+// StorySync.ApplyingRemote усередині OnLocalNpcTask.
+[HarmonyPatch]
+public static class NpcTaskSyncPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var kn = AccessTools.TypeByName("KnownNPC");
+        return kn?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "SetQuestState"
+                              && m.GetParameters().Length == 2
+                              && m.GetParameters()[0].ParameterType == typeof(string));
+    }
+
+    static void Postfix(object __instance, string task_id, object state)
+    {
+        try { StorySync.OnLocalNpcTask(__instance, task_id, Convert.ToInt32(state)); } catch { }
+    }
+
+    static Exception Finalizer(Exception __exception) => null;
+}
