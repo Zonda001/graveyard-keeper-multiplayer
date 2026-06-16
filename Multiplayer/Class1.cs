@@ -9,26 +9,25 @@ using System.Linq;
 using System.Reflection;
 using UnityEngine.SceneManagement;
 using System.Linq.Expressions;
-using Steamworks;
 using Object = UnityEngine.Object;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Зберігаємо посилання на P2 глобально, щоб патчі могли його перевіряти
+// Keep a global reference to P2 so patches can check against it
 // ─────────────────────────────────────────────────────────────────────────────
 public static class MultiplayerState
 {
     public static GameObject Player2;
 
-    // BaseCharacterComponent (рантайм-тип PlayerComponent) split-screen дубля P2.
-    // Патчі порівнюють __instance саме з цим посиланням через ReferenceEquals —
-    // це суто керована перевірка, нативну пам'ять не чіпає, тож безпечна навіть
-    // для знищеного компонента. Звернення до .gameObject знищеного компонента
-    // (напр. гравець під час респавну) дає нативний краш — тому його уникаємо.
+    // BaseCharacterComponent (runtime type PlayerComponent) of the split-screen P2 dummy.
+    // Patches compare __instance against this reference via ReferenceEquals —
+    // a purely managed check that never touches native memory, so it is safe even
+    // for a destroyed component. Accessing .gameObject of a destroyed component
+    // (e.g. the player during respawn) causes a native crash — so we avoid it.
     public static MonoBehaviour Player2Char;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ПАТЧ 1 — PlayerControlIsDisabled завжди повертає false для P2
+// PATCH 1 — PlayerControlIsDisabled always returns false for P2
 // ─────────────────────────────────────────────────────────────────────────────
 [HarmonyPatch]
 public static class PlayerControlPatch
@@ -42,8 +41,8 @@ public static class PlayerControlPatch
 
     static bool Prefix(MonoBehaviour __instance, ref bool __result)
     {
-        // ReferenceEquals замість __instance.gameObject — не торкаємось нативної
-        // пам'яті, тож безпечно навіть якщо компонент знищено (див. MultiplayerState).
+        // ReferenceEquals instead of __instance.gameObject — we don't touch native
+        // memory, so it's safe even if the component is destroyed (see MultiplayerState).
         if (ReferenceEquals(__instance, MultiplayerState.Player2Char))
         {
             __result = false;
@@ -54,7 +53,7 @@ public static class PlayerControlPatch
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ПАТЧ 2 — UpdatePlayer
+// PATCH 2 — UpdatePlayer
 // ─────────────────────────────────────────────────────────────────────────────
 [HarmonyPatch]
 public static class UpdatePlayerPatch
@@ -69,14 +68,14 @@ public static class UpdatePlayerPatch
 
     static bool Prefix(MonoBehaviour __instance, float delta_time)
     {
-        // Патч керує лише split-screen дублем P2 (дебаг, F9). Для всіх інших,
-        // включно зі справжнім гравцем, нічого не робимо й НЕ торкаємось
-        // __instance.gameObject: під час респавну гравця компонент може бути
-        // знищений, і звернення до .gameObject дає нативний краш (підтверджено
-        // Player.log: краш на get_gameObject одразу після gd_player_respawn).
-        // ReferenceEquals — чиста керована перевірка, нативну пам'ять не чіпає.
-        // Мережевий клон сюди не потрапляє — у RemotePlayer_Clone узагалі
-        // знятий BaseCharacterComponent (стрипається при спавні клону).
+        // This patch only drives the split-screen P2 dummy (debug, F9). For everyone
+        // else, including the real player, we do nothing and do NOT touch
+        // __instance.gameObject: during a player respawn the component may be
+        // destroyed, and accessing .gameObject causes a native crash (confirmed via
+        // Player.log: crash on get_gameObject right after gd_player_respawn).
+        // ReferenceEquals is a pure managed check that never touches native memory.
+        // The network clone never reaches here — RemotePlayer_Clone has its
+        // BaseCharacterComponent stripped entirely (removed when the clone spawns).
         if (!ReferenceEquals(__instance, MultiplayerState.Player2Char))
             return true;
 
@@ -98,7 +97,7 @@ public static class UpdatePlayerPatch
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ПАТЧ 3 — SmartAnimationController.Update
+// PATCH 3 — SmartAnimationController.Update
 // ─────────────────────────────────────────────────────────────────────────────
 [HarmonyPatch]
 public static class SmartAnimPatch
@@ -111,8 +110,8 @@ public static class SmartAnimPatch
             BindingFlags.Instance | BindingFlags.DeclaredOnly);
     }
 
-    // Кешуємо кореневий Transform P2 щоб не робити GetComponentInParent кожен кадр
-    // для кожного SmartAnimationController в сцені (NPC, предмети — може бути сотні)
+    // Cache P2's root Transform so we don't call GetComponentInParent every frame
+    // for every SmartAnimationController in the scene (NPCs, items — could be hundreds)
     private static Transform _p2RootCache;
     private static GameObject _p2GoCache;
 
@@ -126,7 +125,7 @@ public static class SmartAnimPatch
     {
         if (MultiplayerState.Player2 == null) return true;
 
-        // Оновлюємо кеш тільки якщо P2 змінився
+        // Update the cache only if P2 changed
         if (_p2GoCache != MultiplayerState.Player2)
         {
             _p2GoCache   = MultiplayerState.Player2;
@@ -453,6 +452,11 @@ public class Multiplayer : BaseUnityPlugin
         //      дропа+Item. Зніми на ОБОХ машинах для ОДНОГО трупа → порівняй *id/*uid (★).
         if (Input.GetKeyDown(KeyCode.F3))
             ChopRecon.DumpNearestBodyDrop();
+
+        // F2 — РОЗВІДКА NPC (косметичний синк позицій жителів): дамп усіх NPC у сцені
+        //      (id/uid/поз). Зніми на ОБОХ машинах біля ОДНОГО NPC → uid стабільний? поз різні?
+        if (Input.GetKeyDown(KeyCode.F2))
+            ChopSync.DumpNpcs();
     }
 
     // ── Спавн клону іншого гравця (мережевий) ────────────────────────────────
@@ -634,6 +638,8 @@ public class Multiplayer : BaseUnityPlugin
         _cachedRemoteController = null;
         _spawnCoroutineRunning = false;
         SteamNetwork.RemotePlayerSpawned = false;
+        ChopSync.ResetNpcSync();      // скидаємо стоп/ре-енейбл-трекінг NPC
+        ChopSync.ResetGardenSync();   // скидаємо дедуп городу → re-push усіх грядок при реконекті
     }
 
     private void ResetP2()
@@ -2236,6 +2242,9 @@ public class SteamManager : MonoBehaviour
                 SendMyPosition();
             }
 
+            ChopSync.TickNpc();      // 0x20 NPC-синк ВИМКНЕНО за прапором SYNC_NPC_POSITIONS (Stardew: NPC персональні)
+            ChopSync.TickGardens();  // host-reconcile росту городу (хост шле 0x21 змінені грядки)
+
             _timeSyncTimer += Time.deltaTime;
             if (_timeSyncTimer >= TIME_SYNC_INTERVAL)
             {
@@ -2331,7 +2340,7 @@ public class SteamManager : MonoBehaviour
                 }
             }
             catch { }
-            _logger.LogInfo($"[TIME-DIAG] day={day} cur={curTime:F3} auto={auto} stopped={stopped} " +
+            _logger.LogInfo($"[TIME-DIAG] day={day} dow={day % 6} cur={curTime:F3} auto={auto} stopped={stopped} " +
                             $"ctrl={ctrl} tod={tod} envTod={envTod} preset={preset} state={state} " +
                             $"lightK={TimeOfDay.light_intensity_k:F2} {weather}");
 
@@ -2554,6 +2563,15 @@ public class SteamManager : MonoBehaviour
             float remoteTime = BitConverter.ToSingle(data, 5);
 
             if (!GameTimeSync.TryRead(out int localDay, out float localTime)) return;
+
+            // 🔬 DAY-DESYNC DIAG (2026-06-13): друг бачив іншу назву дня (Гордыня vs Похоть)
+            // = day%6 розійшовся. Логіка max-wins сходиться за норм. обміну, тож логуємо
+            // КОЖНЕ розходження дня при отриманні — наступний лог покаже, коли/куди й чи
+            // 0x08 його править (порівняти з dow= у TIME-DIAG обох машин).
+            if (remoteDay != localDay)
+                _logger.LogWarning($"[TIME-DESYNC] лок день={localDay}(dow={localDay % 6},cur={localTime:F2}) " +
+                    $"⟷ віддал день={remoteDay}(dow={remoteDay % 6},cur={remoteTime:F2}) → " +
+                    (remoteDay > localDay ? "переймаємо віддалений" : "ми попереду, ігнор"));
 
             // Переймаємо час лише якщо віддалений попереду (день головніший).
             bool remoteAhead = remoteDay > localDay
@@ -2838,6 +2856,16 @@ public class SteamManager : MonoBehaviour
             if (4 + nnLen + ntLen > data.Length) { _logger.LogWarning("[STORY] 0x1F пошкоджений"); return; }
             string ntask = System.Text.Encoding.UTF8.GetString(data, 4 + nnLen, ntLen);
             StorySync.ApplyRemoteNpcTask(nnpc, ntask, nstate);
+        }
+        else if (type == 0x20)
+        {
+            // ── Косметичний синк позицій NPC: type count(2) + N×{uid(8) x(4) y(4)} ──
+            ChopSync.ApplyRemoteNpcPositions(data);
+        }
+        else if (type == 0x21)
+        {
+            // ── Синк стану городу/садів: uid(8) x(4) y(4) objIdLen(2) objId json ──
+            ChopSync.ApplyRemoteGardenState(data);
         }
     }
 
@@ -7092,6 +7120,419 @@ public static class ChopSync
         return null;
     }
 
+    // ── NPC-RECON (2026-06-13, старт косметичного синку позицій жителів) ──────────
+    // Zonda: NPC у різних місцях на двох машинах виглядає дивно → хоче синк ПОЗИЦІЇ
+    // (косметика), БЕЗ AI-стопу що ламає персональні квести. Recon RECON: NPC = WGO з
+    // obj_def.IsNPC() (ObjType.NPC, декомпіл 78583), obj_id типу "npc_blacksmith"/
+    // "npc_redneck_2"; рух через components.character (MovementComponent) + GraphOwner.
+    // ГОЛОВНЕ ПИТАННЯ ДИЗАЙНУ: чи стабільний unique_id NPC на ОБОХ машинах? Якщо так —
+    // мирор за uid (як могили/будівлі); якщо ні — за obj_id (унікальні іменні) + поз-матч.
+    // ТЕСТ: F2 на ОБОХ машинах біля ОДНОГО NPC → порівняти uid (збігається?) і поз (різні?).
+    public static void DumpNpcs()
+    {
+        try
+        {
+            EnsureReflection();
+            if (!_ready || _objIdField == null) { Multiplayer.Log?.LogWarning("[NPC-RECON] рефлексія не готова"); return; }
+            int n = 0;
+            foreach (var comp in ScanWgosCached())
+            {
+                var mb = comp as MonoBehaviour;
+                if (mb == null) continue;
+                string id = _objIdField.GetValue(mb) as string ?? "";
+                if (!id.StartsWith("npc_")) continue;
+                n++;
+                long uid = 0;
+                try { uid = Convert.ToInt64(_uniqueIdField.GetValue(mb)); } catch { }
+                var p = mb.transform.position;
+                Multiplayer.Log?.LogInfo($"[NPC-RECON] id={id} uid={uid} pos=({p.x:F1},{p.y:F1}) active={mb.gameObject.activeInHierarchy}");
+            }
+            Multiplayer.Log?.LogInfo($"[NPC-RECON] усього NPC у сцені: {n} (зніми F2 на ОБОХ машинах біля одного NPC → порівняй uid і pos)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[NPC-RECON] {e.Message}"); }
+    }
+
+    // ── СИНК ПОЗИЦІЙ NPC (0x20, 2026-06-13) — косметичний мирор жителів ───────────
+    // Хост-авторитарно: хост шле батч {uid,x,y} своїх NPC (10/с); клієнт за uid (стабільний —
+    // recon F2 підтвердив: npc_id↔uid однакові на обох) знаходить NPC, ОДИН раз стопить
+    // route-AI (GraphOwner.StopBehaviour, як гра в PreDisable 114815) і ставить позицію.
+    // Діалог не чіпаємо (click-based, незалежний від руху). Видно лише коли поряд (спільні
+    // зони); чужа зона → NPC не матчиться, тихо пропуск. Після розставання (2с без апдейту)
+    // route-AI вертаємо (StartBehaviour) — інакше NPC замерзне на місці у клієнта.
+    private static float _npcSyncTimer;
+    private const float NPC_SYNC_INTERVAL = 0.1f;
+    private const float NPC_REENABLE_TIMEOUT = 2f;
+    private static readonly HashSet<long> _npcAiStopped = new HashSet<long>();
+    private static readonly Dictionary<long, float> _npcLastSeen = new Dictionary<long, float>();
+    private static readonly Dictionary<long, MonoBehaviour> _npcStoppedGo = new Dictionary<long, MonoBehaviour>();
+    private static bool _graphOwnerResolved;
+    private static System.Type _graphOwnerType;
+    private static MethodInfo _stopBehaviourMethod, _startBehaviourMethod;
+    private static object[] _stopArgs, _startArgs;
+    // Баг 1 фікс: StopBehaviour зупиняє лише дерево поведінки, а MovementComponent
+    // (components.character) крутиться на власному апдейт-циклі WGO й перебиває нашу
+    // позицію щокадру (декомпіл 86132/86667/86695). Гасимо рух напряму через
+    // wgo.components.character.StopMovement() — точно як гра в 80586/85178/99687.
+    // _wgoComponentsProp/_componentsCharacterProp вже резолвляться в EnsureReflection
+    // (юзаються стокпайлами); тут лишається тільки метод StopMovement.
+    private static MethodInfo _stopMovementMethod;
+
+    // Stardew-пивот: NPC ПЕРСОНАЛЬНІ — кожна машина веде свій локальний AI/розклад, тому
+    // персональні квест-взаємодії з NPC працюють незалежно на кожному боці. Хост-авторитарний
+    // синк позицій тут глушив би StopBehaviour на ВСІХ дочірніх GraphOwner NPC, у т.ч. сюжетні
+    // flow-графи (декомпіл: гра так робить лише для ObjType.Mob у PreDisable 114811, не для NPC),
+    // і конфліктував би з персональними квестами клієнта. Ціна вимкнення: позиції NPC візуально
+    // різні на машинах — косметика, прийнято (як спліт-інвентар і персональні квести). Код 0x20
+    // лишено за прапором для відкату/майбутнього (static readonly, не const → без CS0162).
+    private static readonly bool SYNC_NPC_POSITIONS = false;
+
+    public static void TickNpc()
+    {
+        if (!SYNC_NPC_POSITIONS) return;   // Stardew: NPC персональні — не жену й не приймаю позиції
+        try
+        {
+            if (!IsPeerConnected() || !SteamNetwork.IsInGame) return;
+            if (SteamNetwork.Role == NetworkRole.Host) TickNpcHostSend();
+            else TickNpcClientReenable();
+        }
+        catch { }
+    }
+
+    private static void TickNpcHostSend()
+    {
+        _npcSyncTimer += Time.deltaTime;
+        if (_npcSyncTimer < NPC_SYNC_INTERVAL) return;
+        _npcSyncTimer = 0f;
+        EnsureReflection();
+        if (!_ready || _objIdField == null) return;
+
+        var ids = new List<long>(); var xs = new List<float>(); var ys = new List<float>();
+        foreach (var comp in ScanWgosCached())
+        {
+            var mb = comp as MonoBehaviour;
+            if (mb == null) continue;
+            string id = _objIdField.GetValue(mb) as string ?? "";
+            if (!id.StartsWith("npc_")) continue;
+            long uid; try { uid = Convert.ToInt64(_uniqueIdField.GetValue(mb)); } catch { continue; }
+            var p = mb.transform.position;
+            ids.Add(uid); xs.Add(p.x); ys.Add(p.y);
+        }
+        if (ids.Count == 0) return;
+        int cnt = Math.Min(ids.Count, 500);
+        var pk = new byte[3 + cnt * 16];
+        pk[0] = 0x20;
+        pk[1] = (byte)(cnt & 0xFF);
+        pk[2] = (byte)((cnt >> 8) & 0xFF);
+        int o = 3;
+        for (int i = 0; i < cnt; i++)
+        {
+            BitConverter.GetBytes(ids[i]).CopyTo(pk, o); o += 8;
+            BitConverter.GetBytes(xs[i]).CopyTo(pk, o); o += 4;
+            BitConverter.GetBytes(ys[i]).CopyTo(pk, o); o += 4;
+        }
+        SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+    }
+
+    public static void ApplyRemoteNpcPositions(byte[] data)
+    {
+        if (!SYNC_NPC_POSITIONS) return;   // Stardew: NPC персональні — вхідні позиції ігноруємо
+        try
+        {
+            if (SteamNetwork.Role == NetworkRole.Host) return;   // авторитет — лише клієнт застосовує
+            if (data.Length < 3) return;
+            int cnt = data[1] | (data[2] << 8);
+            if (data.Length < 3 + cnt * 16) return;
+            EnsureReflection();
+            if (!_ready) return;
+            ResolveGraphOwner();
+            int o = 3;
+            for (int i = 0; i < cnt; i++)
+            {
+                long uid = BitConverter.ToInt64(data, o); o += 8;
+                float x = BitConverter.ToSingle(data, o); o += 4;
+                float y = BitConverter.ToSingle(data, o); o += 4;
+                var mb = FindWgoByUniqueId(uid);
+                if (mb == null) continue;            // не завантажений у клієнта — пропуск
+                _npcLastSeen[uid] = Time.time;
+                if (!_npcAiStopped.Contains(uid))
+                {
+                    StopNpcRouteAI(mb);
+                    _npcAiStopped.Add(uid);
+                    _npcStoppedGo[uid] = mb;
+                }
+                var p = mb.transform.position;
+                mb.transform.position = new Vector3(x, y, p.z);
+            }
+        }
+        catch { }
+    }
+
+    private static void TickNpcClientReenable()
+    {
+        if (_npcAiStopped.Count == 0) return;
+        _npcSyncTimer += Time.deltaTime;
+        if (_npcSyncTimer < 0.5f) return;
+        _npcSyncTimer = 0f;
+        List<long> revive = null;
+        foreach (var uid in _npcAiStopped)
+        {
+            float seen; if (!_npcLastSeen.TryGetValue(uid, out seen)) seen = 0f;
+            if (Time.time - seen > NPC_REENABLE_TIMEOUT)
+                (revive ?? (revive = new List<long>())).Add(uid);
+        }
+        if (revive == null) return;
+        foreach (var uid in revive)
+        {
+            MonoBehaviour mb; _npcStoppedGo.TryGetValue(uid, out mb);
+            if (mb != null) StartNpcRouteAI(mb);
+            _npcAiStopped.Remove(uid); _npcLastSeen.Remove(uid); _npcStoppedGo.Remove(uid);
+        }
+    }
+
+    public static void ResetNpcSync()
+    {
+        // Баг 2: повернути route-AI кожному замороженому NPC ПЕРЕД чисткою, інакше вони
+        // застигнуть назавжди (DespawnRemotePlayer смикається і на транзитному
+        // packet-timeout посеред живої сесії, не лише на реальному дисконекті).
+        foreach (var kv in _npcStoppedGo)
+            if (kv.Value != null) StartNpcRouteAI(kv.Value);
+        _npcAiStopped.Clear(); _npcLastSeen.Clear(); _npcStoppedGo.Clear(); _npcSyncTimer = 0f;
+    }
+
+    private static object[] BuildDefaultArgs(MethodInfo m)
+    {
+        var ps = m.GetParameters();
+        if (ps.Length == 0) return null;
+        var a = new object[ps.Length];
+        for (int i = 0; i < ps.Length; i++)
+            a[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue
+                 : (ps[i].ParameterType.IsValueType ? Activator.CreateInstance(ps[i].ParameterType) : null);
+        return a;
+    }
+
+    private static void ResolveGraphOwner()
+    {
+        if (_graphOwnerResolved) return;
+        _graphOwnerResolved = true;
+        try
+        {
+            _graphOwnerType = AccessTools.TypeByName("NodeCanvas.Framework.GraphOwner")
+                           ?? AccessTools.TypeByName("GraphOwner");
+            if (_graphOwnerType != null)
+                foreach (var m in _graphOwnerType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (m.Name == "StopBehaviour" && _stopBehaviourMethod == null) { _stopBehaviourMethod = m; _stopArgs = BuildDefaultArgs(m); }
+                    if (m.Name == "StartBehaviour" && _startBehaviourMethod == null && m.GetParameters().Length == 0) { _startBehaviourMethod = m; _startArgs = null; }
+                }
+            // Баг 1: StopMovement() на BaseCharacterComponent (успадковано від MovementComponent).
+            var chType = _componentsCharacterProp?.PropertyType;
+            _stopMovementMethod = chType?.GetMethod("StopMovement",
+                BindingFlags.Public | BindingFlags.Instance, null, System.Type.EmptyTypes, null);
+            Multiplayer.Log?.LogInfo($"[NPC] GraphOwner резолв: type={(_graphOwnerType != null)} stop={(_stopBehaviourMethod != null)} start={(_startBehaviourMethod != null)} stopMove={(_stopMovementMethod != null)}");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[NPC] GraphOwner: {e.Message}"); }
+    }
+
+    private static void StopNpcRouteAI(MonoBehaviour npc)
+    {
+        try
+        {
+            if (_graphOwnerType == null || _stopBehaviourMethod == null) return;
+            var owners = npc.GetComponentsInChildren(_graphOwnerType);
+            if (owners == null) return;
+            foreach (var ow in owners) try { _stopBehaviourMethod.Invoke(ow, _stopArgs); } catch { }
+        }
+        catch { }
+        // Баг 1: дерево зупинено, але MovementComponent ще тягне NPC по лишку A*-шляху —
+        // чистимо state+path, інакше він перебиватиме нашу позицію (джитер).
+        StopNpcMovement(npc);
+    }
+
+    // wgo.components.character.StopMovement() через рефлексію (поля вже резолвлені
+    // EnsureReflection-ом для стокпайлів; метод — у ResolveGraphOwner).
+    private static void StopNpcMovement(MonoBehaviour npc)
+    {
+        try
+        {
+            if (_wgoComponentsProp == null || _componentsCharacterProp == null || _stopMovementMethod == null) return;
+            var cm = _wgoComponentsProp.GetValue(npc);
+            var ch = cm != null ? _componentsCharacterProp.GetValue(cm) : null;
+            if (ch != null) _stopMovementMethod.Invoke(ch, null);
+        }
+        catch { }
+    }
+
+    private static void StartNpcRouteAI(MonoBehaviour npc)
+    {
+        try
+        {
+            if (_graphOwnerType == null || _startBehaviourMethod == null) return;
+            var owners = npc.GetComponentsInChildren(_graphOwnerType);
+            if (owners == null) return;
+            foreach (var ow in owners) try { _startBehaviourMethod.Invoke(ow, _startArgs); } catch { }
+        }
+        catch { }
+    }
+
+    // ── СИНК ГОРОДУ/САДІВ (0x21, 2026-06-15) ─────────────────────────────────────
+    // Recon: грядка = WGO зі станом obj_id (garden_X) + параметр "growing" (стадія росту
+    // = дочірні GO, які перемикає GardenCustomDrawer за "growing", декомпіл 89098). 0x0A
+    // синкає лише ЗБІР (garden_X→after_hp_0); ПОСАДКА (empty→garden_X) і РІСТ (growing
+    // по днях, per-machine дрейф як у погоди) — НЕ синкались. Не чіпаємо тонкий grave-шлях
+    // 0x0D (echo-петля = дюп) — окремий пакет 0x21 на ТОМУ Ж примітиві RestoreFromSerialized
+    // Object, але без grave-гардів. ПОЛІТИКА: посадка/збір (зміна obj_id) — ДВОСТОРОННЯ
+    // (хто діє, той шле); РІСТ (growing) — ХОСТ-АВТОРИТАРНО (TickGardens reconcile), щоб
+    // клієнт не бився з хостом на дрейфі.
+    public static bool ApplyingRemoteGarden;
+    private static float _gardenSyncTimer;
+    private const float GARDEN_SYNC_INTERVAL = 1.5f;
+    private static readonly Dictionary<long, string> _lastSentGardenJson = new Dictionary<long, string>();
+    private static readonly Dictionary<long, string> _lastGardenObjId = new Dictionary<long, string>();
+
+    private static bool IsGardenTarget(MonoBehaviour wgo)
+    {
+        if (_objIdField == null) return false;
+        string id = _objIdField.GetValue(wgo) as string ?? "";
+        if (id.StartsWith("zombie")) return false;   // zombie_garden_desk_* = авто-вироб. зомбі (3c), не сюди
+        return id.StartsWith("garden") || id.Contains("_garden");   // garden_*, tree_apple_garden, bush_berry_garden
+    }
+
+    // Тригер зміни грядки (з GraveReplaceSyncPatch/GraveRedrawSyncPatch). Хост шле БУДЬ-ЯКУ
+    // зміну (json-дедуп), клієнт — ЛИШЕ зміну obj_id (посадка/збір), не ріст (хост авторитет).
+    public static void OnLocalGardenStateChanged(MonoBehaviour wgo)
+    {
+        if (ApplyingRemoteChop || ApplyingRemoteGarden || !Connected()) return;
+        if (_objIdField == null || !IsGardenTarget(wgo)) return;
+        try
+        {
+            if (SteamNetwork.Role != NetworkRole.Host)
+            {
+                long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+                string objId = _objIdField.GetValue(wgo) as string ?? "";
+                if (_lastGardenObjId.TryGetValue(uid, out var prevId) && prevId == objId)
+                    return;   // клієнт: той самий obj_id = лише ріст → хай жене хост
+            }
+        }
+        catch { return; }
+        TrySendGarden(wgo);
+    }
+
+    private static void TrySendGarden(MonoBehaviour wgo)
+    {
+        if (!GraveStateReflectionReady()) return;
+        try
+        {
+            var data = _dataField.GetValue(wgo);
+            if (data == null) return;
+            string json = _toJsonMethod.Invoke(data, new object[] { 0 }) as string ?? "";
+            if (json.Length == 0) return;
+            string objId = _objIdField.GetValue(wgo) as string ?? "";
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+            if (uid == 0) return;
+            if (_lastSentGardenJson.TryGetValue(uid, out var prev) && prev == json) return;   // стан не змінився
+            _lastSentGardenJson[uid] = json;
+            _lastGardenObjId[uid] = objId;
+
+            var idB   = System.Text.Encoding.UTF8.GetBytes(objId);
+            var dataB = System.Text.Encoding.UTF8.GetBytes(json);
+            if (idB.Length > 65535) return;
+            var p = wgo.transform.position;
+            // 0x21 | uid(8) | x(4) | y(4) | objIdLen(2) | objId | json(решта)
+            var pk = new byte[19 + idB.Length + dataB.Length];
+            pk[0] = 0x21;
+            BitConverter.GetBytes(uid).CopyTo(pk, 1);
+            BitConverter.GetBytes(p.x).CopyTo(pk, 9);
+            BitConverter.GetBytes(p.y).CopyTo(pk, 13);
+            BitConverter.GetBytes((ushort)idB.Length).CopyTo(pk, 17);
+            int off = 19;
+            Buffer.BlockCopy(idB, 0, pk, off, idB.Length); off += idB.Length;
+            Buffer.BlockCopy(dataB, 0, pk, off, dataB.Length);
+            SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
+            Multiplayer.Log?.LogInfo($"[GARDEN] грядка uid={uid} obj={objId} — синк стану (json={dataB.Length}б)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogError($"[GARDEN] send: {e.Message}"); }
+    }
+
+    public static void ApplyRemoteGardenState(byte[] data)
+    {
+        try
+        {
+            if (data.Length < 19) return;
+            long uid  = BitConverter.ToInt64(data, 1);
+            float x   = BitConverter.ToSingle(data, 9);
+            float y   = BitConverter.ToSingle(data, 13);
+            int idLen = BitConverter.ToUInt16(data, 17);
+            if (19 + idLen > data.Length) return;
+            string objId = System.Text.Encoding.UTF8.GetString(data, 19, idLen);
+            int jsonOff  = 19 + idLen;
+            string json  = System.Text.Encoding.UTF8.GetString(data, jsonOff, data.Length - jsonOff);
+            EnsureReflection();
+            if (!GraveStateReflectionReady()) return;
+
+            var target = FindWgoByUniqueId(uid);
+            if (target == null)
+            {
+                target = FindTargetNear(x, y, out float dist, IsGardenTarget);
+                if (target == null || dist > POSITION_EPSILON)
+                {
+                    Multiplayer.Log?.LogWarning($"[GARDEN] 0x21 uid={uid} obj={objId} не знайдено (fail-open)");
+                    return;
+                }
+            }
+
+            ApplyingRemoteGarden = true;
+            try
+            {
+                var sw = _fromWgoMethod.Invoke(null, new object[] { target });
+                if (sw == null || _fromJsonOverwriteMethod == null) return;
+                var item = _swItemField.GetValue(sw);
+                if (item != null) _fromJsonOverwriteMethod.Invoke(null, new object[] { json, item });
+                else
+                {
+                    var d = _dataField.GetValue(target);
+                    if (d == null) return;
+                    _fromJsonOverwriteMethod.Invoke(null, new object[] { json, d });
+                    _swItemField.SetValue(sw, d);
+                }
+                if (!string.IsNullOrEmpty(objId)) _swObjIdField.SetValue(sw, objId);
+                _restoreFromSerializedMethod.Invoke(target, new object[] { sw, false });
+                if (_redrawMethod != null)
+                    try { _redrawMethod.Invoke(target, new object[] { true, false, false }); } catch { }
+                _lastSentGardenJson[uid] = json;   // не ехоємо назад
+                _lastGardenObjId[uid] = objId;
+                Multiplayer.Log?.LogInfo($"[GARDEN] грядка uid={uid} obj={objId} стан застосовано ✓ (json={json.Length}ch)");
+            }
+            finally { ApplyingRemoteGarden = false; }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[GARDEN] 0x21 apply: {e.Message}"); }
+    }
+
+    // Хост-авторитарний reconcile росту: періодично шле стан кожної грядки (json-дедуп →
+    // лише змінені = ріст/посадка/збір). Закриває day-skip дрейф «growing». Лише ХОСТ.
+    public static void TickGardens()
+    {
+        try
+        {
+            if (!Connected() || SteamNetwork.Role != NetworkRole.Host || !SteamNetwork.RemotePlayerSpawned) return;
+            _gardenSyncTimer += Time.deltaTime;
+            if (_gardenSyncTimer < GARDEN_SYNC_INTERVAL) return;
+            _gardenSyncTimer = 0f;
+            if (!GraveStateReflectionReady()) return;
+            foreach (var comp in ScanWgosCached())
+            {
+                var mb = comp as MonoBehaviour;
+                if (mb == null || !IsGardenTarget(mb)) continue;
+                TrySendGarden(mb);
+            }
+        }
+        catch { }
+    }
+
+    public static void ResetGardenSync()
+    {
+        _lastSentGardenJson.Clear(); _lastGardenObjId.Clear(); _gardenSyncTimer = 0f;
+    }
+
     // ── Прийом 0x0D: реплікація стану могили через item_data ─────────────────────
     // Знаходимо могилу за unique_id (fallback — позиція). Беремо ЛОКАЛЬНУ
     // SerializableWGO цілі (FromWGO — з валідними формулами/посиланнями цієї машини),
@@ -8752,6 +9193,8 @@ public static class GraveReplaceSyncPatch
         // Тригер зміни стадії могили → синк ПОВНОГО стану (підхід A). Фільтр grave*
         // усередині OnLocalGraveStateChanged (відсікає дерева→пеньки).
         ChopSync.OnLocalGraveStateChanged(__instance);
+        // Город/сади: посадка (empty→garden_X) і збір ідуть через ReplaceWithObject (0x21).
+        ChopSync.OnLocalGardenStateChanged(__instance);
     }
 
     static Exception Finalizer(Exception __exception) => null;
@@ -8776,6 +9219,7 @@ public static class GraveRedrawSyncPatch
     static void Postfix(MonoBehaviour __instance)
     {
         ChopSync.OnLocalGraveStateChanged(__instance);
+        ChopSync.OnLocalGardenStateChanged(__instance);   // город: візуальна зміна стадії
     }
 
     static Exception Finalizer(Exception __exception) => null;
