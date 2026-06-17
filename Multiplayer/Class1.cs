@@ -2277,6 +2277,7 @@ public class SteamManager : MonoBehaviour
                 ChopSync.RetryPendingDestroys();
                 ChopSync.RetryPendingDrops();
                 ChopSync.RetryPendingBigPickups();
+                ChopSync.RetryPendingGardens();
             }
         }
     }
@@ -2695,6 +2696,10 @@ public class SteamManager : MonoBehaviour
             if (23 + bidLen > data.Length) { _logger.LogWarning("[CHOP] 0x15 objId за межами"); return; }
             string bObjId = System.Text.Encoding.UTF8.GetString(data, 23, bidLen);
             ChopSync.ApplyRemoteBuildSpawn(buid, bx, by, bz, bObjId);
+            // Грядка-будмайданчик: викинути preview-garden_empty з черги ретраю (DoPlace-превʼю
+            // випереджає 0x15 → інакше каркас миттєво «вскопується»). Докопування синкнеться пізніше.
+            if (bObjId != null && bObjId.Contains("garden") && bObjId.Contains("_place"))
+                ChopSync.InvalidatePendingGarden(buid);
         }
         else if (type == 0x16)
         {
@@ -5155,8 +5160,11 @@ public static class ChopSync
 
     // Обʼєкти, ЗМІНУ СТАНУ яких синхронізуємо (пакет 0x0A — перехід after_hp_0
     // або знищення). Ширше за IsDestroySyncTarget: крім дерев і каменів сюди
-    // йдуть грядки (garden*) — лайв-тест 2026-06-01 підтвердив, що збір врожаю
-    // (одностадійний hp→0) трансформується на приймачі чисто.
+    // йдуть БУДІВЕЛЬНІ обʼєкти грядки (каркас _place / builddesk) — копання каркаса
+    // в garden_empty трансформується чисто (Етап 3). ПЛАНТАБЕЛЬНІ грядки тут БІЛЬШЕ НЕ
+    // синкаються: їх обʼєктними переходами (посадка/збір/ріст) володіє 0x21. До 2026-06-17
+    // вони матчились через garden* і посадка (garden_empty→garden_carrot) слала зайвий 0x0A —
+    // приймач не знав цільового obj_id → "Обʼєкт знищено" → грядка зникала в напарника (uid=39506).
     // МОГИЛИ (grave*) НАВМИСНО ВИКЛЮЧЕНІ: вони багатостадійні (частини падають
     // окремими DropItems), і форс ReplaceWithObject/Destroy на приймачі знищував
     // цілу могилу замість переходу на наступну стадію (лайв-тест 2026-06-01:
@@ -5173,7 +5181,7 @@ public static class ChopSync
         var id = _objIdField.GetValue(wgo) as string;
         if (id == null) return false;
         return id.StartsWith("tree") || id.StartsWith("stone") ||
-               id.StartsWith("garden") || IsNatureGatherTarget(id);
+               (IsGardenRelated(wgo) && !IsGardenTarget(wgo)) || IsNatureGatherTarget(id);
     }
 
     // Обʼєкти, ЛУТ яких синхронізуємо (пакет 0x0B). Ширше за IsDestroySyncTarget —
@@ -5236,6 +5244,11 @@ public static class ChopSync
     // на Фазу 2 будівництва, лишаючись вузьким (тільки 0x15-обʼєкти, не весь світ).
     private static bool IsStateRepTarget(MonoBehaviour wgo)
     {
+        // Весь город — НЕ через 0x0D state-rep (плантабельні йдуть 0x21, каркаси — CHOP). Беремо
+        // ШИРОКИЙ IsGardenRelated (не IsGardenTarget!): каркас garden_empty_place потрапляє в
+        // _syncedBuildUids при будівництві (0x15 → TrackBuildUid), тож без цього він пройшов би у 0x0D
+        // навіть з IsWorkbench=false (Етап 1, 2026-06-16: город ішов трьома шляхами → конфлікт).
+        if (IsGardenRelated(wgo)) return false;
         if (IsGraveTarget(wgo)) return true;
         if (IsWorkbench(wgo)) return true;   // Фаза 2: крафт на верстатах (obj_def.has_craft)
         if ((_syncedBuildUids.Count == 0 && _knownChestUids.Count == 0) ||
@@ -5253,6 +5266,11 @@ public static class ChopSync
     private static bool IsWorkbench(MonoBehaviour wgo)
     {
         if (_objDefField == null || _hasCraftField == null || wgo == null) return false;
+        // Город/сади мають власний шлях (плантабельні — 0x21, каркаси — CHOP), НЕ крафт-станційний
+        // (хоч садіння й має has_craft=true). ШИРОКИЙ IsGardenRelated прибирає весь город із крафт-черги
+        // (0x17), claim-арбітражу (0x18, IsArbitratedStation) та IsStateSyncedStation. Лут збору врожаю
+        // НЕ страждає: IsLootSyncTarget матчить грядку через id "garden", не через IsWorkbench.
+        if (IsGardenRelated(wgo)) return false;
         try
         {
             var od = _objDefField.GetValue(wgo);
@@ -7389,12 +7407,28 @@ public static class ChopSync
     private static readonly Dictionary<long, string> _lastSentGardenJson = new Dictionary<long, string>();
     private static readonly Dictionary<long, string> _lastGardenObjId = new Dictionary<long, string>();
 
-    private static bool IsGardenTarget(MonoBehaviour wgo)
+    // Будь-що «город-повʼязане» (ШИРОКИЙ чек): справжня грядка АБО її будівельний обʼєкт.
+    // Уживається ЛИШЕ щоб виключити весь город із чужих шляхів (0x0D state-rep, крафт). Сам
+    // синк города робить звужений IsGardenTarget (тільки плантабельні тайли, нижче).
+    private static bool IsGardenRelated(MonoBehaviour wgo)
     {
         if (_objIdField == null) return false;
         string id = _objIdField.GetValue(wgo) as string ?? "";
         if (id.StartsWith("zombie")) return false;   // zombie_garden_desk_* = авто-вироб. зомбі (3c), не сюди
         return id.StartsWith("garden") || id.Contains("_garden");   // garden_*, tree_apple_garden, bush_berry_garden
+    }
+
+    // Ціль 0x21-синку = ЛИШЕ плантабельна грядка. Виключаємо будівельні обʼєкти города: каркас-гхост
+    // (obj_id+"_place", декомпіл 44018/76244) і будмайданчики (*builddesk). Їх веде CHOP-шлях
+    // (0x15-спавн + 0x0A-копання → garden_empty), а НЕ garden-reconcile. Без цього періодичний 0x21
+    // (рядок ~7550) ганяв каркаси й запізнілим пакетом «розкопував» свіжу грядку назад у каркас →
+    // застрягання будівництва (лайв-тест 2026-06-17, uid=40126: 1097 викопано → 1099 garden_empty_place
+    // накотився поверх → грядка «розкопалась»).
+    private static bool IsGardenTarget(MonoBehaviour wgo)
+    {
+        if (!IsGardenRelated(wgo)) return false;
+        string id = _objIdField.GetValue(wgo) as string ?? "";
+        return !id.EndsWith("_place") && !id.Contains("builddesk");
     }
 
     // Тригер зміни грядки (з GraveReplaceSyncPatch/GraveRedrawSyncPatch). Хост шле БУДЬ-ЯКУ
@@ -7448,63 +7482,74 @@ public static class ChopSync
             Buffer.BlockCopy(idB, 0, pk, off, idB.Length); off += idB.Length;
             Buffer.BlockCopy(dataB, 0, pk, off, dataB.Length);
             SteamManager.Instance?.SendPacket(SteamNetwork.RemoteID, pk);
-            Multiplayer.Log?.LogInfo($"[GARDEN] грядка uid={uid} obj={objId} — синк стану (json={dataB.Length}б)");
+            Multiplayer.Log?.LogInfo($"[GARDEN] грядка uid={uid} obj={objId} — синк стану (json={dataB.Length}б, growing={ReadGrowing(wgo):F3})");
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[GARDEN] send: {e.Message}"); }
     }
 
-    public static void ApplyRemoteGardenState(byte[] data)
+    // Повертає true, якщо грядку-ціль ЗНАЙДЕНО (стан застосовано best-effort, з черги прибрати);
+    // false — fail-open (об'єкт ще не завантажений → у чергу ретраю). fromRetry гасить повторне
+    // чергування під час самого ретраю. DIAG: логуємо growing (Етап 2 — заміряти детермінізм росту).
+    public static bool ApplyRemoteGardenState(byte[] data, bool fromRetry = false)
     {
         try
         {
-            if (data.Length < 19) return;
+            if (data.Length < 19) return true;   // биті дані — з черги геть
             long uid  = BitConverter.ToInt64(data, 1);
             float x   = BitConverter.ToSingle(data, 9);
             float y   = BitConverter.ToSingle(data, 13);
             int idLen = BitConverter.ToUInt16(data, 17);
-            if (19 + idLen > data.Length) return;
+            if (19 + idLen > data.Length) return true;
             string objId = System.Text.Encoding.UTF8.GetString(data, 19, idLen);
             int jsonOff  = 19 + idLen;
             string json  = System.Text.Encoding.UTF8.GetString(data, jsonOff, data.Length - jsonOff);
             EnsureReflection();
-            if (!GraveStateReflectionReady()) return;
+            if (!GraveStateReflectionReady()) return false;   // рефлексія не готова — спробувати ще
 
             var target = FindWgoByUniqueId(uid);
             if (target == null)
             {
                 target = FindTargetNear(x, y, out float dist, IsGardenTarget);
-                if (target == null || dist > POSITION_EPSILON)
-                {
-                    Multiplayer.Log?.LogWarning($"[GARDEN] 0x21 uid={uid} obj={objId} не знайдено (fail-open)");
-                    return;
-                }
+                if (target != null && dist > POSITION_EPSILON) target = null;
+            }
+            if (target == null)
+            {
+                // Гонка 0x15/0x21 при будівництві АБО поза-зонна грядка → у чергу, ретрай із таймера.
+                if (!fromRetry) EnqueuePendingGarden(uid, data);
+                Multiplayer.Log?.LogWarning($"[GARDEN] 0x21 uid={uid} obj={objId} не знайдено → {(fromRetry ? "ще чекає" : "у чергу ретраю")}");
+                return false;
             }
 
             ApplyingRemoteGarden = true;
             try
             {
                 var sw = _fromWgoMethod.Invoke(null, new object[] { target });
-                if (sw == null || _fromJsonOverwriteMethod == null) return;
-                var item = _swItemField.GetValue(sw);
-                if (item != null) _fromJsonOverwriteMethod.Invoke(null, new object[] { json, item });
-                else
+                if (sw != null && _fromJsonOverwriteMethod != null)
                 {
-                    var d = _dataField.GetValue(target);
-                    if (d == null) return;
-                    _fromJsonOverwriteMethod.Invoke(null, new object[] { json, d });
-                    _swItemField.SetValue(sw, d);
+                    var item = _swItemField.GetValue(sw);
+                    if (item != null) _fromJsonOverwriteMethod.Invoke(null, new object[] { json, item });
+                    else
+                    {
+                        var d = _dataField.GetValue(target);
+                        if (d != null)
+                        {
+                            _fromJsonOverwriteMethod.Invoke(null, new object[] { json, d });
+                            _swItemField.SetValue(sw, d);
+                        }
+                    }
+                    if (!string.IsNullOrEmpty(objId)) _swObjIdField.SetValue(sw, objId);
+                    _restoreFromSerializedMethod.Invoke(target, new object[] { sw, false });
+                    if (_redrawMethod != null)
+                        try { _redrawMethod.Invoke(target, new object[] { true, false, false }); } catch { }
+                    _lastSentGardenJson[uid] = json;   // не ехоємо назад
+                    _lastGardenObjId[uid] = objId;
+                    Multiplayer.Log?.LogInfo($"[GARDEN] грядка uid={uid} obj={objId} стан застосовано ✓ (json={json.Length}ch, growing={ReadGrowing(target):F3})");
                 }
-                if (!string.IsNullOrEmpty(objId)) _swObjIdField.SetValue(sw, objId);
-                _restoreFromSerializedMethod.Invoke(target, new object[] { sw, false });
-                if (_redrawMethod != null)
-                    try { _redrawMethod.Invoke(target, new object[] { true, false, false }); } catch { }
-                _lastSentGardenJson[uid] = json;   // не ехоємо назад
-                _lastGardenObjId[uid] = objId;
-                Multiplayer.Log?.LogInfo($"[GARDEN] грядка uid={uid} obj={objId} стан застосовано ✓ (json={json.Length}ch)");
             }
             finally { ApplyingRemoteGarden = false; }
+            return true;   // ціль знайдено — з черги прибрати
         }
-        catch (Exception e) { Multiplayer.Log?.LogWarning($"[GARDEN] 0x21 apply: {e.Message}"); }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[GARDEN] 0x21 apply: {e.Message}"); return true; }
     }
 
     // Хост-авторитарний reconcile росту: періодично шле стан кожної грядки (json-дедуп →
@@ -7531,6 +7576,53 @@ public static class ChopSync
     public static void ResetGardenSync()
     {
         _lastSentGardenJson.Clear(); _lastGardenObjId.Clear(); _gardenSyncTimer = 0f;
+        _pendingGardens.Clear();
+    }
+
+    // growing-параметр грядки (для DIAG Етапу 2: заміряти, чи ріст детермінований від часу).
+    private static float ReadGrowing(MonoBehaviour wgo)
+    {
+        try { return _getParamMethod != null ? Convert.ToSingle(_getParamMethod.Invoke(wgo, new object[] { "growing", 0f })) : -1f; }
+        catch { return -1f; }
+    }
+
+    // Ретрай fail-open 0x21 (Етап 2 фіксу города 2026-06-16): пакет стану грядки прилетів ДО того,
+    // як ціль завантажилась (гонка з 0x15 при будівництві АБО поза-зонна грядка) → у чергу,
+    // повторюємо з 2с-таймера, поки об'єкт не з'явиться. Дедуп по uid: свіжіший стан заміняє старий.
+    private class PendingGarden { public long uid; public byte[] data; }
+    private static readonly List<PendingGarden> _pendingGardens = new List<PendingGarden>();
+    private const int PENDING_GARDEN_MAX = 128;
+
+    private static void EnqueuePendingGarden(long uid, byte[] data)
+    {
+        var existing = _pendingGardens.FirstOrDefault(p => p.uid == uid);
+        if (existing != null) { existing.data = data; return; }   // свіжіший стан тієї ж грядки
+        if (_pendingGardens.Count < PENDING_GARDEN_MAX)
+            _pendingGardens.Add(new PendingGarden { uid = uid, data = data });
+    }
+
+    // 0x15 (постановка garden_*_place) інвалідує preview-стан garden_empty у черзі ретраю: DoPlace
+    // робить ReplaceWithObject(obj_id+"_place") (декомпіл 44018), тож floating-превʼю грядки має
+    // obj_id garden_empty, і наш тригер шле його ПЕРЕД 0x15. Без цього ретрай застосував би empty
+    // поверх свіжого каркаса → «грядка ставиться вже вскопаною». Реальне докопування пришле
+    // garden_empty ПІСЛЯ 0x15 (reliable+ordered), тож каркас доживе до справжнього копання.
+    public static void InvalidatePendingGarden(long uid)
+    {
+        _pendingGardens.RemoveAll(p => p.uid == uid);
+    }
+
+    // З SteamManager.Update (таймер ретраїв, раз на 2с): зона/0x15 довантажились → застосувати.
+    public static void RetryPendingGardens()
+    {
+        for (int i = _pendingGardens.Count - 1; i >= 0; i--)
+        {
+            long uid = _pendingGardens[i].uid;
+            if (ApplyRemoteGardenState(_pendingGardens[i].data, fromRetry: true))
+            {
+                Multiplayer.Log?.LogInfo($"[GARDEN] 0x21-ретрай: грядка uid={uid} застосовано ✓");
+                _pendingGardens.RemoveAt(i);
+            }
+        }
     }
 
     // ── Прийом 0x0D: реплікація стану могили через item_data ─────────────────────
