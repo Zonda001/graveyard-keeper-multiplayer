@@ -1603,6 +1603,14 @@ public static class SteamNetwork
     public static bool IsClientMode = false;
     public static ulong LobbyID = 0;
     public static ulong RemoteID = 0;
+    // Версія МЕРЕЖЕВОГО протоколу — звіряється на конекті: клієнт несе її в 0x01, хост відмовляє
+    // пакетом 0x22 при розбіжності (інакше різні білди моду тихо десинкаються). ПІДВИЩУВАТИ ПРИ
+    // БУДЬ-ЯКІЙ ЗМІНІ ФОРМАТУ ПАКЕТА. Окреме від BepInPlugin-версії ("1.0.0").
+    public const int PROTOCOL_VERSION = 1;
+    // Виділений слот кооп-сейву клієнта: пишемо сюди сейв хоста, слоти юзера (0-3 тощо) не чіпаємо.
+    // "999999" безпечне — гра нумерує слоти ЛИШЕ 0..1000 (GetNewSlotFilename, декомпіл 102766), тож
+    // не колізить НАВІТЬ якщо cleanup не спрацює (краш). Прибирається в SteamManager.OnApplicationQuit.
+    public const string CoopSaveSlot = "999999";
     public static bool IsConnected => Role != NetworkRole.None && RemoteID != 0;
     public static bool IsInGame = false;
     public static bool IsLoadingAsClient = false;
@@ -2440,6 +2448,24 @@ public class SteamManager : MonoBehaviour
     private int    _saveBufferExpectedSize;
     private int    _saveChunksReceived;
     private Vector3 _hostSpawnPosition = Vector3.zero;
+    private bool    _coopSaveWritten;   // ми записали кооп-сейв у CoopSaveSlot цієї сесії → прибрати на виході
+
+    // Клієнт пише сейв хоста в окремий слот CoopSaveSlot. На виході з гри прибираємо .dat+.info,
+    // щоб не лишати «сміттєвий» слот у меню завантаження (гра створює .info при автозбереженні).
+    // Гейт _coopSaveWritten: чистимо ЛИШЕ те, що самі записали (юзерські слоти недоторкані).
+    private void OnApplicationQuit()
+    {
+        if (!_coopSaveWritten) return;
+        foreach (var ext in new[] { ".dat", ".info" })
+        {
+            try
+            {
+                var p = System.IO.Path.Combine(Application.persistentDataPath, SteamNetwork.CoopSaveSlot + ext);
+                if (System.IO.File.Exists(p)) { System.IO.File.Delete(p); _logger.LogInfo($"[CLIENT] Кооп-слот прибрано: {p} ✓"); }
+            }
+            catch (Exception e) { _logger.LogWarning($"[CLIENT] Очистка кооп-слота {ext} не вдалась: {e.Message}"); }
+        }
+    }
 
     private void OnPacketReceived(byte[] data)
     {
@@ -2459,7 +2485,28 @@ public class SteamManager : MonoBehaviour
         if (type == 0x01)
         {
             if (SteamNetwork.Role == NetworkRole.Host)
+            {
+                // Звірка версії протоколу ПЕРЕД сейвом. Legacy 0x01 без поля (1 байт) → version 0 →
+                // теж розбіжність (старий клієнт чесно відсіюється). Збіг → шлемо сейв як раніше.
+                int clientVer = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : 0;
+                if (clientVer != SteamNetwork.PROTOCOL_VERSION)
+                {
+                    var rej = new byte[5];
+                    rej[0] = 0x22;
+                    System.Buffer.BlockCopy(System.BitConverter.GetBytes(SteamNetwork.PROTOCOL_VERSION), 0, rej, 1, 4);
+                    SendPacket(SteamNetwork.RemoteID, rej);
+                    _logger.LogError($"[VERSION] Клієнт protocol v{clientVer} ≠ хост v{SteamNetwork.PROTOCOL_VERSION} — сейв НЕ надіслано. Обом потрібна та сама версія моду.");
+                    return;
+                }
                 StartCoroutine(SendSaveToClient());
+            }
+        }
+        else if (type == 0x22)
+        {
+            // Хост відмовив через розбіжність версій — НЕ вантажимо сейв (інакше тихий десинк).
+            int hostVer = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : 0;
+            SteamNetwork.IsLoadingAsClient = false;
+            _logger.LogError($"[VERSION] НЕСУМІСНІСТЬ: у тебе protocol v{SteamNetwork.PROTOCOL_VERSION}, у хоста v{hostVer}. Оновіть мод до ОДНАКОВОЇ версії в обох. Приєднання скасовано.");
         }
         else if (type == 0x02)
         {
@@ -3263,9 +3310,16 @@ public class SteamManager : MonoBehaviour
 
         _logger.LogInfo($"[CLIENT] Завантажуємо сейв від хоста ({binary.Length} байт)");
 
-        var savePath = System.IO.Path.Combine(Application.persistentDataPath, "3.dat");
+        // Кооп-сейв вантажиться в ОКРЕМИЙ слот SteamNetwork.CoopSaveSlot ("999999"), якого гра НІКОЛИ
+        // не створює сама (GetNewSlotFilename нумерує лише 0..1000, декомпіл 102766) → слоти юзера
+        // (0-3 тощо) НЕДОТОРКАНІ. Гра вантажить {filename_no_extension}.dat із GetSaveFolder()=
+        // persistentDataPath (декомпіл 102674/102752), тож пишемо рівно туди й ставимо ТЕ САМЕ імʼя
+        // в filename_no_extension нижче. Прибирається в OnApplicationQuit (Zonda 2026-06-17: окремий
+        // слот + cleanup на виході, щоб не лишати мусор).
+        var savePath = System.IO.Path.Combine(Application.persistentDataPath, SteamNetwork.CoopSaveSlot + ".dat");
         System.IO.File.WriteAllBytes(savePath, binary);
-        _logger.LogInfo($"[CLIENT] Сейв записано: {savePath} ✓");
+        _coopSaveWritten = true;
+        _logger.LogInfo($"[CLIENT] Кооп-сейв у окремий слот {SteamNetwork.CoopSaveSlot}: {savePath} ✓");
 
         yield return new WaitForSeconds(0.3f);
 
@@ -3336,7 +3390,7 @@ public class SteamManager : MonoBehaviour
         // НЕ серіалізуємо сейв назад у файл через рефлексію. Round-trip
         // GameSave.FromBinary → ToBinary втрачав DLC-обʼєкти (табір біженців):
         // сейв роздувався на ~150 КБ, а RefugeesCampEngine.Init() падав з NRE
-        // → вічна загрузка в клієнта. 3.dat лишається сирими байтами хоста
+        // → вічна загрузка в клієнта. Окремий кооп-слот 999999.dat лишається сирими байтами хоста
         // (записані вище) — рівно той сейв, що завантажує хост. Правки вище
         // лишаються на обʼєкті newSave (він іде в linked_save як запасний шлях);
         // на випадок завантаження з файлу їх доганяє пост-завантажувальна
@@ -3347,7 +3401,7 @@ public class SteamManager : MonoBehaviour
 
         var saveSlotDataType = AccessTools.TypeByName("SaveSlotData");
         var slotData = System.Activator.CreateInstance(saveSlotDataType);
-        saveSlotDataType.GetField("filename_no_extension", flags)?.SetValue(slotData, "3");
+        saveSlotDataType.GetField("filename_no_extension", flags)?.SetValue(slotData, SteamNetwork.CoopSaveSlot);
         saveSlotDataType.GetField("linked_save", flags)?.SetValue(slotData, newSave);
 
         foreach (var f in saveSlotDataType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
@@ -3474,8 +3528,13 @@ public class SteamManager : MonoBehaviour
     {
         yield return new WaitForSeconds(1f);
 
-        SendPacket(SteamNetwork.RemoteID, new byte[] { 0x01 });
-        _logger.LogInfo("[CLIENT] Запит сейву надіслано хосту ✓");
+        // 0x01 несе версію протоколу [0x01][int32]: хост звірить і відмовить (0x22) при розбіжності,
+        // інакше різні білди моду тихо десинкаються (критично для публічного релізу).
+        var req = new byte[5];
+        req[0] = 0x01;
+        System.Buffer.BlockCopy(System.BitConverter.GetBytes(SteamNetwork.PROTOCOL_VERSION), 0, req, 1, 4);
+        SendPacket(SteamNetwork.RemoteID, req);
+        _logger.LogInfo($"[CLIENT] Запит сейву надіслано хосту (protocol v{SteamNetwork.PROTOCOL_VERSION}) ✓");
     }
 
     private void FetchHostSteamID()
