@@ -5201,9 +5201,15 @@ public static class ChopSync
         if (!_ready || wgo == null) return false;
         var id = _objIdField.GetValue(wgo) as string;
         if (id == null) return false;
+        // Город — БЕЗ дублів луту (рішення Zonda 2026-06-17): плантабельні грядки й сади
+        // (garden_*, tree_apple_garden, bush_berry_garden) при зборі/саджанні НЕ копіюють лут
+        // напарнику. Збирач отримує врожай ЛОКАЛЬНО (гра сама робить DropItems); 0x0B-копію
+        // вимкнено → нуль дублів. Стан грядки далі веде 0x21. Дерева/камінь/колоди/глиби тут НЕ
+        // зачеплені — їх спільний лут лишається свідомо (кооп-робота кількох над одним обʼєктом).
+        if (IsGardenRelated(wgo)) return false;
         return id.StartsWith("tree") || id.StartsWith("stone") ||
                id.StartsWith("steep") || id.StartsWith("grave") ||
-               id.StartsWith("garden") || IsNatureGatherTarget(id) ||
+               IsNatureGatherTarget(id) ||
                IsWorkbench(wgo);   // Фаза 2 крафт: ручний крафт скидає вихід через DropItems на землю
                                    // (декомпіл 83249) — спільний лут реплеїть напарнику. Авто-крафт у
                                    // інвентар верстата йде окремо через 0x0D inv-hash.
