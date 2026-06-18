@@ -48,6 +48,14 @@ public static class PlayerControlPatch
             __result = false;
             return false;
         }
+        // Замок руху клієнта на час входу: PlayerControlIsDisabled — суто гравецький (декомпіл 81209,
+        // кличеться лише з UpdatePlayer/ProcessInteraction), тож форс true вимикає керування ТІЛЬКИ
+        // локальному гравцю (не NPC/клон). Прапор стоїть лише на клієнті під час завантаження.
+        if (SteamNetwork.ClientMovementLocked)
+        {
+            __result = true;
+            return false;
+        }
         return true;
     }
 }
@@ -1615,10 +1623,31 @@ public static class SteamNetwork
     public static bool IsInGame = false;
     public static bool IsLoadingAsClient = false;
     public static bool RemotePlayerSpawned = false;
+    // Замок руху локального КЛІЄНТА на час входу: true від старту завантаження до моменту, коли
+    // клієнт довантажився, телепортувався на хоста й хост його бачить (двосторонній лінк). Доки
+    // true — PlayerControlPatch тримає керування вимкненим, щоб клієнт не ходив ще невидимий хосту
+    // й потім не смикався телепортом. Лише клієнт (хост ніколи не вмикає).
+    public static bool ClientMovementLocked = false;
     // Час коли IsInGame став true — щоб заблокувати spurious Open() одразу після завантаження
     public static float IsInGameSince = -1f;
     // Скільки секунд після IsInGame блокуємо відкриття меню
     public const float MENU_BLOCK_DURATION = 15f;
+    // Час останнього СПРАВЖНЬОГО виходу гравця в меню (InGameMenuGUI.ReturnToMainMenu щойно
+    // викликано). Spurious Open() від game-loop під час ініціалізації НЕ проходить через
+    // ReturnToMainMenu → так відрізняємо реальний вихід від службового і не рубаємо легітимний
+    // вихід у перші MENU_BLOCK_DURATION секунд. Open() кличеться синхронно з ReturnToMainMenu.
+    public static float RealExitRequestedAt = -1f;
+
+    // Хост РЕАЛЬНО у завантаженому ігровому світі (а не на титулці/в меню). На титульному екрані
+    // MainGame.me.save/player ще null. КРИТИЧНО для хостингу: якщо хост відкриває лобі з меню й
+    // приймає клієнта зарано, клієнт вантажиться без валідної позиції в інтро-стан і шле свої
+    // туторіальні парами (lock_tp=1 тощо) назад по 0x1C → затирає хостовий світ (хост не може
+    // вийти з хати — «not yet»). Тому сейв/синк дозволяємо лише коли хост справді у світі.
+    public static bool HostInWorld()
+    {
+        try { return MainGame.me != null && MainGame.me.save != null && MainGame.me.player != null; }
+        catch { return false; }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2434,7 +2463,9 @@ public class SteamManager : MonoBehaviour
             // Хост вже в грі якщо RemoteID щойно встановлено — вмикаємо позиційний синк.
             // Не можна покладатись на OnGameStartedPlayingPatch бо він спрацьовує
             // ДО того як роль Host встановлена (F11 натискається після завантаження гри).
-            if (SteamNetwork.Role == NetworkRole.Host && !SteamNetwork.IsInGame)
+            // АЛЕ лише якщо хост РЕАЛЬНО у світі — інакше (лобі відкрито з меню) передчасний
+            // IsInGame=true вмикає ReadyToApply і хост починає вбирати інтро-парами клієнта.
+            if (SteamNetwork.Role == NetworkRole.Host && !SteamNetwork.IsInGame && SteamNetwork.HostInWorld())
             {
                 SteamNetwork.IsInGame = true;
                 SteamNetwork.IsInGameSince = UnityEngine.Time.time;
@@ -2498,6 +2529,15 @@ public class SteamManager : MonoBehaviour
                     _logger.LogError($"[VERSION] Клієнт protocol v{clientVer} ≠ хост v{SteamNetwork.PROTOCOL_VERSION} — сейв НЕ надіслано. Обом потрібна та сама версія моду.");
                     return;
                 }
+                // Хост мусить бути У СВІТІ, перш ніж слати сейв. Якщо лобі відкрито з меню/титулки —
+                // відхиляємо (0x23): інакше клієнт вантажиться без позиції в інтро-стан і його
+                // туторіальні парами (lock_tp=1 тощо) по 0x1C затирають хостовий світ.
+                if (!SteamNetwork.HostInWorld())
+                {
+                    SendPacket(SteamNetwork.RemoteID, new byte[] { 0x23 });
+                    _logger.LogError("[STEAM] Клієнт під'єднався, але хост ЩЕ НЕ у світі — сейв НЕ надіслано (0x23). Зайди у свій світ, тоді запрошуй знову.");
+                    return;
+                }
                 StartCoroutine(SendSaveToClient());
             }
         }
@@ -2507,6 +2547,14 @@ public class SteamManager : MonoBehaviour
             int hostVer = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : 0;
             SteamNetwork.IsLoadingAsClient = false;
             _logger.LogError($"[VERSION] НЕСУМІСНІСТЬ: у тебе protocol v{SteamNetwork.PROTOCOL_VERSION}, у хоста v{hostVer}. Оновіть мод до ОДНАКОВОЇ версії в обох. Приєднання скасовано.");
+        }
+        else if (type == 0x23)
+        {
+            // Хост відмовив, бо ще не зайшов у свій світ (відкрив лобі з меню). НЕ вантажимо нічого —
+            // інакше опинились би в інтро-стані й затерли б хостовий світ. Хост зайде у світ і
+            // запросить знову.
+            SteamNetwork.IsLoadingAsClient = false;
+            _logger.LogError("[JOIN] Хост ще НЕ у своєму світі — приєднання скасовано. Нехай хост спершу зайде у свій світ, тоді запросить знову.");
         }
         else if (type == 0x02)
         {
@@ -3254,6 +3302,11 @@ public class SteamManager : MonoBehaviour
                 // який би їх увімкнув → форсимо (інакше друг не бачить дощ/туман).
                 ChopSync.ForceWeatherStatesEnabledOutside();
 
+                // Розблокувати рух — але лише коли хост побачить клієнта (двосторонній лінк). Окрема
+                // корутина, бо тут try/catch (yield return в try заборонено). Телепорт на хоста вже
+                // стався вище, тож клієнт стоїть на місці хоста до розблокування — без смикання.
+                StartCoroutine(ReleaseClientLockWhenSeen());
+
                 yield break;
             }
             catch (Exception e)
@@ -3262,7 +3315,25 @@ public class SteamManager : MonoBehaviour
             }
         }
 
-        _logger.LogError("[UNLOCK] Timeout! Гравець може бути заблокований.");
+        // Fail-open: усі спроби провалились — НЕ лишаємо клієнта замкненим (краще без телепорту,
+        // ніж заморожений назавжди).
+        SteamNetwork.ClientMovementLocked = false;
+        _logger.LogError("[UNLOCK] Timeout! Рух розблоковано примусово (fail-open).");
+    }
+
+    // Тримаємо клієнта замкненим, поки не підтвердимо, що хост його бачить. Прямого ACK нема, тож
+    // проксі = RemotePlayerSpawned (ми отримали 0x06 хоста → конект двосторонній, хост у грі й
+    // отримує нашу позицію теж). Fail-open 10с, щоб не зависнути замкненим, якщо пакети хоста не йдуть.
+    private IEnumerator ReleaseClientLockWhenSeen()
+    {
+        float waited = 0f;
+        while (!SteamNetwork.RemotePlayerSpawned && waited < 10f)
+        {
+            waited += 0.25f;
+            yield return new WaitForSeconds(0.25f);
+        }
+        SteamNetwork.ClientMovementLocked = false;
+        _logger.LogInfo($"[UNLOCK] Рух клієнта розблоковано (хост бачить={SteamNetwork.RemotePlayerSpawned}, чекали {waited:F1}с) ✓");
     }
 
     private IEnumerator HideMenuUntilInGame()
@@ -3526,6 +3597,24 @@ public class SteamManager : MonoBehaviour
 
     private IEnumerator LoadGameAsClient()
     {
+        // Замикаємо рух клієнта на весь вхід: гра розблокує керування рано (по завантаженню сцени),
+        // а телепорт на хоста + поява в хоста — пізніше (UnlockPlayerAfterLoad). Без замка клієнт
+        // ходить ще невидимий хосту й потім смикається на хоста. _unlockAlreadyDone скидаємо, щоб на
+        // реконекті розблокування відпрацювало знову (інакше клієнт лишився б замкненим назавжди).
+        SteamNetwork.ClientMovementLocked = true;
+        _unlockAlreadyDone = false;
+
+        // RE-JOIN: вихід «у меню» в GK — це GUI-оверлей (MainMenuGUI.Open) поверх ще завантаженої
+        // ігрової сцени, активна сцена НЕ міняється → activeSceneChanged-скид (де обнуляються ці
+        // гарди) НЕ фаєриться. Тому при повторному заході без перезапуску гри StartPlayingGame-гард
+        // лишався true й блокував справжній спавн гравця → клієнт висів на завантаженні
+        // (HideMenuUntilInGame timeout). Скидаємо сесійні гарди ТУТ — у канонічній точці (пере)заходу,
+        // дзеркало меню-хендлера. Безпечно й для першого заходу (усі прапори там і так свіжі).
+        StartPlayingGameGuardPatch.AlreadyStarted = false;
+        OnGameStartedPlayingPatch.Reset();
+        SteamNetwork.RemotePlayerSpawned = false;
+        ChopSync.Reset();
+
         yield return new WaitForSeconds(1f);
 
         // 0x01 несе версію протоколу [0x01][int32]: хост звірить і відмовить (0x22) при розбіжності,
@@ -3896,9 +3985,15 @@ public static class MainMenuGUIOpenPatch
         {
             float timeSinceInGame = UnityEngine.Time.time - SteamNetwork.IsInGameSince;
 
-            // Перші MENU_BLOCK_DURATION секунд після входу в гру — блокуємо
-            // spurious Open() що викликається game loop під час ініціалізації.
-            if (timeSinceInGame < SteamNetwork.MENU_BLOCK_DURATION)
+            // СПРАВЖНІЙ вихід (гравець натиснув «вийти в меню» → InGameMenuGUI.ReturnToMainMenu
+            // щойно фаєрнув) — пропускаємо ЗАВЖДИ, навіть у вікні MENU_BLOCK_DURATION. Без цього
+            // швидкий вихід у перші 15с рубався як spurious і клієнт застрягав у світі.
+            bool realExit = SteamNetwork.RealExitRequestedAt > 0f &&
+                            (UnityEngine.Time.time - SteamNetwork.RealExitRequestedAt) < 2f;
+
+            // Перші MENU_BLOCK_DURATION секунд після входу — блокуємо spurious Open() від game
+            // loop під час ініціалізації (вони НЕ йдуть через ReturnToMainMenu).
+            if (!realExit && timeSinceInGame < SteamNetwork.MENU_BLOCK_DURATION)
             {
                 Multiplayer.Log?.LogInfo($"[CLIENT] MainMenuGUI.Open заблоковано (spurious, t={timeSinceInGame:F1}с) ✓");
                 return false;
@@ -3909,9 +4004,10 @@ public static class MainMenuGUIOpenPatch
             // 0x11 встигає полетіти напарнику; spurious-кейси відсіяні вище).
             ChopSync.DropOverheadOnExit();
             // Скидаємо IsInGame і дозволяємо меню відкритись.
-            Multiplayer.Log?.LogInfo($"[CLIENT] MainMenuGUI.Open дозволено (вихід гравця, t={timeSinceInGame:F1}с)");
+            Multiplayer.Log?.LogInfo($"[CLIENT] MainMenuGUI.Open дозволено (вихід гравця, t={timeSinceInGame:F1}с, real={realExit})");
             SteamNetwork.IsInGame = false;
             SteamNetwork.IsInGameSince = -1f;
+            SteamNetwork.RealExitRequestedAt = -1f;
         }
         else if (!SteamNetwork.IsClientMode && SteamNetwork.IsInGame && SteamNetwork.IsConnected)
         {
@@ -3920,6 +4016,22 @@ public static class MainMenuGUIOpenPatch
         }
 
         return true;
+    }
+}
+
+// Маркер СПРАВЖНЬОГО виходу гравця в меню. InGameMenuGUI.ReturnToMainMenu (декомпіл 60391)
+// кличеться ЛИШЕ коли гравець обрав «вийти в меню» з паузи → одразу зве main_menu.Open().
+// Spurious Open() від game-loop під час ініціалізації сюди НЕ заходить. MainMenuGUIOpenPatch
+// читає цей маркер, щоб не зарубати швидкий легітимний вихід у вікні MENU_BLOCK_DURATION.
+[HarmonyPatch]
+public static class InGameMenuReturnPatch
+{
+    static MethodBase TargetMethod() =>
+        AccessTools.Method(AccessTools.TypeByName("InGameMenuGUI"), "ReturnToMainMenu");
+
+    static void Prefix()
+    {
+        SteamNetwork.RealExitRequestedAt = UnityEngine.Time.time;
     }
 }
 
