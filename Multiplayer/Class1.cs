@@ -2498,6 +2498,46 @@ public class SteamManager : MonoBehaviour
         }
     }
 
+    private static void NoOpDelegate() { }
+
+    // Показати клієнту НА ЕКРАНІ, чому приєднання скасовано (а не лише в лозі) — щоб не думав, що
+    // це баг мода. Клієнт у момент відмови на титулці/в меню (персонажа для бабла нема), тож
+    // використовуємо ігровий діалог GUIElements.me.dialog (DialogGUI, доступний і в меню).
+    // Через рефлексію: тип кнопкового делегата DialogGUI.Open — GJCommons.VoidDelegate з
+    // Assembly-CSharp-firstpass, яку НЕ реферимо (її глобальні типи колізять із нашим класом
+    // SteamManager → CS0436). Делегат будуємо динамічно під тип параметра. Текст іде через
+    // GJL.L (локалізація); на невідомому ключі GK повертає сам рядок.
+    private void ShowJoinError(string message)
+    {
+        try
+        {
+            var guiType = AccessTools.TypeByName("GUIElements");
+            var me = guiType?.GetProperty("me", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var dialog = me?.GetType().GetField("dialog", BindingFlags.Public | BindingFlags.Instance)?.GetValue(me);
+            if (dialog == null) { _logger.LogWarning("[JOIN] Діалог недоступний — повідомлення лише в лозі"); return; }
+
+            var openM = dialog.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "Open" && m.GetParameters().Length >= 3 &&
+                                     m.GetParameters()[0].ParameterType == typeof(string) &&
+                                     m.GetParameters()[1].ParameterType == typeof(string));
+            if (openM == null) { _logger.LogWarning("[JOIN] DialogGUI.Open не знайдено — повідомлення лише в лозі"); return; }
+
+            var ps = openM.GetParameters();
+            var noop = Delegate.CreateDelegate(ps[2].ParameterType,
+                typeof(SteamManager).GetMethod("NoOpDelegate", BindingFlags.NonPublic | BindingFlags.Static));
+
+            var args = new object[ps.Length];
+            args[0] = message;
+            args[1] = "OK";
+            args[2] = noop;
+            for (int i = 3; i < ps.Length; i++)
+                args[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
+
+            openM.Invoke(dialog, args);
+        }
+        catch (Exception e) { _logger.LogWarning($"[JOIN] Показ повідомлення впав: {e.Message}"); }
+    }
+
     private void OnPacketReceived(byte[] data)
     {
         byte type = data[0];
@@ -2547,6 +2587,7 @@ public class SteamManager : MonoBehaviour
             int hostVer = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : 0;
             SteamNetwork.IsLoadingAsClient = false;
             _logger.LogError($"[VERSION] НЕСУМІСНІСТЬ: у тебе protocol v{SteamNetwork.PROTOCOL_VERSION}, у хоста v{hostVer}. Оновіть мод до ОДНАКОВОЇ версії в обох. Приєднання скасовано.");
+            ShowJoinError("Mod version mismatch between players. Join cancelled.\nInstall the SAME mod version on both, then try again.");
         }
         else if (type == 0x23)
         {
@@ -2555,6 +2596,7 @@ public class SteamManager : MonoBehaviour
             // запросить знову.
             SteamNetwork.IsLoadingAsClient = false;
             _logger.LogError("[JOIN] Хост ще НЕ у своєму світі — приєднання скасовано. Нехай хост спершу зайде у свій світ, тоді запросить знову.");
+            ShowJoinError("The host hasn't entered their world yet. Join cancelled.\nAsk them to enter the game, then join again.\n\n(This is not a mod bug.)");
         }
         else if (type == 0x02)
         {
