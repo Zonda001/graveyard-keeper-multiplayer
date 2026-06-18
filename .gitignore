@@ -8,8 +8,9 @@ riderModule.iml
 .idea/
 *.DotSettings.user
 
-# Claude Code — локальні файли
-.claude/settings.local.json
+# Claude Code / локальний інструментарій — не в git
+.claude/
+.remember/
 memory/
 
 # Логи
