@@ -305,6 +305,35 @@ public class Multiplayer : BaseUnityPlugin
     private float _p1MissingTimer = 0f;
     private const float P1_MISSING_THRESHOLD = 2f;
 
+    // Версія мода в кутку меню/титулки — щоб гравці бачили, яку версію запущено (і легше
+    // діагностували розбіжність версій, що блокує приєднання). Лише поза грою (IsInGame=false):
+    // у грі ховаємо, щоб не заважало. Версія = BepInPlugin metadata + номер протоколу (саме
+    // протокол має збігатись між гравцями).
+    private GUIStyle _versionStyle;
+    private string _versionLabel;
+
+    void OnGUI()
+    {
+        if (SteamNetwork.IsInGame) return;
+
+        if (_versionLabel == null)
+            _versionLabel = $"Co-op Multiplayer  v{Info.Metadata.Version}  ·  protocol {SteamNetwork.PROTOCOL_VERSION}";
+
+        if (_versionStyle == null)
+        {
+            _versionStyle = new GUIStyle(GUI.skin.label) { fontSize = 15, fontStyle = FontStyle.Bold };
+            _versionStyle.normal.textColor = new Color(1f, 1f, 1f, 0.65f);
+        }
+
+        // Тінь для читабельності на будь-якому фоні + сам текст, лівий нижній кут.
+        var rect = new Rect(14f, Screen.height - 30f, 700f, 26f);
+        var shadow = _versionStyle.normal.textColor;
+        _versionStyle.normal.textColor = new Color(0f, 0f, 0f, 0.5f);
+        GUI.Label(new Rect(rect.x + 1f, rect.y + 1f, rect.width, rect.height), _versionLabel, _versionStyle);
+        _versionStyle.normal.textColor = shadow;
+        GUI.Label(rect, _versionLabel, _versionStyle);
+    }
+
     void Update()
     {
         if (player != null && !_hadPlayer2)
