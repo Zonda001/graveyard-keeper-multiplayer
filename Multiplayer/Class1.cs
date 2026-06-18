@@ -48,9 +48,10 @@ public static class PlayerControlPatch
             __result = false;
             return false;
         }
-        // Замок руху клієнта на час входу: PlayerControlIsDisabled — суто гравецький (декомпіл 81209,
-        // кличеться лише з UpdatePlayer/ProcessInteraction), тож форс true вимикає керування ТІЛЬКИ
-        // локальному гравцю (не NPC/клон). Прапор стоїть лише на клієнті під час завантаження.
+        // Client movement lock during join: PlayerControlIsDisabled is purely player-side
+        // (decompile 81209, called only from UpdatePlayer/ProcessInteraction), so forcing true
+        // disables control ONLY for the local player (not NPC/clone). The flag is set on the
+        // client during loading only.
         if (SteamNetwork.ClientMovementLocked)
         {
             __result = true;
@@ -140,16 +141,16 @@ public static class SmartAnimPatch
             _p2RootCache = MultiplayerState.Player2.transform;
         }
 
-        // Порівнюємо кореневий transform напряму — без GetComponentInParent
+        // Compare the root transform directly — no GetComponentInParent
         return __instance.transform.root != _p2RootCache;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Дубль-гравець на клієнті: SaveSlotsMenuGUI.StartPlayingGame викликається двічі —
-// наш кастомний флоу завантаження сейву хоста накладається на природний флоу гри.
-// Кожен виклик спавнить окремий Player(Clone). Блокуємо всі виклики після першого
-// в межах сесії клієнта. Прапор скидається при переході в меню.
+// Duplicate player on the client: SaveSlotsMenuGUI.StartPlayingGame is called twice —
+// our custom host-save load flow overlaps the game's natural flow. Each call spawns a
+// separate Player(Clone). Block every call after the first within the client session.
+// The flag is reset on the transition to the menu.
 // ─────────────────────────────────────────────────────────────────────────────
 [HarmonyPatch]
 static class StartPlayingGameGuardPatch
@@ -184,7 +185,7 @@ public class Multiplayer : BaseUnityPlugin
     private bool showPosition = false;
     public static Multiplayer Instance;
     
-    // Клон іншого гравця (remote) — існує на обох сторонах
+    // The other player's clone (remote) — exists on both sides
     private GameObject _remotePlayerGO;
 
     private float logTimer = 0f;
@@ -195,9 +196,9 @@ public class Multiplayer : BaseUnityPlugin
         Log = Logger;
         Instance = this;
 
-        // Без цього Unity зупиняє весь ігровий цикл, коли вікно гри неактивне —
-        // мод перестає слати/приймати пакети, і синк «замерзає» для гравця, що
-        // перемкнувся в інше вікно. З runInBackground цикл працює завжди.
+        // Without this Unity halts the whole game loop when the window is inactive —
+        // the mod stops sending/receiving packets and sync "freezes" for a player who
+        // switched to another window. With runInBackground the loop always runs.
         Application.runInBackground = true;
 
         try
@@ -215,9 +216,9 @@ public class Multiplayer : BaseUnityPlugin
                 }
             }
             Logger.LogInfo("[MP] PatchAll успішно ✓");
-            // МАРКЕР ЗБІРКИ: перший рядок, який перевіряємо в кожному лайв-лозі — щоб «гра
-            // крутить стару DLL з памʼяті» більше ніколи не зʼїдало тест (інцидент 2026-06-11:
-            // дві сесії тестували попередню збірку, бо гру не перезапустили після деплою).
+            // BUILD MARKER: the first line we check in every live log — so "the game runs an
+            // old DLL from memory" never eats a test again (incident 2026-06-11: two sessions
+            // tested the previous build because the game wasn't restarted after deploy).
             Logger.LogInfo($"[MP] BUILD: {System.IO.File.GetLastWriteTime(System.Reflection.Assembly.GetExecutingAssembly().Location):yyyy-MM-dd HH:mm:ss}");
 
             var tutType = AccessTools.TypeByName("TutorialGUI");
@@ -263,9 +264,9 @@ public class Multiplayer : BaseUnityPlugin
             Logger.LogInfo($"[MP] PlayerControlIsDisabled патчів: prefixes={patches1?.Prefixes?.Count ?? 0}");
         }
 
-        // Application.logMessageReceived видалено — викликається для КОЖНОГО
-        // exception включаючи SimplifiedWGO.Restore що кидає кожен кадр.
-        // Тепер exceptions заглушуються через Harmony Finalizer напряму.
+        // Application.logMessageReceived removed — it fired for EVERY exception,
+        // including SimplifiedWGO.Restore which throws every frame.
+        // Exceptions are now silenced via a Harmony Finalizer directly.
 
         SceneManager.sceneLoaded += (scene, mode) =>
         {
@@ -288,10 +289,10 @@ public class Multiplayer : BaseUnityPlugin
                 SteamNetwork.Role = NetworkRole.None;
                 SteamNetwork.LobbyID = 0;
                 SteamNetwork.RemoteID = 0;
-                // ── Фаза 3: скидаємо клон при зміні сцени ──────────────────
+                // ── Phase 3: reset the clone on scene change ──────────────────
                 SteamNetwork.RemotePlayerSpawned = false;
                 _remotePlayerGO = null;
-                // Скидаємо guards для наступної сесії
+                // Reset guards for the next session
                 SteamManager._unlockAlreadyDone = false;
                 OnGameStartedPlayingPatch.Reset();
                 StartPlayingGameGuardPatch.AlreadyStarted = false;
@@ -305,10 +306,10 @@ public class Multiplayer : BaseUnityPlugin
     private float _p1MissingTimer = 0f;
     private const float P1_MISSING_THRESHOLD = 2f;
 
-    // Версія мода в кутку меню/титулки — щоб гравці бачили, яку версію запущено (і легше
-    // діагностували розбіжність версій, що блокує приєднання). Лише поза грою (IsInGame=false):
-    // у грі ховаємо, щоб не заважало. Версія = BepInPlugin metadata + номер протоколу (саме
-    // протокол має збігатись між гравцями).
+    // Mod version in the menu/title corner — so players can see which version is running
+    // (and more easily diagnose the version mismatch that blocks joining). Only outside the
+    // game (IsInGame=false): hidden in-game so it doesn't get in the way. Version = BepInPlugin
+    // metadata + protocol number (it's the protocol that must match between players).
     private GUIStyle _versionStyle;
     private string _versionLabel;
 
@@ -325,7 +326,7 @@ public class Multiplayer : BaseUnityPlugin
             _versionStyle.normal.textColor = new Color(1f, 1f, 1f, 0.65f);
         }
 
-        // Тінь для читабельності на будь-якому фоні + сам текст, лівий нижній кут.
+        // Shadow for readability on any background + the text itself, bottom-left corner.
         var rect = new Rect(14f, Screen.height - 30f, 700f, 26f);
         var shadow = _versionStyle.normal.textColor;
         _versionStyle.normal.textColor = new Color(0f, 0f, 0f, 0.5f);
