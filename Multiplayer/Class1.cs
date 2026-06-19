@@ -3287,6 +3287,11 @@ public class SteamManager : MonoBehaviour
         }
         _unlockAlreadyDone = true;
 
+        // Варіант A: накладаємо персонаж-шар ОКРЕМОЮ корутиною, що стартує негайно й застосовує
+        // overlay щойно інвентар готовий+стабільний — не чекаючи пауз нижче (косметичний UX-фікс
+        // затримки). Пізній виклик у кінці цього методу — фолбек (гард OverlayDone).
+        StartCoroutine(OverlayClientCharacterASAP());
+
         yield return new WaitForSeconds(5f);
 
         var iFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
@@ -3384,8 +3389,14 @@ public class SteamManager : MonoBehaviour
                 // стався вище, тож клієнт стоїть на місці хоста до розблокування — без смикання.
                 StartCoroutine(ReleaseClientLockWhenSeen());
 
-                // M1: накласти персонаж-шар клієнта поверх світу хоста (інвентар/гроші/стати/toolbar),
-                // зберігши світові прапори хоста. Перший захід = клон хоста + зберегти базу.
+                // M1: періодичний автосейв персонажа клієнта, поки він у грі. Хуки виходу (меню /
+                // OnApplicationQuit) НЕнадійні самі по собі: повний quit/Alt+F4/краш можуть не дати
+                // зберегтись. Автосейв = втрата щонайбільше ~хвилину, як автосейв самої гри.
+                StartCoroutine(AutosaveClientCharacter());
+
+                // M1 ФОЛБЕК: якщо ASAP-корутина (старт угорі) ще не наклала персонаж-шар (інвентар
+                // не стабілізувався вчасно), накладаємо тут наприкінці. Гард OverlayDone не дасть
+                // подвоїти, якщо ранній виклик уже спрацював.
                 ClientCharacterStore.Overlay();
 
                 yield break;
@@ -3415,6 +3426,79 @@ public class SteamManager : MonoBehaviour
         }
         SteamNetwork.ClientMovementLocked = false;
         _logger.LogInfo($"[UNLOCK] Рух клієнта розблоковано (хост бачить={SteamNetwork.RemotePlayerSpawned}, чекали {waited:F1}с) ✓");
+    }
+
+    // Варіант A: накласти персонаж-шар клієнта ЩОЙНО player.data зʼявився І стабілізувався —
+    // не чекаючи косметичних пауз UnlockPlayerAfterLoad (5с + 1с/спроба), через які раніше
+    // overlay падав аж у кінці й гравець кілька секунд бачив хостів інвентар. Стабільність =
+    // довжина ToJSON(0) не змінюється 2 тики поспіль (~0.4с): поки гра дозаповнює інвентар із
+    // сейву, довжина росте — накладати рано не можна (затремо). Логуємо реальний час появи й
+    // стабілізації, щоб знати безпечну точку. Пізній виклик у UnlockPlayerAfterLoad лишається
+    // фолбеком (OverlayDone-гард не дасть подвоїти).
+    private IEnumerator OverlayClientCharacterASAP()
+    {
+        if (SteamNetwork.Role != NetworkRole.Client) yield break;
+
+        float start = Time.time;
+        float firstReady = -1f;
+        string lastJson = null;
+        int stableHits = 0;
+
+        for (float waited = 0f; waited < 15f; waited += 0.2f)
+        {
+            yield return new WaitForSeconds(0.2f);
+            if (ClientCharacterStore.OverlayDone) yield break;
+
+            string json = ClientCharacterStore.LivePlayerJson();
+            if (json == null) continue;
+
+            if (firstReady < 0f)
+            {
+                firstReady = Time.time - start;
+                _logger.LogInfo($"[CHAR] player.data готовий через {firstReady:F1}с (json={json.Length}б) — чекаю стабілізації…");
+            }
+
+            stableHits = (json == lastJson) ? stableHits + 1 : 0;
+            lastJson = json;
+
+            if (stableHits >= 2)
+            {
+                _logger.LogInfo($"[CHAR] Інвентар стабільний через {Time.time - start:F1}с — накладаю overlay ранньо");
+                ClientCharacterStore.Overlay();
+                // Хотбар/HUD може ще домалюватись хостовими лічильниками після нашого overlay
+                // (GUI ініціалізується ~тоді ж). Кілька повторних редро добивають видимий стан.
+                for (int i = 0; i < 3; i++)
+                {
+                    yield return new WaitForSeconds(0.5f);
+                    ClientCharacterStore.RefreshHud();
+                }
+                yield break;
+            }
+        }
+        _logger.LogWarning("[CHAR] ASAP-overlay: інвентар не стабілізувався за 15с — лишаю на пізній фолбек");
+    }
+
+    private bool _charAutosaveRunning;
+
+    // Періодичний автосейв персонажа клієнта. Робить збереження незалежним від хуків виходу:
+    // навіть якщо гра закрилась напряму/крашнула, втрачається максимум один інтервал. Save()
+    // сам гейтиться Role==Client && IsInGame, тож на хості/в меню — ноуп. Цикл живе, поки
+    // IsInGame; на виході в меню завершується сам, на ре-джоіні стартує новий (гард від подвоєння).
+    private IEnumerator AutosaveClientCharacter()
+    {
+        if (_charAutosaveRunning) yield break;
+        _charAutosaveRunning = true;
+        try
+        {
+            const float intervalSec = 60f;
+            while (SteamNetwork.IsInGame && SteamNetwork.Role == NetworkRole.Client)
+            {
+                yield return new WaitForSeconds(intervalSec);
+                if (!SteamNetwork.IsInGame || SteamNetwork.Role != NetworkRole.Client) break;
+                ClientCharacterStore.Save();
+            }
+        }
+        finally { _charAutosaveRunning = false; }
     }
 
     private IEnumerator HideMenuUntilInGame()
@@ -10160,6 +10244,21 @@ public static class ClientCharacterStore
         try { return System.IO.File.Exists(FilePath()); } catch { return false; }
     }
 
+    // Поточний JSON живого інвентаря (ToJSON(0) — як гра пише сейв) або null, якщо
+    // player.data ще не готовий. Для ASAP-полінгу: зміна довжини = гра ще дозаповнює
+    // інвентар; стабільна довжина = безпечно накладати overlay (інакше затремо).
+    public static string LivePlayerJson()
+    {
+        GetLive(out var save, out var pdata);
+        if (save == null || pdata == null) return null;
+        try
+        {
+            var toJson = pdata.GetType().GetMethod("ToJSON", new[] { typeof(int) });
+            return (string)toJson.Invoke(pdata, new object[] { 0 });
+        }
+        catch { return null; }
+    }
+
     // (save, playerData) живого світу або (null,null) якщо ще не готові.
     private static void GetLive(out object save, out object playerData)
     {
@@ -10277,9 +10376,34 @@ public static class ClientCharacterStore
             }
 
             OverlayDone = true;
+            RefreshHud();
             Multiplayer.Log.LogInfo($"[CHAR] Персонаж накладено ✓ (maxHp={maxHp} світ-прапорів збережено={worldSnap.Count} json={invJson.Length}б)");
         }
         catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Overlay помилка: {e.Message}\n{e.StackTrace}"); }
+    }
+
+    // Форсимо перемальовку ЗАВЖДИ-ВИДИМОГО ігрового хотбару після overlay. Без цього HUD показує
+    // хостові лічильники (15 хліба), поки гравець сам не зробить дію (зʼїсть), бо FromJsonOverwrite
+    // міняє дані напряму, без події «інвентар змінився», що тригерить редро.
+    // Ціль = GUIElements.me.hud.toolbar (ToolbarGUI, декомпіл 66829). Його Redraw малює слоти з
+    // save.equipped_items[i] (id) + player.data.GetTotalCount(id) (лічильник) — після overlay обидва
+    // клієнтові. УВАГА: InventoryGUI.toolbelt — ІНШИЙ компонент (тулбелт усередині екрану інвентаря,
+    // редроїться на Open), тому редро ЙОГО не лагодило видимий HUD-хотбар. Гроші — лише в екрані
+    // інвентаря (редро на Open), HUD-лічильника грошей нема, тож не чіпаємо.
+    public static void RefreshHud()
+    {
+        try
+        {
+            var guiType = AccessTools.TypeByName("GUIElements");
+            var me = guiType?.GetProperty("me", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (me == null) return;
+            var hud = me.GetType().GetField("hud", BindingFlags.Public | BindingFlags.Instance)?.GetValue(me);
+            var toolbar = hud?.GetType().GetField("toolbar", BindingFlags.Public | BindingFlags.Instance)?.GetValue(hud);
+            toolbar?.GetType()
+                .GetMethod("Redraw", BindingFlags.Public | BindingFlags.Instance, null, System.Type.EmptyTypes, null)
+                ?.Invoke(toolbar, null);
+        }
+        catch (Exception e) { Multiplayer.Log.LogWarning($"[CHAR] RefreshHud: {e.Message}"); }
     }
 
     // Імена парамів = Item._params (GameRes).Types; відбираємо світові (StorySync.IsWorldParam).
