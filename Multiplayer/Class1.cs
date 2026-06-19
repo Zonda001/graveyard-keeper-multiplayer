@@ -294,6 +294,7 @@ public class Multiplayer : BaseUnityPlugin
                 _remotePlayerGO = null;
                 // Reset guards for the next session
                 SteamManager._unlockAlreadyDone = false;
+                ClientCharacterStore.OverlayDone = false;
                 OnGameStartedPlayingPatch.Reset();
                 StartPlayingGameGuardPatch.AlreadyStarted = false;
                 ChopSync.Reset();
@@ -2516,6 +2517,10 @@ public class SteamManager : MonoBehaviour
     // Гейт _coopSaveWritten: чистимо ЛИШЕ те, що самі записали (юзерські слоти недоторкані).
     private void OnApplicationQuit()
     {
+        // M1: зберегти персонаж-шар клієнта перед закриттям гри (гравець ще в пам'яті).
+        // Окремий файл coop_character_* — на відміну від кооп-слота 999999 його НЕ чистимо.
+        ClientCharacterStore.Save();
+
         if (!_coopSaveWritten) return;
         foreach (var ext in new[] { ".dat", ".info" })
         {
@@ -3379,6 +3384,10 @@ public class SteamManager : MonoBehaviour
                 // стався вище, тож клієнт стоїть на місці хоста до розблокування — без смикання.
                 StartCoroutine(ReleaseClientLockWhenSeen());
 
+                // M1: накласти персонаж-шар клієнта поверх світу хоста (інвентар/гроші/стати/toolbar),
+                // зберігши світові прапори хоста. Перший захід = клон хоста + зберегти базу.
+                ClientCharacterStore.Overlay();
+
                 yield break;
             }
             catch (Exception e)
@@ -3685,6 +3694,7 @@ public class SteamManager : MonoBehaviour
         StartPlayingGameGuardPatch.AlreadyStarted = false;
         OnGameStartedPlayingPatch.Reset();
         SteamNetwork.RemotePlayerSpawned = false;
+        ClientCharacterStore.OverlayDone = false;
         ChopSync.Reset();
 
         yield return new WaitForSeconds(1f);
@@ -4104,6 +4114,8 @@ public static class InGameMenuReturnPatch
     static void Prefix()
     {
         SteamNetwork.RealExitRequestedAt = UnityEngine.Time.time;
+        // M1: зберегти персонаж-шар клієнта ДО вивантаження світу (гравець ще живий).
+        ClientCharacterStore.Save();
     }
 }
 
@@ -10103,6 +10115,192 @@ public static class PparRecon
             Multiplayer.Log?.LogInfo($"[PPAR-DIAG] CheckKeyQuests '{key}'");
         }
         catch { }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// СЕЙВ ПЕРСОНАЖА КЛІЄНТА (M1, 2026-06-19) ─ персонаж-шар клієнта поверх світу хоста.
+// Stardew-модель: світ СПІЛЬНИЙ (вантажиться від хоста), персонаж ПЕРСОНАЛЬНИЙ.
+// M1 покриває: інвентар + гроші (item "money") + стелі статів (save.max_hp/energy/
+// sanity) + toolbar (save.equipped_items). Знання/сюжет — M2/M3.
+//
+// Жива копія інвентаря = MainGame.me.player.data (Item); GameSave.PrepareForSave
+// робить _inventory = player.data при збереженні (декомпіл 104876), тож працюємо з
+// живим player.data ПІСЛЯ спавну, а не з приватного save._inventory.
+//
+// Серіалізація: Item.ToJSON(0) (як гра пише інвентар у сейв, вкладеність до 3);
+// відновлення — JsonUtility.FromJsonOverwrite(json, player.data).
+//
+// ⚠️ СВІТОВІ ПРАПОРИ (lock_tp/church_level/rednecks_spawned… = StorySync.IsWorldParam)
+// живуть у ТОМУ Ж Item-i, що й персональні парами. FromJsonOverwrite затер би їх
+// клієнтовими (старими) значеннями → ворота/прогресія відкотились би. Тому до
+// перезапису знімаємо хостові світові прапори й відновлюємо їх ПІСЛЯ.
+//
+// Файл per-host (coop_character_{RemoteID}.dat) — персонаж привʼязаний до світу хоста,
+// як ферма у Stardew; різні хости не змішуються. Перший захід (файлу нема) = персонаж
+// лишається клоном хоста й одразу зберігається як база клієнта.
+// ─────────────────────────────────────────────────────────────────────────────
+public static class ClientCharacterStore
+{
+    private const string FILE_VERSION = "GKCOOP-CHAR-1";
+    private static readonly BindingFlags F =
+        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+    // Гард на один overlay за захід. Ставиться в Overlay() при успіху (і на 1-му
+    // заході = клон). Скидається при ресеті сесії/ре-джоіні. Дає ранній ASAP-виклик
+    // (OverlayClientCharacterASAP) випередити пізній фолбек у UnlockPlayerAfterLoad,
+    // не накладаючи двічі.
+    public static bool OverlayDone;
+
+    private static string FilePath() =>
+        System.IO.Path.Combine(Application.persistentDataPath, $"coop_character_{SteamNetwork.RemoteID}.dat");
+
+    public static bool HasSaved()
+    {
+        try { return System.IO.File.Exists(FilePath()); } catch { return false; }
+    }
+
+    // (save, playerData) живого світу або (null,null) якщо ще не готові.
+    private static void GetLive(out object save, out object playerData)
+    {
+        save = null; playerData = null;
+        var mg = AccessTools.TypeByName("MainGame");
+        var me = mg?.GetField("me", F)?.GetValue(null);
+        if (me == null) return;
+        save = mg.GetField("save", F)?.GetValue(me);
+        var player = mg.GetField("player", F)?.GetValue(me);
+        if (player != null)
+            playerData = player.GetType().GetProperty("data", F)?.GetValue(player);
+    }
+
+    // ── ЗБЕРЕЖЕННЯ ──────────────────────────────────────────────────────────────
+    // Кличеться на виході (у меню / quit), поки гравець ще у світі. Ідемпотентно
+    // (перезаписує файл). Гейт: лише клієнт, лише коли реально був у грі.
+    public static void Save()
+    {
+        try
+        {
+            if (SteamNetwork.Role != NetworkRole.Client || !SteamNetwork.IsInGame) return;
+            GetLive(out var save, out var pdata);
+            if (save == null || pdata == null)
+            {
+                Multiplayer.Log.LogWarning("[CHAR] Save: save/player ще null — пропуск");
+                return;
+            }
+
+            var toJson = pdata.GetType().GetMethod("ToJSON", new[] { typeof(int) });
+            var invJson = (string)toJson.Invoke(pdata, new object[] { 0 });
+
+            int maxHp  = (int)save.GetType().GetField("max_hp",     F).GetValue(save);
+            int maxEn  = (int)save.GetType().GetField("max_energy", F).GetValue(save);
+            int maxSan = (int)save.GetType().GetField("max_sanity", F).GetValue(save);
+
+            var equipped = save.GetType().GetField("equipped_items", F)?.GetValue(save) as string[];
+            var eq = new string[4];
+            for (int i = 0; i < 4; i++) eq[i] = (equipped != null && i < equipped.Length && equipped[i] != null) ? equipped[i] : "";
+
+            // Формат: 4 секції, розділені \n (json останній → split limit 4 зберігає його цілим).
+            var text = FILE_VERSION + "\n"
+                     + $"{maxHp} {maxEn} {maxSan}" + "\n"
+                     + string.Join("\t", eq) + "\n"
+                     + invJson;
+            System.IO.File.WriteAllText(FilePath(), text);
+            Multiplayer.Log.LogInfo($"[CHAR] Персонаж збережено → {FilePath()} (maxHp={maxHp} json={invJson.Length}б)");
+        }
+        catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Save помилка: {e.Message}"); }
+    }
+
+    // ── НАКЛАДАННЯ ──────────────────────────────────────────────────────────────
+    // Кличеться після спавну клієнта у світі хоста (UnlockPlayerAfterLoad). Накладає
+    // збережений персонаж клієнта поверх живого player.data, зберігаючи світові прапори
+    // хоста. Перший захід (файлу нема) = персонаж лишається клоном, зберігаємо базу.
+    public static void Overlay()
+    {
+        try
+        {
+            if (SteamNetwork.Role != NetworkRole.Client) return;
+            if (OverlayDone) return;   // вже накладено цього заходу (ранній ASAP випередив)
+            GetLive(out var save, out var pdata);
+            if (save == null || pdata == null)
+            {
+                Multiplayer.Log.LogWarning("[CHAR] Overlay: save/player ще null — пропуск");
+                return;
+            }
+
+            if (!HasSaved())
+            {
+                Multiplayer.Log.LogInfo("[CHAR] Перший захід — персонаж=клон хоста, зберігаю базу клієнта");
+                Save();
+                OverlayDone = true;
+                return;
+            }
+
+            var parts = System.IO.File.ReadAllText(FilePath()).Split(new[] { '\n' }, 4);
+            if (parts.Length < 4 || parts[0].Trim() != FILE_VERSION)
+            {
+                Multiplayer.Log.LogWarning("[CHAR] Файл персонажа несумісний/биткий — overlay пропущено");
+                return;
+            }
+            var statToks = parts[1].Split(' ');
+            int maxHp = int.Parse(statToks[0]), maxEn = int.Parse(statToks[1]), maxSan = int.Parse(statToks[2]);
+            var equipped = parts[2].Split('\t');
+            var invJson = parts[3];
+
+            // 1) Зняти хостові СВІТОВІ прапори (до перезапису).
+            var worldSnap = SnapshotWorldParams(pdata);
+
+            // 2) Перезаписати живий інвентар клієнтовим (предмети + гроші + парами + hp).
+            // JsonUtility — у модулі, який проєкт не реферить (як решта коду) → рефлексія.
+            var fromJsonOverwrite = AccessTools.TypeByName("UnityEngine.JsonUtility")
+                ?.GetMethod("FromJsonOverwrite", new[] { typeof(string), typeof(object) });
+            if (fromJsonOverwrite == null)
+            {
+                Multiplayer.Log.LogError("[CHAR] JsonUtility.FromJsonOverwrite нема — overlay аборт");
+                return;
+            }
+            fromJsonOverwrite.Invoke(null, new object[] { invJson, pdata });
+
+            // 3) Відновити хостові світові прапори (щоб ворота/прогресія не відкотились).
+            var setParam = pdata.GetType().GetMethod("SetParam", new[] { typeof(string), typeof(float) });
+            if (setParam != null)
+                foreach (var kv in worldSnap) setParam.Invoke(pdata, new object[] { kv.Key, kv.Value });
+
+            // 4) Стелі статів + toolbar = клієнтові.
+            save.GetType().GetField("max_hp",     F).SetValue(save, maxHp);
+            save.GetType().GetField("max_energy", F).SetValue(save, maxEn);
+            save.GetType().GetField("max_sanity", F).SetValue(save, maxSan);
+            if (equipped.Length > 0)
+            {
+                var eq = new string[4];
+                for (int i = 0; i < 4; i++) eq[i] = i < equipped.Length ? equipped[i] : "";
+                save.GetType().GetField("equipped_items", F)?.SetValue(save, eq);
+            }
+
+            OverlayDone = true;
+            Multiplayer.Log.LogInfo($"[CHAR] Персонаж накладено ✓ (maxHp={maxHp} світ-прапорів збережено={worldSnap.Count} json={invJson.Length}б)");
+        }
+        catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Overlay помилка: {e.Message}\n{e.StackTrace}"); }
+    }
+
+    // Імена парамів = Item._params (GameRes).Types; відбираємо світові (StorySync.IsWorldParam).
+    private static Dictionary<string, float> SnapshotWorldParams(object pdata)
+    {
+        var d = new Dictionary<string, float>();
+        try
+        {
+            var paramsObj = pdata.GetType().GetField("_params", F)?.GetValue(pdata);
+            var types = paramsObj?.GetType().GetProperty("Types", F)?.GetValue(paramsObj) as System.Collections.IEnumerable;
+            var getParam = pdata.GetType().GetMethod("GetParam", new[] { typeof(string), typeof(float) });
+            if (types == null || getParam == null) return d;
+            // Копія імен у список (SetParam під час відновлення не мутуватиме поточну ітерацію).
+            var names = new List<string>();
+            foreach (var n in types) if (n is string s) names.Add(s);
+            foreach (var name in names)
+                if (StorySync.IsWorldParam(name))
+                    d[name] = (float)getParam.Invoke(pdata, new object[] { name, 0f });
+        }
+        catch (Exception e) { Multiplayer.Log.LogWarning($"[CHAR] SnapshotWorldParams: {e.Message}"); }
+        return d;
     }
 }
 
