@@ -10226,9 +10226,79 @@ public static class PparRecon
 // ─────────────────────────────────────────────────────────────────────────────
 public static class ClientCharacterStore
 {
-    private const string FILE_VERSION = "GKCOOP-CHAR-1";
+    private const string FILE_VERSION = "GKCOOP-CHAR-2";   // V2 = + шар знань (M2)
+    private const string FILE_VERSION_V1 = "GKCOOP-CHAR-1"; // V1 = лише інв/гроші/стати (M1); читаємо для сумісності
     private static readonly BindingFlags F =
         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+    // M2: персональний шар ЗНАНЬ. Усі поля — List<string> у GameSave, КРІМ unlocked_tech_branches
+    // (List<int>). Перевірки гри читають їх НАПРЯМУ live (IsCraftUnlocked=unlocked_crafts.Contains,
+    // tech-tree GetState=unlocked_techs.Contains…), тож копії списків у save досить — БЕЗ переграшу
+    // ApplyTech/UnlockPerk (стат-бонуси перків уже в player.data._params, які M1 overlay переносить;
+    // повторне застосування подвоїло б їх). Декомпіл GameSave 104544-574.
+    // known_world_zones НАВМИСНЕ ВІДСУТНІЙ: мапа/зони = СПІЛЬНИЙ світ (рішення Деніса 2026-06-20),
+    // клієнт успадковує хостові зони (не перезаписуємо → нічого не ламаємо).
+    private static readonly string[] _knowledgeFields =
+    {
+        "unlocked_techs", "unlocked_crafts", "locked_crafts", "unlocked_works",
+        "unlocked_phrases", "unlocked_perks", "black_list_of_phrases", "completed_one_time_crafts",
+        "known_fishes", "known_fishes_clear", "last_bait_reservoirs",
+        "last_bait_baits", "revealed_techs", "visible_techs", "unlocked_tech_branches",
+    };
+    private const string INT_LIST_FIELD = "unlocked_tech_branches";
+    private const char LIST_SEP = '\x1f';  // між полями (unit separator — не буває в id/назвах)
+    private const char ITEM_SEP = '\x1e';  // між елементами списку (record separator)
+
+    // Серіалізація шару знань в один рядок: "field=a\x1eb\x1ec\x1ffield2=…". Порядок-незалежна
+    // й толерантна до відсутніх полів (вперед/назад-сумісність).
+    private static string EncodeKnowledge(object save)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < _knowledgeFields.Length; i++)
+        {
+            if (i > 0) sb.Append(LIST_SEP);
+            sb.Append(_knowledgeFields[i]).Append('=');
+            var list = save.GetType().GetField(_knowledgeFields[i], F)?.GetValue(save) as System.Collections.IEnumerable;
+            if (list != null)
+            {
+                bool first = true;
+                foreach (var item in list)
+                {
+                    if (!first) sb.Append(ITEM_SEP);
+                    sb.Append(item);
+                    first = false;
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    // Накласти збережений шар знань на save: для кожного поля повністю замінюємо список клієнтовим.
+    private static int ApplyKnowledge(object save, string encoded)
+    {
+        int applied = 0;
+        foreach (var group in encoded.Split(LIST_SEP))
+        {
+            int eq = group.IndexOf('=');
+            if (eq < 0) continue;
+            var name = group.Substring(0, eq);
+            var rest = group.Substring(eq + 1);
+            var field = save.GetType().GetField(name, F);
+            if (field?.GetValue(save) is not System.Collections.IList list) continue;
+            list.Clear();
+            if (rest.Length > 0)
+            {
+                bool isInt = name == INT_LIST_FIELD;
+                foreach (var s in rest.Split(ITEM_SEP))
+                {
+                    if (isInt) { if (int.TryParse(s, out var n)) list.Add(n); }
+                    else list.Add(s);
+                }
+            }
+            applied++;
+        }
+        return applied;
+    }
 
     // Гард на один overlay за захід. Ставиться в Overlay() при успіху (і на 1-му
     // заході = клон). Скидається при ресеті сесії/ре-джоіні. Дає ранній ASAP-виклик
@@ -10236,8 +10306,51 @@ public static class ClientCharacterStore
     // не накладаючи двічі.
     public static bool OverlayDone;
 
-    private static string FilePath() =>
+    // Стабільний per-world ключ: dungeon_seed (GameSave) — присвоюється раз при
+    // CreateNewSave (декомпіл 104842), ніколи не мутується; їде в сирих байтах сейву
+    // хоста → у клієнта = сід СВІТУ хоста (і на overlay, і на save). -1 = сейв ще не
+    // готовий → FilePath падає на старий ключ-фолбек (на реальних викликах save готовий).
+    private static int WorldSeed()
+    {
+        GetLive(out var save, out _);
+        if (save == null) return -1;
+        try { return (int)save.GetType().GetField("dungeon_seed", F).GetValue(save); }
+        catch { return -1; }
+    }
+
+    // Старий ключ (лише по хосту, без світу) — для одноразової авто-міграції.
+    private static string LegacyFilePath() =>
         System.IO.Path.Combine(Application.persistentDataPath, $"coop_character_{SteamNetwork.RemoteID}.dat");
+
+    private static string FilePath()
+    {
+        int seed = WorldSeed();
+        var name = seed >= 0
+            ? $"coop_character_{SteamNetwork.RemoteID}_{seed}.dat"
+            : $"coop_character_{SteamNetwork.RemoteID}.dat";   // фолбек: сейв не готовий
+        return System.IO.Path.Combine(Application.persistentDataPath, name);
+    }
+
+    // Одноразова авто-міграція: до фіксу файл персонажа називався лише по хосту
+    // (coop_character_{RemoteID}.dat) без ключа світу → персонаж «тік» між світами
+    // одного хоста. Тепер ключ +dungeon_seed. Якщо файл ЦЬОГО світу ще не існує, а
+    // старий є — перейменовуємо старий у новий: наявний персонаж дістається ПЕРШОМУ
+    // світу, у який клієнт зайде після оновлення; далі legacy нема → інші світи
+    // отримають свіжий клон. Кличеться з Overlay() (коли save готовий, перед HasSaved).
+    private static void MigrateLegacyFile()
+    {
+        try
+        {
+            var legacy  = LegacyFilePath();
+            var current = FilePath();
+            if (legacy == current) return;               // seed=-1 фолбек → ключі збіглись
+            if (System.IO.File.Exists(current)) return;  // новий уже є — не чіпаємо
+            if (!System.IO.File.Exists(legacy)) return;  // мігрувати нічого
+            System.IO.File.Move(legacy, current);
+            Multiplayer.Log.LogInfo($"[CHAR] Авто-міграція персонажа: {System.IO.Path.GetFileName(legacy)} → {System.IO.Path.GetFileName(current)}");
+        }
+        catch (Exception e) { Multiplayer.Log.LogWarning($"[CHAR] Авто-міграція пропущена: {e.Message}"); }
+    }
 
     public static bool HasSaved()
     {
@@ -10287,6 +10400,16 @@ public static class ClientCharacterStore
                 return;
             }
 
+            // Захист ордеру: якщо персонаж цього заходу ще НЕ накладено (overlay не встиг —
+            // напр. quit за <1с після джоіну) і є legacy-файл, який ще не мігровано — НЕ
+            // перезаписуємо світовим клоном-хоста (інакше migration наступного заходу
+            // заблокується, а legacy-персонаж осиротіє). Пропуск: overlay наступного заходу мігрує.
+            if (!OverlayDone && System.IO.File.Exists(LegacyFilePath()) && !System.IO.File.Exists(FilePath()))
+            {
+                Multiplayer.Log.LogInfo("[CHAR] Save до overlay при наявному legacy — пропуск (щоб не загубити міграцію)");
+                return;
+            }
+
             var toJson = pdata.GetType().GetMethod("ToJSON", new[] { typeof(int) });
             var invJson = (string)toJson.Invoke(pdata, new object[] { 0 });
 
@@ -10298,13 +10421,17 @@ public static class ClientCharacterStore
             var eq = new string[4];
             for (int i = 0; i < 4; i++) eq[i] = (equipped != null && i < equipped.Length && equipped[i] != null) ? equipped[i] : "";
 
-            // Формат: 4 секції, розділені \n (json останній → split limit 4 зберігає його цілим).
+            var knowledge = EncodeKnowledge(save);
+
+            // Формат V2: 5 секцій, розділені \n (json останній → split limit 5 зберігає його цілим).
+            // Рядки знань/json не містять \n (EncodeKnowledge юзає \x1f/\x1e; ToJSON одно-рядковий).
             var text = FILE_VERSION + "\n"
                      + $"{maxHp} {maxEn} {maxSan}" + "\n"
                      + string.Join("\t", eq) + "\n"
+                     + knowledge + "\n"
                      + invJson;
             System.IO.File.WriteAllText(FilePath(), text);
-            Multiplayer.Log.LogInfo($"[CHAR] Персонаж збережено → {FilePath()} (maxHp={maxHp} json={invJson.Length}б)");
+            Multiplayer.Log.LogInfo($"[CHAR] Персонаж збережено → {FilePath()} (maxHp={maxHp} json={invJson.Length}б знань={knowledge.Length}б)");
         }
         catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Save помилка: {e.Message}"); }
     }
@@ -10326,6 +10453,7 @@ public static class ClientCharacterStore
                 return;
             }
 
+            MigrateLegacyFile();   // перенести довоєнний файл (без ключа світу) на цей світ, якщо є
             if (!HasSaved())
             {
                 Multiplayer.Log.LogInfo("[CHAR] Перший захід — персонаж=клон хоста, зберігаю базу клієнта");
@@ -10334,8 +10462,19 @@ public static class ClientCharacterStore
                 return;
             }
 
-            var parts = System.IO.File.ReadAllText(FilePath()).Split(new[] { '\n' }, 4);
-            if (parts.Length < 4 || parts[0].Trim() != FILE_VERSION)
+            var parts = System.IO.File.ReadAllText(FilePath()).Split(new[] { '\n' }, 5);
+            var ver = parts.Length > 0 ? parts[0].Trim() : "";
+            string knowledge = null, invJson;
+            if (ver == FILE_VERSION && parts.Length >= 5)        // V2: + шар знань
+            {
+                knowledge = parts[3];
+                invJson = parts[4];
+            }
+            else if (ver == FILE_VERSION_V1 && parts.Length >= 4) // V1: лише M1 (без знань) — сумісність
+            {
+                invJson = parts[3];
+            }
+            else
             {
                 Multiplayer.Log.LogWarning("[CHAR] Файл персонажа несумісний/биткий — overlay пропущено");
                 return;
@@ -10343,7 +10482,6 @@ public static class ClientCharacterStore
             var statToks = parts[1].Split(' ');
             int maxHp = int.Parse(statToks[0]), maxEn = int.Parse(statToks[1]), maxSan = int.Parse(statToks[2]);
             var equipped = parts[2].Split('\t');
-            var invJson = parts[3];
 
             // 1) Зняти хостові СВІТОВІ прапори (до перезапису).
             var worldSnap = SnapshotWorldParams(pdata);
@@ -10375,9 +10513,13 @@ public static class ClientCharacterStore
                 save.GetType().GetField("equipped_items", F)?.SetValue(save, eq);
             }
 
+            // 5) M2: шар ЗНАНЬ (техи/крафти/перки/…) = клієнтові. Лише копія списків — БЕЗ ApplyTech
+            // (стат-бонуси перків уже в player.data, перенесені кроком 2; переграш подвоїв би їх).
+            int knownApplied = knowledge != null ? ApplyKnowledge(save, knowledge) : 0;
+
             OverlayDone = true;
             RefreshHud();
-            Multiplayer.Log.LogInfo($"[CHAR] Персонаж накладено ✓ (maxHp={maxHp} світ-прапорів збережено={worldSnap.Count} json={invJson.Length}б)");
+            Multiplayer.Log.LogInfo($"[CHAR] Персонаж накладено ✓ (maxHp={maxHp} світ-прапорів збережено={worldSnap.Count} полів-знань={knownApplied} json={invJson.Length}б)");
         }
         catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Overlay помилка: {e.Message}\n{e.StackTrace}"); }
     }
