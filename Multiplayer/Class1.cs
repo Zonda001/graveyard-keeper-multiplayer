@@ -10226,7 +10226,8 @@ public static class PparRecon
 // ─────────────────────────────────────────────────────────────────────────────
 public static class ClientCharacterStore
 {
-    private const string FILE_VERSION = "GKCOOP-CHAR-2";   // V2 = + шар знань (M2)
+    private const string FILE_VERSION = "GKCOOP-CHAR-3";   // V3 = + сюжетний шар (M3a: quests + known_npcs)
+    private const string FILE_VERSION_V2 = "GKCOOP-CHAR-2"; // V2 = + шар знань (M2); читаємо для сумісності
     private const string FILE_VERSION_V1 = "GKCOOP-CHAR-1"; // V1 = лише інв/гроші/стати (M1); читаємо для сумісності
     private static readonly BindingFlags F =
         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
@@ -10298,6 +10299,164 @@ public static class ClientCharacterStore
             applied++;
         }
         return applied;
+    }
+
+    // ── M3a: ПЕРСОНАЛЬНИЙ СЮЖЕТНИЙ ШАР (quests + known_npcs) ───────────────────────
+    // Серце Stardew-моделі (Фаза Б): світ хоста спільний, а стосунки/квести у кожного свої.
+    // Персональні стори-ПАРАМИ (met_donkey/skull_talk_*/goto_tavern…) живуть у player.data._params
+    // і вже переносяться M1 (крок 2 overlay) — тут лише два GameSave-обʼєкти ПОЗА player.data:
+    //   • known_npcs (KnownNPCList) — плоский [Serializable] (npc_id + tasks{id,state}) → JsonUtility.
+    //   • quests (QuestSystem) — 3 рядкові списки (failed/succed/executed) + _currnet_quests, що тримає
+    //     QuestDefinition (тригери=FlowCanvas-асети, JsonUtility їх НЕ відновить) → зберігаємо лише
+    //     {id, start_time, state}, а definition РЕГІДРУЄМО з GameBalance.GetDataOrNull на overlay
+    //     (як StorySync робив при реплікації). Декомпіл: QuestSystem 103990, KnownNPCList 106951.
+    private const char GROUP_SEP = '\x1d';  // між 4 групами quests-блоку (failed/succed/executed/current)
+    private const char FIELD_SEP = '\x1c';  // між полями рекорду активного квеста (id/start_time/state)
+
+    private static System.Collections.IList PrivList(object obj, string field)
+        => obj?.GetType().GetField(field, F)?.GetValue(obj) as System.Collections.IList;
+
+    private static string JoinItems(System.Collections.IList list)
+    {
+        if (list == null) return "";
+        var sb = new System.Text.StringBuilder();
+        bool first = true;
+        foreach (var x in list) { if (!first) sb.Append(ITEM_SEP); sb.Append(x); first = false; }
+        return sb.ToString();
+    }
+
+    private static object StaticMe(string typeName)
+    {
+        var t = AccessTools.TypeByName(typeName);
+        if (t == null) return null;
+        var bf = BindingFlags.Public | BindingFlags.Static;
+        return t.GetProperty("me", bf)?.GetValue(null) ?? t.GetField("me", bf)?.GetValue(null);
+    }
+
+    // Серіалізація сюжетного шару в один рядок (\n-free): "<questsBlock>\x1f<knownNpcsJson>".
+    // questsBlock = failed \x1d succed \x1d executed \x1d current; current = рекорди (\x1e), рекорд = id\x1ctime\x1cstate.
+    private static string EncodeStory(object save)
+    {
+        var sb = new System.Text.StringBuilder();
+        var quests = save.GetType().GetField("quests", F)?.GetValue(save);
+        sb.Append(JoinItems(PrivList(quests, "_failed_quests"))).Append(GROUP_SEP);
+        sb.Append(JoinItems(PrivList(quests, "_succed_quests"))).Append(GROUP_SEP);
+        sb.Append(JoinItems(PrivList(quests, "_executed_quests"))).Append(GROUP_SEP);
+        var current = PrivList(quests, "_currnet_quests");
+        if (current != null)
+        {
+            bool first = true;
+            foreach (var qs in current)
+            {
+                if (qs == null) continue;
+                var def = qs.GetType().GetField("definition", F)?.GetValue(qs);
+                if (!(def?.GetType().GetField("id", F)?.GetValue(def) is string id) || id.Length == 0) continue;
+                var st = qs.GetType().GetField("start_time", F)?.GetValue(qs);
+                var state = qs.GetType().GetField("state", F)?.GetValue(qs);
+                if (!first) sb.Append(ITEM_SEP);
+                sb.Append(id).Append(FIELD_SEP).Append(Convert.ToInt64(st)).Append(FIELD_SEP).Append(Convert.ToInt32(state));
+                first = false;
+            }
+        }
+
+        var npcs = save.GetType().GetField("known_npcs", F)?.GetValue(save);
+        var toJson = AccessTools.TypeByName("UnityEngine.JsonUtility")?.GetMethod("ToJson", new[] { typeof(object) });
+        var npcsJson = (npcs != null && toJson != null) ? (string)toJson.Invoke(null, new object[] { npcs }) : "{}";
+        return sb.ToString() + LIST_SEP + npcsJson;
+    }
+
+    // Накласти сюжетний шар на save: quests-списки + регідрація активних квестів + known_npcs.
+    // Повертає (к-сть активних квестів, к-сть NPC) для логу. UI журналу рефрешимо в кінці.
+    private static (int quests, int npcs) ApplyStory(object save, string encoded)
+    {
+        int sep = encoded.IndexOf(LIST_SEP);
+        var questsBlock = sep >= 0 ? encoded.Substring(0, sep) : encoded;
+        var npcsJson    = sep >= 0 ? encoded.Substring(sep + 1) : null;
+
+        int curApplied = 0, npcApplied = 0;
+        var quests = save.GetType().GetField("quests", F)?.GetValue(save);
+        if (quests != null)
+        {
+            var groups = questsBlock.Split(GROUP_SEP);
+            if (groups.Length >= 4)
+            {
+                ReplaceStrList(quests, "_failed_quests",   groups[0]);
+                ReplaceStrList(quests, "_succed_quests",   groups[1]);
+                ReplaceStrList(quests, "_executed_quests", groups[2]);
+                curApplied = RebuildCurrentQuests(quests, groups[3]);
+            }
+        }
+
+        if (npcsJson != null && npcsJson.Length > 0)
+        {
+            var npcs = save.GetType().GetField("known_npcs", F)?.GetValue(save);
+            var fromJsonOverwrite = AccessTools.TypeByName("UnityEngine.JsonUtility")
+                ?.GetMethod("FromJsonOverwrite", new[] { typeof(string), typeof(object) });
+            if (npcs != null && fromJsonOverwrite != null)
+            {
+                fromJsonOverwrite.Invoke(null, new object[] { npcsJson, npcs });
+                npcApplied = (PrivList(npcs, "npcs"))?.Count ?? 0;
+            }
+        }
+
+        RedrawQuestList();
+        return (curApplied, npcApplied);
+    }
+
+    private static void ReplaceStrList(object obj, string field, string joined)
+    {
+        if (PrivList(obj, field) is not System.Collections.IList list) return;
+        list.Clear();
+        if (joined.Length > 0) foreach (var s in joined.Split(ITEM_SEP)) list.Add(s);
+    }
+
+    // Відновити _currnet_quests: на рекорд id\x1ctime\x1cstate створюємо QuestState, definition
+    // регідруємо з GameBalance (невідомий id = інша версія/DLC → пропуск, без краху).
+    private static int RebuildCurrentQuests(object quests, string recordsBlob)
+    {
+        if (PrivList(quests, "_currnet_quests") is not System.Collections.IList list) return 0;
+        list.Clear();
+        if (recordsBlob.Length == 0) return 0;
+
+        var gbMe = StaticMe("GameBalance");
+        var qdefType = AccessTools.TypeByName("QuestDefinition");
+        var getDataOrNull = gbMe?.GetType().GetMethod("GetDataOrNull")?.MakeGenericMethod(qdefType);
+        var qstateType = AccessTools.TypeByName("QuestState");
+        if (gbMe == null || getDataOrNull == null || qstateType == null)
+        {
+            Multiplayer.Log.LogWarning("[CHAR] RebuildCurrentQuests: GameBalance/QuestState не знайдено — активні квести пропущено");
+            return 0;
+        }
+
+        int n = 0;
+        foreach (var rec in recordsBlob.Split(ITEM_SEP))
+        {
+            var f = rec.Split(FIELD_SEP);
+            if (f.Length < 3) continue;
+            var def = getDataOrNull.Invoke(gbMe, new object[] { f[0] });
+            if (def == null) continue;   // невідомий квест — пропуск
+            var qs = System.Activator.CreateInstance(qstateType);
+            qstateType.GetField("definition", F)?.SetValue(qs, def);
+            if (long.TryParse(f[1], out var st)) qstateType.GetField("start_time", F)?.SetValue(qs, st);
+            var stateField = qstateType.GetField("state", F);
+            if (stateField != null && int.TryParse(f[2], out var state))
+                stateField.SetValue(qs, System.Enum.ToObject(stateField.FieldType, state));
+            list.Add(qs);
+            n++;
+        }
+        return n;
+    }
+
+    private static void RedrawQuestList()
+    {
+        try
+        {
+            var guiMe = StaticMe("GUIElements");
+            var ql = guiMe?.GetType().GetField("quest_list", BindingFlags.Public | BindingFlags.Instance)?.GetValue(guiMe);
+            ql?.GetType().GetMethod("Redraw", BindingFlags.Public | BindingFlags.Instance, null, System.Type.EmptyTypes, null)
+               ?.Invoke(ql, null);
+        }
+        catch (Exception e) { Multiplayer.Log.LogWarning($"[CHAR] RedrawQuestList: {e.Message}"); }
     }
 
     // Гард на один overlay за захід. Ставиться в Overlay() при успіху (і на 1-му
@@ -10422,16 +10581,18 @@ public static class ClientCharacterStore
             for (int i = 0; i < 4; i++) eq[i] = (equipped != null && i < equipped.Length && equipped[i] != null) ? equipped[i] : "";
 
             var knowledge = EncodeKnowledge(save);
+            var story = EncodeStory(save);
 
-            // Формат V2: 5 секцій, розділені \n (json останній → split limit 5 зберігає його цілим).
-            // Рядки знань/json не містять \n (EncodeKnowledge юзає \x1f/\x1e; ToJSON одно-рядковий).
+            // Формат V3: 6 секцій, розділені \n (json останній → split limit 6 зберігає його цілим).
+            // Знання/сюжет/json не містять \n (Encode* юзають \x1c..\x1f + JsonUtility одно-рядковий; ToJSON теж).
             var text = FILE_VERSION + "\n"
                      + $"{maxHp} {maxEn} {maxSan}" + "\n"
                      + string.Join("\t", eq) + "\n"
                      + knowledge + "\n"
+                     + story + "\n"
                      + invJson;
             System.IO.File.WriteAllText(FilePath(), text);
-            Multiplayer.Log.LogInfo($"[CHAR] Персонаж збережено → {FilePath()} (maxHp={maxHp} json={invJson.Length}б знань={knowledge.Length}б)");
+            Multiplayer.Log.LogInfo($"[CHAR] Персонаж збережено → {FilePath()} (maxHp={maxHp} json={invJson.Length}б знань={knowledge.Length}б сюжет={story.Length}б)");
         }
         catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Save помилка: {e.Message}"); }
     }
@@ -10462,15 +10623,21 @@ public static class ClientCharacterStore
                 return;
             }
 
-            var parts = System.IO.File.ReadAllText(FilePath()).Split(new[] { '\n' }, 5);
+            var parts = System.IO.File.ReadAllText(FilePath()).Split(new[] { '\n' }, 6);
             var ver = parts.Length > 0 ? parts[0].Trim() : "";
-            string knowledge = null, invJson;
-            if (ver == FILE_VERSION && parts.Length >= 5)        // V2: + шар знань
+            string knowledge = null, story = null, invJson;
+            if (ver == FILE_VERSION && parts.Length >= 6)         // V3: + сюжетний шар
+            {
+                knowledge = parts[3];
+                story = parts[4];
+                invJson = parts[5];
+            }
+            else if (ver == FILE_VERSION_V2 && parts.Length >= 5) // V2: + шар знань (без сюжету) — сумісність
             {
                 knowledge = parts[3];
                 invJson = parts[4];
             }
-            else if (ver == FILE_VERSION_V1 && parts.Length >= 4) // V1: лише M1 (без знань) — сумісність
+            else if (ver == FILE_VERSION_V1 && parts.Length >= 4) // V1: лише M1 (без знань/сюжету) — сумісність
             {
                 invJson = parts[3];
             }
@@ -10517,9 +10684,13 @@ public static class ClientCharacterStore
             // (стат-бонуси перків уже в player.data, перенесені кроком 2; переграш подвоїв би їх).
             int knownApplied = knowledge != null ? ApplyKnowledge(save, knowledge) : 0;
 
+            // 6) M3a: сюжетний шар = клієнтів (журнал квестів + NPC-задачі). Активні квести
+            // регідрують definition із GameBalance; журнал рефрешиться (RedrawQuestList).
+            var (curQ, nNpc) = story != null ? ApplyStory(save, story) : (0, 0);
+
             OverlayDone = true;
             RefreshHud();
-            Multiplayer.Log.LogInfo($"[CHAR] Персонаж накладено ✓ (maxHp={maxHp} світ-прапорів збережено={worldSnap.Count} полів-знань={knownApplied} json={invJson.Length}б)");
+            Multiplayer.Log.LogInfo($"[CHAR] Персонаж накладено ✓ (maxHp={maxHp} світ-прапорів={worldSnap.Count} знань={knownApplied} активних-квестів={curQ} NPC={nNpc} json={invJson.Length}б)");
         }
         catch (Exception e) { Multiplayer.Log.LogError($"[CHAR] Overlay помилка: {e.Message}\n{e.StackTrace}"); }
     }
