@@ -83,6 +83,12 @@
     </ItemGroup>
     <ItemGroup>
         <Compile Include="Class1.cs"/>
+        <Compile Include="CharacterSave.cs"/>
+        <Compile Include="Story.cs"/>
+        <Compile Include="Weather.cs"/>
+        <Compile Include="Crafting.cs"/>
+        <Compile Include="Chests.cs"/>
+        <Compile Include="WorldSync.cs"/>
         <Compile Include="Properties\AssemblyInfo.cs"/>
     </ItemGroup>
     <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
