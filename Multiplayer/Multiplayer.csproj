@@ -88,6 +88,7 @@
         <Compile Include="Weather.cs"/>
         <Compile Include="Crafting.cs"/>
         <Compile Include="Chests.cs"/>
+        <Compile Include="Reliability.cs"/>
         <Compile Include="WorldSync.cs"/>
         <Compile Include="Properties\AssemblyInfo.cs"/>
     </ItemGroup>

@@ -1607,7 +1607,7 @@ public static class SteamNetwork
     public static ulong RemoteID = 0;
     // NETWORK protocol version — checked on connect (0x01 → host rejects with 0x22 on mismatch, else builds
     // silently desync). BUMP ON ANY PACKET FORMAT CHANGE. Separate from the BepInPlugin version.
-    public const int PROTOCOL_VERSION = 1;
+    public const int PROTOCOL_VERSION = 2;   // v2: gameplay rides ReliableNet (0xFE/0xFF framing) — wire-incompatible with v1
     // Client's coop save slot. "999999" never collides — the game numbers slots 0..1000 only
     // (GetNewSlotFilename, decomp 102766). Removed in SteamManager.OnApplicationQuit.
     public const string CoopSaveSlot = "999999";
@@ -1740,6 +1740,7 @@ public class SteamManager : MonoBehaviour
     private MethodInfo  _cachedReadP2PPacket;     // SteamNetworking.ReadP2PPacket
     private ConstructorInfo _cachedSteamIdCtor;   // CSteamID(ulong)
     private object      _cachedSendReliable;      // EP2PSend.k_EP2PSendReliable
+    private object      _cachedSendUnreliable;    // EP2PSend.k_EP2PSendUnreliable — for high-freq position/anim/time
     private object      _cachedRemoteSteamId;     // CSteamID for RemoteID (updated on change)
     private ulong       _cachedRemoteIdValue;     // last value for which the CSteamID was created
 
@@ -1758,6 +1759,7 @@ public class SteamManager : MonoBehaviour
     private object _lobbyJoinRequestedCallback;
     private object _lobbyChatUpdateCallback;
     private object _p2pSessionRequestCallback;
+    private object _p2pSessionConnectFailCallback;  // DIAG (patch A): logs P2PSessionConnectFail_t — transport failures were invisible
 
     private IEnumerator InitDelayed()
     {
@@ -1863,6 +1865,32 @@ public class SteamManager : MonoBehaviour
                         ?.Invoke(null, new object[] { del });
 
                     _logger.LogInfo($"[STEAM] P2PSessionRequest callback: {(_p2pSessionRequestCallback != null ? "✓" : "✗")}");
+                }
+
+                // DIAG (patch A): P2PSessionConnectFail_t — fired when a P2P session dies (timeout, NAT, etc).
+                // Without this we were blind to transport breaks; the symptom was reliable packets silently lost.
+                var p2pFailType = asm2.GetType("Steamworks.P2PSessionConnectFail_t");
+                if (callbackGeneric != null && p2pFailType != null)
+                {
+                    var cbConcrete   = callbackGeneric.MakeGenericType(p2pFailType);
+                    var delegateType = cbConcrete.GetNestedType("DispatchDelegate");
+                    if (delegateType.IsGenericTypeDefinition)
+                        delegateType = delegateType.MakeGenericType(p2pFailType);
+
+                    var handler = GetType().GetMethod("OnP2PSessionConnectFailRaw",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+
+                    var param = Expression.Parameter(p2pFailType);
+                    var call  = Expression.Call(
+                        Expression.Constant(this), handler,
+                        Expression.Convert(param, typeof(object)));
+                    var del = Expression.Lambda(delegateType, call, param).Compile();
+
+                    _p2pSessionConnectFailCallback = cbConcrete
+                        .GetMethod("Create", BindingFlags.Public | BindingFlags.Static)
+                        ?.Invoke(null, new object[] { del });
+
+                    _logger.LogInfo($"[STEAM] P2PSessionConnectFail callback: {(_p2pSessionConnectFailCallback != null ? "✓" : "✗")}");
                 }
 
                 _initialized = true;
@@ -1972,6 +2000,7 @@ public class SteamManager : MonoBehaviour
             {
                 _logger.LogInfo($"[STEAM] Other player left (id={changedId}, state={state}) — removing clone");
                 Multiplayer.Instance?.DespawnRemotePlayer();
+                ReliableNet.Stop();        // peer gone — quit resending + block until next handshake
                 SteamNetwork.RemoteID = 0;
                 _lastLobbyMemberCount = 0; // so PollLobbyMembers picks up a new player
             }
@@ -2007,13 +2036,21 @@ public class SteamManager : MonoBehaviour
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
 
             var ep2pSendType     = _steamNetworking?.Assembly.GetType("Steamworks.EP2PSend");
-            _cachedSendReliable  = System.Enum.ToObject(ep2pSendType, 2);
+            _cachedSendReliable   = System.Enum.ToObject(ep2pSendType, 2);   // k_EP2PSendReliable
+            _cachedSendUnreliable = System.Enum.ToObject(ep2pSendType, 0);   // k_EP2PSendUnreliable
 
             _logger.LogInfo($"[CACHE] RunCallbacks: {(_cachedRunCallbacks != null ? "✓" : "✗")}");
             _logger.LogInfo($"[CACHE] SendP2PPacket: {(_cachedSendP2PPacket != null ? "✓" : "✗")}");
             _logger.LogInfo($"[CACHE] IsP2PAvailable: {(_cachedIsP2PAvailable != null ? "✓" : "✗")}");
             _logger.LogInfo($"[CACHE] ReadP2PPacket: {(_cachedReadP2PPacket != null ? "✓" : "✗")}");
             _logger.LogInfo($"[CACHE] SteamIdCtor: {(_cachedSteamIdCtor != null ? "✓" : "✗")}");
+
+            // Wire the C3 reliability layer: it sends raw UNRELIABLE datagrams to RemoteID and hands
+            // reassembled inner messages back to the dispatcher (with diag counting).
+            ReliableNet.Log       = _logger;
+            ReliableNet.RawSend   = bytes => SendRawDatagram(SteamNetwork.RemoteID, bytes, reliable: false);
+            ReliableNet.OnDeliver = DispatchReliableInner;
+            _logger.LogInfo("[CACHE] ReliableNet wired ✓");
             _logger.LogInfo("[CACHE] Reflection cache initialized ✓");
         }
         catch (Exception e)
@@ -2057,9 +2094,31 @@ public class SteamManager : MonoBehaviour
         }
     }
 
+    // Routing entry point. Three transport classes (see ReliableNet for the why):
+    //   0x06/0x07/0x08            → raw UNRELIABLE (high-freq, superseded next tick — loss is fine)
+    //   0x01-0x05, 0x22, 0x23     → native Steam RELIABLE (handshake/save/version — setup + host→client, proven OK)
+    //   everything else (gameplay)→ ReliableNet (TCP-lite over unreliable; Steam reliable drops client→host on SDK 1.42)
     public void SendPacket(ulong targetSteamId, byte[] data, int channel = 0)
     {
-        if (_cachedSendP2PPacket == null || _cachedSteamIdCtor == null) return;
+        if (data == null || data.Length == 0) return;
+        byte t = data[0];
+
+        // Log service packets (not high-freq position/anim/time)
+        if (t != 0x06 && t != 0x07 && t != 0x08)
+            _logger.LogInfo($"[P2P] SendPacket to {targetSteamId}: type=0x{t:X2} dataLen={data.Length}");
+
+        if (t == 0x06 || t == 0x07 || t == 0x08)
+            SendRawDatagram(targetSteamId, data, reliable: false);
+        else if (t <= 0x05 || t == 0x22 || t == 0x23)
+            SendRawDatagram(targetSteamId, data, reliable: true);
+        else
+            ReliableNet.Send(data);
+    }
+
+    // Actual SteamNetworking.SendP2PPacket call — no routing. Used by SendPacket and (unreliable) by ReliableNet.
+    public bool SendRawDatagram(ulong targetSteamId, byte[] data, bool reliable)
+    {
+        if (_cachedSendP2PPacket == null || _cachedSteamIdCtor == null) return false;
         try
         {
             // Rebuild the CSteamID only if RemoteID changed — otherwise use the cached one
@@ -2069,14 +2128,12 @@ public class SteamManager : MonoBehaviour
                 _cachedRemoteIdValue = targetSteamId;
             }
 
+            var sendType = reliable ? _cachedSendReliable : _cachedSendUnreliable;
             _cachedSendP2PPacket.Invoke(null,
-                new object[] { _cachedRemoteSteamId, data, (uint)data.Length, _cachedSendReliable, channel });
-
-            // Log only service packets (not position, animation, time)
-            if (data.Length > 0 && data[0] != 0x06 && data[0] != 0x07 && data[0] != 0x08)
-                _logger.LogInfo($"[P2P] SendPacket to {targetSteamId}: type=0x{data[0]:X2} dataLen={data.Length}");
+                new object[] { _cachedRemoteSteamId, data, (uint)data.Length, sendType, 0 });
+            return true;
         }
-        catch (System.Exception e) { _logger.LogError($"[P2P] Send error: {e.Message}"); }
+        catch (System.Exception e) { _logger.LogError($"[P2P] Send error: {e.Message}"); return false; }
     }
 
     private void OnP2PSessionRequestRaw(object param)
@@ -2098,6 +2155,27 @@ public class SteamManager : MonoBehaviour
             _logger.LogInfo("[P2P] AcceptP2PSessionWithUser ✓");
         }
         catch (System.Exception e) { _logger.LogError($"[P2P] SessionRequest error: {e.Message}"); }
+    }
+
+    // DIAG (patch A): P2P session died. m_eP2PSessionError: 0=None 1=NotRunningApp 2=NoRightsToApp
+    // 3=DestinationNotLoggedIn 4=Timeout. A Timeout/repeating fail mid-session = transport is the culprit
+    // (→ migrate to SteamNetworkingMessages). uid + error printed so the live test is decisive.
+    private void OnP2PSessionConnectFailRaw(object param)
+    {
+        try
+        {
+            var flags = BindingFlags.Public | BindingFlags.Instance;
+            var steamId = param.GetType().GetField("m_steamIDRemote", flags)?.GetValue(param);
+            var rawId = steamId?.GetType()
+                .GetField("m_SteamID", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.GetValue(steamId);
+            var errObj = param.GetType().GetField("m_eP2PSessionError", flags)?.GetValue(param);
+            int err = errObj != null ? System.Convert.ToInt32(errObj) : -1;
+            string name = err == 0 ? "None" : err == 1 ? "NotRunningApp" : err == 2 ? "NoRightsToApp"
+                        : err == 3 ? "DestinationNotLoggedIn" : err == 4 ? "Timeout" : "Unknown";
+            _logger.LogError($"[P2P-FAIL] Session with {System.Convert.ToUInt64(rawId ?? 0UL)} FAILED — error={err}({name})");
+        }
+        catch (System.Exception e) { _logger.LogError($"[P2P-FAIL] handler error: {e.Message}"); }
     }
 
     // Reusable objects for ReadPacket — no allocations every frame
@@ -2225,6 +2303,19 @@ public class SteamManager : MonoBehaviour
     private float _lastRemotePacketTime = 0f;
     private const float REMOTE_PACKET_TIMEOUT = 5f;
 
+    // ── DIAG (patch A): localize the client→host packet loss ──────────────────────────
+    // Heartbeat 0x24 [type][int32 seq]: both sides send reliably every 2s. The receiver logs seq + gap,
+    // so we measure reliable delivery + loss per direction independent of gameplay actions. Receive counters
+    // (pos = unreliable 0x06/07/08, other = everything else) flush every 2s. Combined with [P2P-FAIL] this
+    // tells us: transport dying (→ go SteamNetworkingMessages) vs a half-open session. Remove after diagnosis.
+    private float _heartbeatTimer = 0f;
+    private int   _heartbeatSeqOut = 0;
+    private int   _heartbeatSeqIn  = -1;
+    private float _netDiagTimer = 0f;
+    private int   _diagRecvPos = 0;
+    private int   _diagRecvOther = 0;
+    private int   _diagRecvHeartbeat = 0;
+
     void Update()
     {
         if (!_initialized) return;
@@ -2235,17 +2326,38 @@ public class SteamManager : MonoBehaviour
         if (SteamNetwork.Role == NetworkRole.Host && SteamNetwork.LobbyID != 0)
             PollLobbyMembers();
 
-        // Read all available packets in a single Update
-        int maxPacketsPerFrame = 10;
+        // Read all available packets in a single Update (bumped: fragmented reliable bursts during initial sync)
+        int maxPacketsPerFrame = 64;
         for (int i = 0; i < maxPacketsPerFrame; i++)
         {
             var packet = ReadPacket();
             if (packet == null || packet.Length == 0) break;
             _lastRemotePacketTime = Time.time;
-            // Log only service packets (not position, animation, time)
-            if (packet[0] != 0x06 && packet[0] != 0x07 && packet[0] != 0x08)
-                _logger.LogInfo($"[P2P] Received packet {packet.Length} bytes, type={packet[0]}");
+            byte pt = packet[0];
+
+            // Reliability framing (0xFE data / 0xFF ack) → ReliableNet; it delivers reassembled inner
+            // messages back through DispatchReliableInner (which counts + dispatches). Don't log framing.
+            if (pt == 0xFE || pt == 0xFF) { ReliableNet.HandleIncoming(packet); continue; }
+
+            // DIAG: classify raw arrivals (position = unreliable; native-setup = "other")
+            if (pt == 0x06 || pt == 0x07 || pt == 0x08) _diagRecvPos++;
+            else _diagRecvOther++;
+            if (pt != 0x06 && pt != 0x07 && pt != 0x08)
+                _logger.LogInfo($"[P2P] Received packet {packet.Length} bytes, type={pt}");
             OnPacketReceived(packet);
+        }
+
+        // Drive the reliability layer: retransmit unacked fragments + flush cumulative acks (runs always)
+        ReliableNet.Tick(Time.deltaTime);
+
+        // DIAG (patch A): flush receive counters every 2s — shows reliable vs unreliable arrival per direction
+        _netDiagTimer += Time.deltaTime;
+        if (_netDiagTimer >= 2f)
+        {
+            _netDiagTimer = 0f;
+            if (SteamNetwork.RemoteID != 0)
+                _logger.LogInfo($"[NET-DIAG] recv last 2s: pos(unrel)={_diagRecvPos} hb={_diagRecvHeartbeat} other(rel)={_diagRecvOther} | lastHbSeqIn={_heartbeatSeqIn} hbSeqOut={_heartbeatSeqOut}");
+            _diagRecvPos = _diagRecvOther = _diagRecvHeartbeat = 0;
         }
 
         // Clone is spawned, but packets from the other player are gone — they left
@@ -2274,6 +2386,17 @@ public class SteamManager : MonoBehaviour
             {
                 _timeSyncTimer = 0f;
                 SendTimeSync();
+            }
+
+            // DIAG (patch A): reliable heartbeat 0x24 every 2s — measures reliable delivery + loss per direction
+            _heartbeatTimer += Time.deltaTime;
+            if (_heartbeatTimer >= 2f)
+            {
+                _heartbeatTimer = 0f;
+                var hb = new byte[5];
+                hb[0] = 0x24;
+                System.Buffer.BlockCopy(System.BitConverter.GetBytes(_heartbeatSeqOut++), 0, hb, 1, 4);
+                SendPacket(SteamNetwork.RemoteID, hb);
             }
 
             // 🔬 TIME-DIAG (2026-06-12): "the partner's day period doesn't change" —
@@ -2520,6 +2643,16 @@ public class SteamManager : MonoBehaviour
         catch (Exception e) { _logger.LogWarning($"[JOIN] Showing the message failed: {e.Message}"); }
     }
 
+    // A reliable inner message was fully reassembled by ReliableNet → count it (NET-DIAG) then dispatch normally.
+    private void DispatchReliableInner(byte[] inner)
+    {
+        if (inner == null || inner.Length == 0) return;
+        if (inner[0] == 0x24) _diagRecvHeartbeat++; else _diagRecvOther++;
+        if (inner[0] != 0x06 && inner[0] != 0x07 && inner[0] != 0x08)
+            _logger.LogInfo($"[P2P] Received(rel) {inner.Length} bytes, type={inner[0]}");
+        OnPacketReceived(inner);
+    }
+
     private void OnPacketReceived(byte[] data)
     {
         byte type = data[0];
@@ -2559,6 +2692,9 @@ public class SteamManager : MonoBehaviour
                     _logger.LogError("[STEAM] Client connected, but the host is NOT in the world yet — save NOT sent (0x23). Enter your world, then invite again.");
                     return;
                 }
+                // Realign the reliable streams at the session (re)start — both sides reset on the 0x01 handshake
+                // (client resets right before sending it), so seq spaces agree for all gameplay that follows.
+                ReliableNet.Reset();
                 StartCoroutine(SendSaveToClient());
             }
         }
@@ -2987,6 +3123,15 @@ public class SteamManager : MonoBehaviour
         {
             // ── Garden/orchard state sync: uid(8) x(4) y(4) objIdLen(2) objId json ──
             ChopSync.ApplyRemoteGardenState(data);
+        }
+        else if (type == 0x24)
+        {
+            // DIAG (patch A): heartbeat from the partner. Log seq + gap so reliable loss is visible per direction.
+            int seq = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : -1;
+            int gap = (_heartbeatSeqIn >= 0 && seq > _heartbeatSeqIn) ? seq - _heartbeatSeqIn - 1 : 0;
+            if (gap > 0) _logger.LogWarning($"[HEARTBEAT] recv seq={seq} — LOST {gap} reliable heartbeat(s) since {_heartbeatSeqIn}");
+            else _logger.LogInfo($"[HEARTBEAT] recv seq={seq} ✓");
+            _heartbeatSeqIn = seq;
         }
     }
 
@@ -3712,6 +3857,10 @@ public class SteamManager : MonoBehaviour
         ChopSync.Reset();
 
         yield return new WaitForSeconds(1f);
+
+        // Realign the reliable streams BEFORE the handshake — the host resets on receiving this 0x01, so both
+        // seq spaces start at 0 for everything that follows (covers re-join without restart too).
+        ReliableNet.Reset();
 
         // 0x01 carries the protocol version [0x01][int32]: the host checks it and refuses (0x22) on mismatch,
         // otherwise different mod builds silently desync (critical for a public release).
