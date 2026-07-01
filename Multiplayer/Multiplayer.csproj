@@ -33,52 +33,62 @@
         <ErrorReport>prompt</ErrorReport>
         <WarningLevel>4</WarningLevel>
     </PropertyGroup>
+
+    <!-- Path to the Graveyard Keeper install. Contributors: set the GRAVEYARD_KEEPER_DIR environment variable
+         (see README). The fallbacks below cover common Steam library locations so a local build works out of the box. -->
+    <PropertyGroup>
+        <GameDir Condition="'$(GameDir)' == '' AND '$(GRAVEYARD_KEEPER_DIR)' != ''">$(GRAVEYARD_KEEPER_DIR)</GameDir>
+        <GameDir Condition="'$(GameDir)' == '' AND Exists('C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper')">C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper</GameDir>
+        <GameDir Condition="'$(GameDir)' == '' AND Exists('C:\Program Files\Steam\steamapps\common\Graveyard Keeper')">C:\Program Files\Steam\steamapps\common\Graveyard Keeper</GameDir>
+        <GameDir Condition="'$(GameDir)' == '' AND Exists('B:\SteamLibrary\steamapps\common\Graveyard Keeper')">B:\SteamLibrary\steamapps\common\Graveyard Keeper</GameDir>
+    </PropertyGroup>
+
     <ItemGroup>
         <Reference Include="0Harmony">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\BepInEx\core\0Harmony.dll</HintPath>
+          <HintPath>$(GameDir)\BepInEx\core\0Harmony.dll</HintPath>
         </Reference>
         <Reference Include="Assembly-CSharp">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\Assembly-CSharp.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\Assembly-CSharp.dll</HintPath>
         </Reference>
         <Reference Include="BepInEx">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\BepInEx\core\BepInEx.dll</HintPath>
+          <HintPath>$(GameDir)\BepInEx\core\BepInEx.dll</HintPath>
         </Reference>
         <Reference Include="BepInEx.Harmony">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\BepInEx\core\BepInEx.Harmony.dll</HintPath>
+          <HintPath>$(GameDir)\BepInEx\core\BepInEx.Harmony.dll</HintPath>
         </Reference>
         <Reference Include="Steamworks.NET">
-          <HintPath>..\..\..\..\Downloads\Steamworks.NET.dll</HintPath>
+          <HintPath>lib\Steamworks.NET.dll</HintPath>
         </Reference>
         <Reference Include="System"/>
         <Reference Include="System.Core"/>
         <Reference Include="System.Data"/>
         <Reference Include="System.Xml"/>
         <Reference Include="UnityEngine">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.AnimationModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.AnimationModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.CoreModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.IMGUIModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.TextRenderingModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.InputLegacyModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.ParticleSystemModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.Physics2DModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.Physics2DModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.Physics2DModule.dll</HintPath>
         </Reference>
         <Reference Include="UnityEngine.PhysicsModule">
-          <HintPath>B:\SteamLibrary\steamapps\common\Graveyard Keeper\Graveyard Keeper_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+          <HintPath>$(GameDir)\Graveyard Keeper_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
         </Reference>
     </ItemGroup>
     <ItemGroup>
@@ -95,15 +105,16 @@
     <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
 
     <PropertyGroup>
-        <PluginsDir>B:\SteamLibrary\steamapps\common\Graveyard Keeper\BepInEx\plugins\</PluginsDir>
+        <PluginsDir>$(GameDir)\BepInEx\plugins\</PluginsDir>
     </PropertyGroup>
 
-    <Target Name="AfterBuild">
+    <!-- Deploy the built DLL only when the game folder actually resolved (skip on CI / a machine without the game). -->
+    <Target Name="AfterBuildDeploy" AfterTargets="Build" Condition="'$(GameDir)' != '' AND Exists('$(PluginsDir)')">
         <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll"
               DestinationFolder="$(PluginsDir)"
               OverwriteReadOnlyFiles="true"
               SkipUnchangedFiles="false"/>
-        <Message Text="[Deploy] $(AssemblyName).dll → $(PluginsDir)" Importance="high"/>
+        <Message Text="[Deploy] $(AssemblyName).dll -> $(PluginsDir)" Importance="high"/>
     </Target>
 
 </Project>
