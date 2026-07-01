@@ -2109,6 +2109,7 @@ public static class ChopSync
     // apply to see whether marble was already there, arrived in the json, or got injected by our apply/force.
     public static void LogGraveFurniture(MonoBehaviour wgo, long uid, string when)
     {
+        if (!Multiplayer.DebugMode) return;   // verbose per-apply diag — only when debugging
         try
         {
             if (wgo == null || _dataField == null || _itemInventoryField == null || _itemIdField == null) return;

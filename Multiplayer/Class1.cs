@@ -206,6 +206,10 @@ static class StartPlayingGameGuardPatch
 public class Multiplayer : BaseUnityPlugin
 {
     internal static ManualLogSource Log;
+    // Developer mode: gates the dev keybinds (F2-F12, Shift+C loss injector, IJKL test-clone movement) and the
+    // verbose per-tick diagnostics. OFF by default so a normal player can't accidentally break their game or
+    // drown their log. Flip it in BepInEx/config/com.denys.multiplayer.cfg for debugging.
+    internal static bool DebugMode;
 
     private GameObject player;
     private GameObject player2;
@@ -222,6 +226,10 @@ public class Multiplayer : BaseUnityPlugin
     {
         Log = Logger;
         Instance = this;
+        DebugMode = Config.Bind("Debug", "DebugMode", false,
+            "Enables developer keybinds (F2-F12, Shift+C packet-loss injector, IJKL test-clone movement) and verbose " +
+            "per-tick diagnostic logging. Leave OFF for normal play — these are dev tools that can disrupt a live game.").Value;
+        if (DebugMode) Logger.LogWarning("[MP] DebugMode ON — dev keybinds + verbose diagnostics enabled");
 
         // Without this Unity halts the game loop when the window is inactive → the mod stops sending/receiving
         // packets and sync "freezes" for a player who switched windows. runInBackground keeps the loop running.
@@ -385,6 +393,14 @@ public class Multiplayer : BaseUnityPlugin
             _p1MissingTimer = 0f;
         }
 
+        // F11 — create a lobby (host). The one player-facing keybind → always available.
+        if (Input.GetKeyDown(KeyCode.F11))
+            SteamManager.Instance?.CreateLobby();
+
+        // Everything below is a developer tool (diagnostics, recon dumps, split-screen test clone, packet-loss
+        // injector). Gate it behind DebugMode so a player can't wreck their session with an accidental F9/Shift+C.
+        if (!DebugMode) return;
+
         // F7 — find the player
         if (Input.GetKeyDown(KeyCode.F7))
         {
@@ -470,12 +486,6 @@ public class Multiplayer : BaseUnityPlugin
             Logger.LogInfo(rb2d != null
                 ? $"  Rigidbody2D: bodyType={rb2d.bodyType}, simulated={rb2d.simulated}"
                 : "  Rigidbody2D: not found");
-        }
-
-        // F11 — create a lobby (host)
-        if (Input.GetKeyDown(KeyCode.F11))
-        {
-            SteamManager.Instance?.CreateLobby();
         }
 
         // F12 — connection status
@@ -2407,7 +2417,7 @@ public class SteamManager : MonoBehaviour
         if (_netDiagTimer >= 2f)
         {
             _netDiagTimer = 0f;
-            if (SteamNetwork.RemoteID != 0)
+            if (SteamNetwork.RemoteID != 0 && Multiplayer.DebugMode)
                 _logger.LogInfo($"[NET-DIAG] recv last 2s: pos(unrel)={_diagRecvPos} hb={_diagRecvHeartbeat} other(rel)={_diagRecvOther} | lastHbSeqIn={_heartbeatSeqIn} hbSeqOut={_heartbeatSeqOut}");
             _diagRecvPos = _diagRecvOther = _diagRecvHeartbeat = 0;
         }
@@ -2700,7 +2710,7 @@ public class SteamManager : MonoBehaviour
     {
         if (inner == null || inner.Length == 0) return;
         if (inner[0] == 0x24) _diagRecvHeartbeat++; else _diagRecvOther++;
-        if (inner[0] != 0x06 && inner[0] != 0x07 && inner[0] != 0x08)
+        if (Multiplayer.DebugMode && inner[0] != 0x06 && inner[0] != 0x07 && inner[0] != 0x08)
             _logger.LogInfo($"[P2P] Received(rel) {inner.Length} bytes, type={inner[0]}");
         OnPacketReceived(inner);
     }
@@ -3191,7 +3201,7 @@ public class SteamManager : MonoBehaviour
             int seq = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : -1;
             int gap = (_heartbeatSeqIn >= 0 && seq > _heartbeatSeqIn) ? seq - _heartbeatSeqIn - 1 : 0;
             if (gap > 0) _logger.LogWarning($"[HEARTBEAT] recv seq={seq} — LOST {gap} reliable heartbeat(s) since {_heartbeatSeqIn}");
-            else _logger.LogInfo($"[HEARTBEAT] recv seq={seq} ✓");
+            else if (Multiplayer.DebugMode) _logger.LogInfo($"[HEARTBEAT] recv seq={seq} ✓");
             _heartbeatSeqIn = seq;
         }
     }

@@ -79,13 +79,14 @@ Both players must run the same version of `Multiplayer.dll`.
 
 | Key | Action |
 |-----|--------|
-| `F7`  | Find the player in the scene |
-| `F8`  | Toggle position logging |
-| `F9`  | Spawn a local P2 (split-screen test) |
-| `F10` | P2 diagnostics |
-| `F11` | Create a lobby (host) |
-| `F12` | Steam connection status |
-| `IJKL` / `HJKL` | Move the local test P2 |
+| `F11` | **Create a lobby (host)** — the main action to start co-op |
+
+The mod also ships with developer keybinds (F2–F10, F12, `Shift+C`, `IJKL`) for
+diagnostics, recon dumps, a split-screen test clone, and a packet-loss injector.
+They're **off by default** and only active when `DebugMode = true` in
+`BepInEx/config/com.denys.multiplayer.cfg`. Leave it off for normal play — those
+tools can disrupt a live game. Beta testers: turn it on so bug reports include
+full diagnostics.
 
 ---
 
