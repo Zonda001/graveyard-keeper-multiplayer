@@ -1,0 +1,91 @@
+name: "🐞 Bug report"
+description: Report a sync problem, crash, or other bug in co-op
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! This is a **networked co-op** mod, so most bugs depend on
+        *who* saw them, *what both players were doing*, and the **connection quality**.
+        The more of the fields below you fill in, the faster it gets fixed.
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Who saw the bug?
+      description: Host = created the lobby (F11). Client = joined via invite.
+      options:
+        - Host
+        - Client
+        - Both players
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+      placeholder: e.g. "I repaired a grave but on my friend's screen it still looked broken."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exactly what both players did, in order. Note who did what.
+      placeholder: |
+        1. Host places a chest near the church
+        2. Client opens the same chest
+        3. Both move items at the same time
+        4. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection type
+      description: Sync bugs are very sensitive to packet loss. This helps a lot.
+      options:
+        - Same local network (LAN / same house)
+        - Internet — good/stable connection
+        - Internet — one side has weak/unstable internet (mobile, dorm, etc.)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Mod version
+      description: The release tag or commit hash of the Multiplayer.dll you're running. Both players must run the SAME one.
+      placeholder: e.g. v0.1.0-beta or commit b1dfb42
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs from BOTH players
+      description: |
+        Attach or paste `BepInEx/LogOutput.log` from **both** the host and the client.
+        ⚠️ Grab it right after the bug — the game overwrites it on the next launch.
+        Logs render better as an attached file than pasted text.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: Both players were running the exact same `Multiplayer.dll`
+          required: true
+        - label: The game was launched through Steam (not the .exe directly)
+          required: true
+        - label: I searched existing issues and this isn't a duplicate
+          required: false

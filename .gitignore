@@ -12,6 +12,7 @@ riderModule.iml
 .claude/
 .remember/
 memory/
+NEXT-SESSION.md
 
 # Логи
 *.log

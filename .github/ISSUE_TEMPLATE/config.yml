@@ -1,0 +1,7 @@
+# Force reporters to pick a structured template instead of opening a blank issue.
+blank_issues_enabled: false
+# Optional: point people at a chat for quick questions (replace the URL, then uncomment).
+# contact_links:
+#   - name: 💬 Discord (quick questions / testing)
+#     url: https://discord.gg/your-invite-here
+#     about: For quick help and beta-testing chat. Use GitHub Issues for bugs so they don't get lost.
