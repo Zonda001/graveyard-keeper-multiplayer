@@ -1,226 +1,228 @@
 # Graveyard Keeper — Multiplayer Mod
 
-Мод що додає кооператив на 2 гравці до **Graveyard Keeper** (гра спочатку
-тільки однокористувацька). З'єднання — через Steam P2P, без окремого сервера.
+A mod that adds 2-player co-op to **Graveyard Keeper** (originally a
+single-player game). Connection is over Steam P2P — no separate server.
 
-> Статус: у розробці, готується до бети. Синхронізуються рух/анімації/час,
-> рубка дерев і каменю, збір природи, грядки, **могили** (стадії копання +
-> закопування тіла + ремонт), **переносимий труп** (носіння/кидок + передача
-> власності), **будівництво** (розміщення → будівництво → знесення), **крафт**
-> на верстатах, **інвентар** (спільні скрині + стокпайли + обмін), **погода**,
-> а також персональний сейв 2-го персонажа й особистий сюжет-шар (квести/NPC).
-> NPC-мешканці, моби/зомбі — поки ні.
-
----
-
-## Можливості
-
-Що вже працює:
-
-- Створення/приєднання до Steam-лобі (FriendsOnly, максимум 2 гравці)
-- Передача сейву від хоста клієнту — обидва грають в одному світі
-- Синхронізація позиції та анімацій (клон іншого гравця видно на обох боках)
-- Синхронізація ігрового дня й часу доби — сон будь-кого переводить обох
-- Детект виходу гравця — клон зникає при виході з лобі, вильоті чи
-  розриві мережі (три шляхи: колбек лобі, опитування складу лобі,
-  таймаут пакетів 5с)
-- Синхронізація рубки дерев — удари й зрубування дерева видно в напарника
-- Синхронізація розбивання наземного каменю + лут (колоди, каміння, вугілля,
-  мармур, залізо)
-- Синхронізація луту від жил у шахтах (жила не зникає, реплеїться тільки лут)
-- Збір природи (гриби/квіти/кущі) + трансформація грядок ферми
-- **Спільний лут** — обидва гравці отримують лут (інвентарі окремі)
-- **Могили** — синк стадій копання (state-replication через JSON), закопування
-  тіла назад, відбудова кургану/рамки/хреста, ремонт (durability)
-- **Переносимий труп** — носіння над головою (overhead-поза) + кидок, з мирором
-  позиції; **передача власності** (інший гравець підіймає труп собі)
-- **Будівництво (Фаза 2)** — повний цикл: розміщення будмайданчика → будівництво
-  (будь-хто будує, плейсхолдер→готова) → знесення, усе синкається спільним uid
-- **Крафт на верстатах** — кооп-крафт: спільні черги, арбітраж власника станції,
-  живий прогрес-бар у напарника
-- **Інвентар** — спільні скрині (оп-синк, конкурентне редагування обома), стокпайли
-  ресурсів, обмін предметами через скрині
-- **Погода** — host-authoritative денний розклад пресетів
-- **Персональний сейв 2-го персонажа** — свій файл персонажа поверх світу хоста
-  (навички/hp/техи/крафти/перки окремі), + особистий сюжет-шар (журнал квестів,
-  відомі NPC) — світ спільний, прогрес персональний (модель Stardew)
-- Пропуск туторіалу/інтро для клієнта
-- Оптимізації: кешована рефлексія, буфери пакетів без алокацій, власний шар
-  надійності поверх Steam-unreliable (ReliableNet)
-
-Що **поки не** синхронізується:
-
-- Стан NPC-мешканців (позиції/розклад)
-- Моби й зомбі підземелля (відкладено — чекає прогресу до данжу)
+> Status: in development, preparing for beta. Synced: movement/animations/time,
+> tree & stone chopping, foraging, garden beds, **graves** (digging stages +
+> reburying a body + repair), **carried corpse** (carry/drop + ownership
+> handoff), **building** (placement → construction → demolition), **crafting**
+> at workstations, **inventory** (shared chests + stockpiles + item exchange),
+> **weather**, plus a personal save for the 2nd character and a personal story
+> layer (quests/NPCs). NPC villagers and dungeon mobs/zombies — not yet.
 
 ---
 
-## Встановлення
+## Features
 
-1. Встанови **BepInEx 5.4.23.5** у папку гри
-2. Поклади `Multiplayer.dll` у `Graveyard Keeper/BepInEx/plugins/`
-3. Запускай гру **через Steam** (інакше Steamworks не ініціалізується)
+Already working:
 
-Обидва гравці мають однакову версію `Multiplayer.dll`.
+- Create/join a Steam lobby (FriendsOnly, up to 2 players)
+- Save transfer from host to client — both play in the same world
+- Position and animation sync (the other player's clone is visible on both sides)
+- In-game day and time-of-day sync — anyone sleeping advances both
+- Player-leave detection — the clone disappears on lobby exit, crash, or network
+  drop (three paths: lobby callback, lobby-membership polling, 5s packet timeout)
+- Tree-chopping sync — hits and felling are visible to the partner
+- Ground-stone breaking + loot (logs, stone, coal, marble, iron)
+- Mine-vein loot sync (the vein doesn't disappear, only the loot is replayed)
+- Foraging (mushrooms/flowers/bushes) + farm garden-bed transitions
+- **Shared loot** — both players receive the loot (separate inventories)
+- **Graves** — digging-stage sync (state replication via JSON), reburying a body,
+  rebuilding the mound/fence/cross, repair (durability)
+- **Carried corpse** — overhead carrying + drop, with position mirroring;
+  **ownership handoff** (the other player picks the corpse up for themselves)
+- **Building (Phase 2)** — full cycle: place a build site → construct (anyone can
+  build, placeholder→finished) → demolish, all synced by a shared uid
+- **Workstation crafting** — co-op crafting: shared queues, station-owner
+  arbitration, live progress bar on the partner's side
+- **Inventory** — shared chests (op-based sync, concurrent editing by both),
+  resource stockpiles, item exchange through chests
+- **Weather** — host-authoritative daily preset schedule
+- **Personal 2nd-character save** — the client's own character file layered over
+  the host's world (skills/hp/techs/crafts/perks are separate), plus a personal
+  story layer (quest journal, known NPCs) — shared world, personal progress
+  (Stardew model)
+- Tutorial/intro skip for the client
+- Optimizations: cached reflection, allocation-free packet buffers, a custom
+  reliability layer over Steam-unreliable (ReliableNet)
+
+**Not yet** synced:
+
+- NPC-villager state (positions/schedule)
+- Dungeon mobs and zombies (deferred — waiting for dungeon-stage progress)
 
 ---
 
-## Як грати
+## Installation
 
-**Хост:**
-1. Зайди у свій сейв
-2. Натисни `F11` — створиться лобі, відкриється Steam-оверлей запрошення
-3. Запроси друга
+1. Install **BepInEx 5.4.23.5** into the game folder
+2. Drop `Multiplayer.dll` into `Graveyard Keeper/BepInEx/plugins/`
+3. Launch the game **through Steam** (otherwise Steamworks won't initialize)
 
-**Клієнт:**
-1. Прийми запрошення в Steam
-2. Мод сам завантажить сейв хоста й приєднає тебе до світу
-
-### Клавіші
-
-| Клавіша | Дія |
-|---------|-----|
-| `F7`  | Знайти гравця у сцені |
-| `F8`  | Увімк./вимк. лог позиції |
-| `F9`  | Заспавнити локального P2 (split-screen тест) |
-| `F10` | Діагностика P2 |
-| `F11` | Створити лобі (хост) |
-| `F12` | Статус Steam-з'єднання |
-| `IJKL` / `HJKL` | Рух локального тестового P2 |
+Both players must run the same version of `Multiplayer.dll`.
 
 ---
 
-## Збірка
+## How to play
+
+**Host:**
+1. Load your save
+2. Press `F11` — a lobby is created and the Steam invite overlay opens
+3. Invite your friend
+
+**Client:**
+1. Accept the Steam invite
+2. The mod downloads the host's save and joins you into the world
+
+### Keys
+
+| Key | Action |
+|-----|--------|
+| `F7`  | Find the player in the scene |
+| `F8`  | Toggle position logging |
+| `F9`  | Spawn a local P2 (split-screen test) |
+| `F10` | P2 diagnostics |
+| `F11` | Create a lobby (host) |
+| `F12` | Steam connection status |
+| `IJKL` / `HJKL` | Move the local test P2 |
+
+---
+
+## Building
 
 ```sh
 dotnet build Multiplayer/Multiplayer.csproj -c Release
 ```
 
-Після збірки DLL автоматично копіюється у `BepInEx/plugins/` гри (якщо папку гри знайдено).
+After a build, the DLL is copied into the game's `BepInEx/plugins/`
+automatically (when the game folder is found).
 
-- **Шлях до гри:** задай змінну середовища `GRAVEYARD_KEEPER_DIR` (напр.
-  `C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper`). Якщо не задано —
-  збірка спробує знайти гру у типових Steam-локаціях автоматично.
-- `Steamworks.NET.dll` вендорнутий у `Multiplayer/lib/` — нічого докачувати не треба.
-- `build.ps1` — збірка з кольоровим виводом, опційний перезапуск гри
-- `log-watch.ps1` — живий перегляд BepInEx-логу з підсвічуванням
+- **Game path:** set the `GRAVEYARD_KEEPER_DIR` environment variable (e.g.
+  `C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper`). If it's not
+  set, the build tries to locate the game in common Steam locations automatically.
+- `Steamworks.NET.dll` is vendored in `Multiplayer/lib/` — nothing to download.
+- `build.ps1` — build with colored output, optional game restart
+- `log-watch.ps1` — live BepInEx-log viewer with highlighting
 
 ---
 
-## Мережевий протокол
+## Network protocol
 
-P2P-пакети (перший байт — тип):
+P2P packets (first byte is the type):
 
-| Тип | Призначення |
-|-----|-------------|
-| `0x01` | Клієнт запитує сейв у хоста |
-| `0x02` | Хост: розмір сейву |
-| `0x03` | Чанк сейву (по 500 КБ) |
-| `0x04` | Передачу сейву завершено |
-| `0x05` | Стартова позиція хоста для клієнта |
-| `0x06` | Позиція + анімація (26 байт, 20/сек) |
-| `0x07` | Подія анімації (17 байт, при зміні) |
-| `0x08` | Синхронізація дня й часу доби (9 байт, кожні 2с) |
-| `0x09` | Удар по дереву/каменю — косметичне трясіння в напарника |
-| `0x0A` | Дерево/камінь знищено — прибирання обʼєкта в напарника |
-| `0x0B` | Лут від рубки/жили — реплей `WGO.DropItems` у напарника |
-| `0x0D` | Реплікація стану могили/будівлі (JSON `ToJSON(0)` + `RestoreFromSerializedObject`) — стадії копання, закопування, будівництво |
-| `0x0F` | Позиція переносимого трупа (дзеркалення носія, 16/сек) |
-| `0x10` | Труп прибрано (покладено/спожито) — глядач видаляє копію |
-| `0x11` | Спавн трупа (повний JSON стану) на граві напарника |
-| `0x12` / `0x13` | Носіння overhead: несе предмет над головою клона / поклав |
-| `0x14` | Передача власності трупа (глядач підняв мирор → власник прибирає копію) |
-| `0x15` | Спавн-примітив: новий обʼєкт (будівля) у напарника зі спільним uid |
-| `0x16` | Знесення будівлі — напарник прибирає копію |
-| `0x17` | Крафт-черга верстата (кооп-крафт, етап видимості) — напарник бачить ті самі вікна-черги над станціями |
-| `0x18` | Claim/release станції (арбітраж власника) — старт крафту блокує станцію для напарника, завершення звільняє; flag=2 несе прогрес крафту (живий бар у напарника) |
-| `0x19` | Опи скрині (спільні скрині = обмін предметами): дельти вмісту («забрав 2 води», «поклав 3 дошки») — конкурентне редагування обома гравцями; реконсиліація повним станом 0x0D на закритті GUI |
+| Type | Purpose |
+|------|---------|
+| `0x01` | Client requests the save from the host |
+| `0x02` | Host: save size |
+| `0x03` | Save chunk (500 KB each) |
+| `0x04` | Save transfer complete |
+| `0x05` | Host's start position for the client |
+| `0x06` | Position + animation (26 bytes, 20/s) |
+| `0x07` | Animation event (17 bytes, on change) |
+| `0x08` | Day and time-of-day sync (9 bytes, every 2s) |
+| `0x09` | Tree/stone hit — cosmetic shake on the partner |
+| `0x0A` | Tree/stone destroyed — object removal on the partner |
+| `0x0B` | Loot from chopping/vein — replays `WGO.DropItems` on the partner |
+| `0x0D` | Grave/building state replication (JSON `ToJSON(0)` + `RestoreFromSerializedObject`) — digging stages, reburying, building, grave repair |
+| `0x0F` | Carried-corpse position (mirrors the carrier, 16/s) |
+| `0x10` | Corpse removed (placed/consumed) — the viewer deletes its copy |
+| `0x11` | Corpse spawn (full state JSON) on the partner's screen |
+| `0x12` / `0x13` | Overhead carrying: the clone carries an item overhead / put it down |
+| `0x14` | Corpse ownership handoff (viewer picked up the mirror → owner removes its copy) |
+| `0x15` | Spawn primitive: a new object (building) on the partner with a shared uid |
+| `0x16` | Building demolition — the partner removes its copy |
+| `0x17` | Workstation craft queue (co-op crafting, visibility stage) — the partner sees the same queue widgets over stations |
+| `0x18` | Station claim/release (owner arbitration) — a craft start locks the station for the partner, finishing releases it; flag=2 carries craft progress (live bar on the partner) |
+| `0x19` | Chest ops (shared chests = item exchange): content deltas ("took 2 water", "put 3 planks") — concurrent editing by both players; full-state reconciliation via 0x0D on GUI close |
+| `0x1A` | Weather (host-authoritative daily preset schedule) |
+| `0x1C` | Story world-flags (whitelisted shared flags) |
 
 ---
 
 ## Roadmap
 
-**✅ Готово**
-- Steam-лобі, P2P-сесія
-- Передача сейву хост → клієнт
-- Синхронізація позиції та анімацій
-- Синхронізація дня й часу доби
-- Стабільність: без зайвих тіней, без дубля клону, без лагу при рубці,
-  без крашу при сні
-- Детект виходу гравця — клон зникає при виході, вильоті чи розриві мережі
-- Синхронізація рубки дерев (Фаза 1) — удари, знищення, пень, анімація падіння
-- Синхронізація наземного каменю — удари, знищення, лут
-- Синхронізація луту від жил шахт (вугілля, каміння, мармур, залізо)
-- Збір природи + грядки ферми; спільний лут (обидва отримують)
-- Могили: стадії копання + закопування тіла + відбудова (state-replication 0x0D)
-- Переносимий труп: носіння/кидок + передача власності між гравцями
-- Будівництво (Фаза 2): розміщення → будівництво → знесення
-- Крафт на верстатах (кооп-черги, арбітраж, живий бар)
-- Інвентар: спільні скрині + стокпайли + обмін
-- Погода (host-authoritative)
-- Персональний сейв 2-го персонажа + особистий сюжет-шар (квести/NPC)
-- Власний шар надійності (ReliableNet) поверх Steam-unreliable
+**✅ Done**
+- Steam lobby, P2P session
+- Save transfer host → client
+- Position and animation sync
+- Day and time-of-day sync
+- Stability: no stray shadows, no duplicate clone, no chop lag, no sleep crash
+- Player-leave detection — clone disappears on exit, crash, or network drop
+- Tree-chopping sync (Phase 1) — hits, destruction, stump, fall animation
+- Ground-stone sync — hits, destruction, loot
+- Mine-vein loot sync (coal, stone, marble, iron)
+- Foraging + farm garden beds; shared loot (both receive it)
+- Graves: digging stages + reburying a body + rebuild (state replication 0x0D)
+- Carried corpse: carry/drop + ownership handoff between players
+- Building (Phase 2): placement → construction → demolition
+- Workstation crafting (co-op queues, arbitration, live bar)
+- Inventory: shared chests + stockpiles + exchange
+- Weather (host-authoritative)
+- Personal 2nd-character save + personal story layer (quests/NPCs)
+- Custom reliability layer (ReliableNet) over Steam-unreliable
 
-**🔜 Далі**
-- Закрита бета для волонтерів
-- Синхронізація стану NPC-мешканців
-- Моби й зомбі підземелля
-- Анімація сну для гравця що не спав (зараз — миттєвий стрибок дня)
+**🔜 Next**
+- Closed beta for volunteers
+- NPC-villager state sync
+- Dungeon mobs and zombies
+- Sleep animation for the player who didn't sleep (currently — instant day jump)
 
-**💡 Ідеї на потім**
-- Більше ніж 2 гравці
-- Голосовий/текстовий чат у грі
-
----
-
-## Траблшутинг
-
-### Гра крашить на старті — білий екран, «Не відповідає»
-
-**Причина:** конфлікт свіжих NVIDIA-драйверів (серія 32.x, з кінця 2025)
-з Unity-стеком гри. Краш відбувається **до** завантаження BepInEx — мод
-тут ні до чого, та сама поведінка й без нього. У стек-трейсі
-`Player-prev.log` видно `NvPresent64.NVP_Init_Vulkan` → `dxgi.CreateDXGIFactory2`.
-
-**Фікси, від найшвидшого:**
-
-1. **Перемкнути гру на iGPU** (ноутбуки з гібридною графікою — найшвидший
-   воркараунд). NVIDIA Control Panel → Manage 3D Settings → Program
-   Settings → знайти `Graveyard Keeper.exe` → *Preferred graphics
-   processor* = **Integrated**. Гра не вимоглива, на iGPU йде нормально.
-2. **Вимкнути overlay-фічі NVIDIA**. NVIDIA App → Settings → Graphics:
-   вимкнути *Smooth Motion*, *Frame Generation*, *Game Filters*,
-   *Overlay*. Закрити Discord/GeForce Experience перед запуском.
-3. **Відкат драйвера через DDU** (найнадійніше). Завантажити старший
-   Game Ready Driver (серії 5xx, осінь 2025) з
-   [nvidia.com/Download](https://www.nvidia.com/Download/Find.aspx),
-   завантажити [DDU](https://www.guru3d.com/download/display-driver-uninstaller-download/),
-   у Safe Mode зробити Clean and restart, потім поставити завантажений
-   драйвер вручну (БЕЗ NVIDIA App / GeForce Experience — щоб не
-   автооновився назад).
-
-Якщо жоден з фіксів не допомагає — є шанс що проблема в чомусь іншому,
-відкрий issue з файлами `Player.log` і `Player-prev.log` з папки гри.
+**💡 Ideas for later**
+- More than 2 players
+- In-game voice/text chat
 
 ---
 
-## Технічне
+## Troubleshooting
 
-- **Рушій:** Unity 2020.3, .NET Framework 4.7.2
-- **Моддінг:** BepInEx 5.4.23.5 + HarmonyLib (патчинг через рефлексію)
-- **Мережа:** Steamworks.NET (Steam P2P, без релею) + власний шар надійності
-  `ReliableNet` (TCP-lite поверх unreliable — Steam reliable на цьому SDK битий)
-- Код розбитий по підсистемах: `Class1.cs` (ядро/мережа), `WorldSync.cs`,
+### The game crashes on startup — white screen, "Not responding"
+
+**Cause:** a conflict between recent NVIDIA drivers (the 32.x series, from late
+2025) and the game's Unity stack. The crash happens **before** BepInEx loads —
+the mod isn't involved, the same behavior occurs without it. The `Player-prev.log`
+stack trace shows `NvPresent64.NVP_Init_Vulkan` → `dxgi.CreateDXGIFactory2`.
+
+**Fixes, fastest first:**
+
+1. **Switch the game to the iGPU** (laptops with hybrid graphics — the fastest
+   workaround). NVIDIA Control Panel → Manage 3D Settings → Program Settings →
+   find `Graveyard Keeper.exe` → *Preferred graphics processor* = **Integrated**.
+   The game is light and runs fine on an iGPU.
+2. **Disable NVIDIA overlay features.** NVIDIA App → Settings → Graphics: turn off
+   *Smooth Motion*, *Frame Generation*, *Game Filters*, *Overlay*. Close
+   Discord/GeForce Experience before launching.
+3. **Roll back the driver with DDU** (most reliable). Download an older Game Ready
+   Driver (the 5xx series, autumn 2025) from
+   [nvidia.com/Download](https://www.nvidia.com/Download/Find.aspx), download
+   [DDU](https://www.guru3d.com/download/display-driver-uninstaller-download/),
+   in Safe Mode do Clean and restart, then install the downloaded driver manually
+   (WITHOUT NVIDIA App / GeForce Experience — so it doesn't auto-update back).
+
+If none of the fixes help, the problem may be something else — open an issue with
+`Player.log` and `Player-prev.log` from the game folder.
+
+---
+
+## Technical
+
+- **Engine:** Unity 2020.3, .NET Framework 4.7.2
+- **Modding:** BepInEx 5.4.23.5 + HarmonyLib (patching via reflection)
+- **Network:** Steamworks.NET (Steam P2P, no relay) + a custom reliability layer
+  `ReliableNet` (TCP-lite over unreliable — Steam's reliable send is broken on
+  this SDK)
+- Code is split by subsystem: `Class1.cs` (core/network), `WorldSync.cs`,
   `Crafting.cs`, `Chests.cs`, `Story.cs`, `Weather.cs`, `CharacterSave.cs`,
   `Reliability.cs`
-- Гра патчиться через рефлексію та Harmony — прямого доступу до її API нема
-- Механіку гри читаємо з декомпільованого `Assembly-CSharp` (ilspycmd) — щоб
-  синкати точно за реальним кодом, а не вгадувати
+- The game is patched via reflection and Harmony — there's no direct access to
+  its API
+- Game mechanics are read from the decompiled `Assembly-CSharp` (ilspycmd) — so
+  we sync against the real code instead of guessing
 
 ---
 
-## Ліцензія
+## License
 
-[MIT](LICENSE) — вільно використовуй, змінюй, поширюй. Це неофіційний фанатський
-мод; не афілійований із Lazy Bear Games чи tinyBuild. `Steamworks.NET` (у `lib/`) —
-під власною MIT-ліцензією (© rlabrecque).
+[MIT](LICENSE) — use, modify, and distribute freely. This is an unofficial fan
+mod, not affiliated with Lazy Bear Games or tinyBuild. `Steamworks.NET` (in
+`lib/`) is under its own MIT license (© rlabrecque).
