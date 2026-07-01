@@ -227,6 +227,12 @@ If none of the fixes help, the problem may be something else — open an issue w
 Help is welcome — testing, bug reports, or code. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for build setup, the (2-player) testing workflow, and code layout.
 
+## Support
+
+This mod is free and always will be. If you'd like to support development, you can
+buy me a coffee: **[ko-fi.com/zonda](https://ko-fi.com/zonda)**. Totally optional —
+bug reports and testing help just as much. ❤️
+
 ---
 
 ## License
