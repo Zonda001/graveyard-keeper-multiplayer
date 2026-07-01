@@ -202,7 +202,7 @@ static class StartPlayingGameGuardPatch
 
 // ═════════════════════════════════════════════════════════════
 
-[BepInPlugin("com.denys.multiplayer", "Multiplayer", "1.0.0")]
+[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.1")]
 public class Multiplayer : BaseUnityPlugin
 {
     internal static ManualLogSource Log;
