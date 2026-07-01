@@ -222,6 +222,13 @@ If none of the fixes help, the problem may be something else — open an issue w
 
 ---
 
+## Contributing
+
+Help is welcome — testing, bug reports, or code. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for build setup, the (2-player) testing workflow, and code layout.
+
+---
+
 ## License
 
 [MIT](LICENSE) — use, modify, and distribute freely. This is an unofficial fan
