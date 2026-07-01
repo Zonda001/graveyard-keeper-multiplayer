@@ -57,6 +57,42 @@ public static class PlayerControlPatch
     }
 }
 
+// DIAG (2026-06-24, temporary): client SLEEP soft-lock (freeze tied to the Gerry/first-burial intro). The client
+// went to bed but SleepGUI never reached State.Sleeping (TIME-DIAG never showed timeScale=10/stopped, no wake_up,
+// energy not restored) → hard soft-lock. SleepGUI.Open's FIRST line dereferences
+// WorldMap.GetWorldGameObjectByCustomTag("hero_bed") — if that's null on the client it NREs before the GUI opens.
+// This probe logs the bed lookup + any exception thrown by Open. Remove once root-caused.
+[HarmonyPatch]
+public static class SleepGuiDiagPatch
+{
+    static MethodBase TargetMethod()
+    {
+        var t = AccessTools.TypeByName("SleepGUI");
+        return t?.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .FirstOrDefault(m => m.Name == "Open");
+    }
+
+    static void Prefix()
+    {
+        try
+        {
+            var wm = AccessTools.TypeByName("WorldMap");
+            var getTag = wm?.GetMethod("GetWorldGameObjectByCustomTag", BindingFlags.Public | BindingFlags.Static);
+            var bed = getTag?.Invoke(null, new object[] { "hero_bed" });
+            Multiplayer.Log?.LogInfo($"[SLEEP-DIAG] SleepGUI.Open entered — hero_bed={(bed != null ? "found" : "NULL")} role={SteamNetwork.Role}");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[SLEEP-DIAG] prefix: {e.Message}"); }
+    }
+
+    static Exception Finalizer(Exception __exception)
+    {
+        if (__exception != null)
+            Multiplayer.Log?.LogError($"[SLEEP-DIAG] SleepGUI.Open THREW: {__exception.GetType().Name}: {__exception.Message}");
+        return __exception;   // rethrow — pure diagnostic, don't change behavior
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCH 2 — UpdatePlayer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +515,12 @@ public class Multiplayer : BaseUnityPlugin
         //      (id/uid/pos). Capture on BOTH machines near the SAME NPC → uid stable? positions differ?
         if (Input.GetKeyDown(KeyCode.F2))
             ChopSync.DumpNpcs();
+
+        // Shift+C — CHAOS: cycle simulated packet loss OFF→10%→25%→40%→OFF on this machine's outgoing reliable
+        //      datagrams. Reproduces the lossy-internet bursts that surface the chest/grave races on a clean LAN.
+        //      Enable on one or both PCs, then repeat the buggy actions. See ReliableNet.CycleChaos.
+        if (Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.C))
+            ReliableNet.CycleChaos();
     }
 
     // ── Spawn the other player's clone (networked) ────────────────────────────────
@@ -2335,16 +2377,26 @@ public class SteamManager : MonoBehaviour
             _lastRemotePacketTime = Time.time;
             byte pt = packet[0];
 
-            // Reliability framing (0xFE data / 0xFF ack) → ReliableNet; it delivers reassembled inner
-            // messages back through DispatchReliableInner (which counts + dispatches). Don't log framing.
-            if (pt == 0xFE || pt == 0xFF) { ReliableNet.HandleIncoming(packet); continue; }
+            // Isolate per-packet dispatch: a throw in any handler (rogue NRE, malformed payload) must NOT
+            // escape Update — otherwise Unity skips the rest of the frame, including ReliableNet.Tick below
+            // (the ACK/retransmit pump), stalling the reliable layer. One bad packet ≠ a stalled session.
+            try
+            {
+                // Reliability framing (0xFE data / 0xFF ack) → ReliableNet; it delivers reassembled inner
+                // messages back through DispatchReliableInner (which counts + dispatches). Don't log framing.
+                if (pt == 0xFE || pt == 0xFF) { ReliableNet.HandleIncoming(packet); continue; }
 
-            // DIAG: classify raw arrivals (position = unreliable; native-setup = "other")
-            if (pt == 0x06 || pt == 0x07 || pt == 0x08) _diagRecvPos++;
-            else _diagRecvOther++;
-            if (pt != 0x06 && pt != 0x07 && pt != 0x08)
-                _logger.LogInfo($"[P2P] Received packet {packet.Length} bytes, type={pt}");
-            OnPacketReceived(packet);
+                // DIAG: classify raw arrivals (position = unreliable; native-setup = "other")
+                if (pt == 0x06 || pt == 0x07 || pt == 0x08) _diagRecvPos++;
+                else _diagRecvOther++;
+                if (pt != 0x06 && pt != 0x07 && pt != 0x08)
+                    _logger.LogInfo($"[P2P] Received packet {packet.Length} bytes, type={pt}");
+                OnPacketReceived(packet);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError($"[P2P] Dispatch threw for type=0x{pt:X2} ({packet.Length}b): {e}");
+            }
         }
 
         // Drive the reliability layer: retransmit unacked fragments + flush cumulative acks (runs always)
@@ -2727,6 +2779,15 @@ public class SteamManager : MonoBehaviour
             int chunkIndex = System.BitConverter.ToInt32(data, 1);
             int offset     = chunkIndex * 500000;
             int size       = data.Length - 5;
+            // Defensive: a 0x03 chunk arriving before its 0x02 header (lost/reordered), or one that runs past
+            // the announced size, would NRE/throw inside Array.Copy. Drop it instead — the transfer is reliable
+            // and ordered, so a missing 0x02 means something is already wrong; don't compound it with a crash.
+            if (_saveBuffer == null) { _logger.LogWarning("[P2P] 0x03 chunk before 0x02 header — dropped"); return; }
+            if (offset < 0 || size < 0 || offset + size > _saveBuffer.Length)
+            {
+                _logger.LogWarning($"[P2P] 0x03 chunk {chunkIndex} out of bounds (offset={offset} size={size} buf={_saveBuffer.Length}) — dropped");
+                return;
+            }
             System.Array.Copy(data, 5, _saveBuffer, offset, size);
             _saveChunksReceived++;
             _logger.LogInfo($"[P2P] Received chunk {chunkIndex} ({size} bytes)");

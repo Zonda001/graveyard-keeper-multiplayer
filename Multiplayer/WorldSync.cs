@@ -1902,6 +1902,7 @@ public static class ChopSync
     {
         EnsureReflection();
         _lastRemoteChestOpTime[uid] = Time.realtimeSinceStartup;
+
         var wgo = FindWgoByUniqueId(uid);
         if (wgo == null)
         {
@@ -2097,6 +2098,31 @@ public static class ChopSync
             return ch != null ? _getOverheadItemMethod.Invoke(ch, null) : null;
         }
         catch { return null; }
+    }
+
+    // ── DIAG (temporary) — grave furniture state around a 0x0D apply, to localize grave-sync issues
+    // (marble/parts showing in the grave bubble; repair not syncing). Remove once root-caused.
+
+    // Grave furniture (grave_* items in the grave's inventory = what the bubble shows). Call before/after a 0x0D
+    // apply to see whether marble was already there, arrived in the json, or got injected by our apply/force.
+    public static void LogGraveFurniture(MonoBehaviour wgo, long uid, string when)
+    {
+        try
+        {
+            if (wgo == null || _dataField == null || _itemInventoryField == null || _itemIdField == null) return;
+            var data = _dataField.GetValue(wgo);
+            var inv = data != null ? _itemInventoryField.GetValue(data) as System.Collections.IList : null;
+            var ids = new List<string>();
+            if (inv != null)
+                foreach (var it in inv)
+                {
+                    if (it == null) continue;
+                    string id = _itemIdField.GetValue(it) as string;
+                    if (id != null && id.StartsWith("grave")) ids.Add(id);
+                }
+            Multiplayer.Log?.LogInfo($"[DIAG-GRAVE] uid={uid} {when}: furniture=[{string.Join(",", ids.ToArray())}]");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[DIAG-GRAVE] {e.Message}"); }
     }
 
     // HOME STRETCH — fix for "exit with a corpse in hand" (deferred bug 2026-06-10): when the carrier
@@ -3320,6 +3346,7 @@ public static class ChopSync
         }
         catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] 0x0D monotonicity guard failed (applying anyway): {e.Message}"); }
 
+        LogGraveFurniture(target, uid, "BEFORE-apply");   // DIAG: grave furniture / repair sync
         ApplyingRemoteChop = true;
         try
         {
@@ -3369,6 +3396,7 @@ public static class ChopSync
                 _graveSentStageSig.Remove(uid);
                 _graveSentParts.Remove(uid);
             }
+            LogGraveFurniture(target, uid, "AFTER-apply");   // DIAG: did marble appear from the json/force?
             Multiplayer.Log?.LogInfo($"[CHOP] Grave uid={uid} obj={objId} state restored ✓ (json={json.Length}ch)");
             // Phase 3: if this chest is open for us right now — live panel refresh (see changes immediately).
             RefreshOpenChestGui(target);

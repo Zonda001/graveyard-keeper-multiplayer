@@ -34,6 +34,44 @@ public static class ReliableNet
     public static Action<byte[]>     OnDeliver;  // hand a fully reassembled inner message to the dispatcher
     public static ManualLogSource    Log;
 
+    // ── DEBUG chaos injector: simulated packet loss ───────────────────────────────────────────────────────────
+    // The gameplay races (chest "-1 on cursor", half-drawn grave) only surface under packet loss. Reason: this
+    // layer delivers IN ORDER — when a fragment is lost, later ones pile up in _reorder and the whole contiguous
+    // run drains in ONE frame the moment the gap fills (the while-loop in HandleIncoming). That burst applies a
+    // clump of ops at once → opens the race window. A clean LAN never bursts, so those bugs can't be reproduced
+    // on it — which is why a friend on lossy dorm/CGNAT internet hit them and a two-PC LAN test never does.
+    // This drops a configurable fraction of OUTGOING datagrams — DATA, retransmits AND acks, exactly what a lossy
+    // uplink does — to force the bursts on demand. Toggled by a debug key (Shift+C). OFF in production.
+    public static bool  ChaosEnabled;
+    public static float ChaosDropRate;                                 // 0..1 — P(an outgoing datagram is dropped)
+    static readonly System.Random _chaosRng = new System.Random();
+    static int _chaosDropped, _chaosSent;
+
+    // Cycle OFF → 10% → 25% → 40% → OFF so you can walk the loss up until the bug appears.
+    public static void CycleChaos()
+    {
+        float[] steps = { 0f, 0.10f, 0.25f, 0.40f };
+        int cur = 0;
+        for (int i = 0; i < steps.Length; i++)
+            if (Mathf.Approximately(steps[i], ChaosDropRate)) { cur = i; break; }
+        ChaosDropRate = steps[(cur + 1) % steps.Length];
+        ChaosEnabled  = ChaosDropRate > 0f;
+        Log?.LogWarning($"[CHAOS] packet-loss injector → {(ChaosEnabled ? $"{ChaosDropRate * 100f:0}% drop" : "OFF")} " +
+                        $"(dropped {_chaosDropped}/{_chaosSent} datagrams so far)");
+    }
+
+    // Every outgoing datagram funnels through here. When chaos is on, silently swallow a fraction of them so the
+    // reliability layer must retransmit — reproducing the real bursty, delayed delivery of a lossy link.
+    static void WireSend(byte[] wire)
+    {
+        if (ChaosEnabled)
+        {
+            _chaosSent++;
+            if (_chaosRng.NextDouble() < ChaosDropRate) { _chaosDropped++; return; }   // "lost" — never hits the wire
+        }
+        RawSend?.Invoke(wire);
+    }
+
     // ── Send side: our outgoing reliable stream ──
     static uint _sendSeq;
     class Pending { public byte[] wire; public float lastSent; public int tries; }
@@ -84,7 +122,7 @@ public static class ReliableNet
             wire[5] = (byte)(more ? 1 : 0);
             Buffer.BlockCopy(payload, off, wire, 6, chunk);
             _unacked[seq] = new Pending { wire = wire, lastSent = now, tries = 1 };
-            RawSend?.Invoke(wire);
+            WireSend(wire);
             off += chunk;
         } while (off < payload.Length);
     }
@@ -152,7 +190,7 @@ public static class ReliableNet
             var p = kv.Value;
             if (now - p.lastSent >= RESEND_AFTER)
             {
-                RawSend?.Invoke(p.wire);
+                WireSend(p.wire);
                 p.lastSent = now;
                 p.tries++;
             }
@@ -167,7 +205,7 @@ public static class ReliableNet
                 var ack = new byte[5];
                 ack[0] = TAG_ACK;
                 BitConverter.GetBytes(_recvNext - 1).CopyTo(ack, 1);
-                RawSend?.Invoke(ack);
+                WireSend(ack);
             }
         }
     }
