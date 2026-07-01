@@ -558,6 +558,7 @@ public static class ChopSync
     private static ConstructorInfo _itemCtor;           // new Item(string id, int value)
     private static FieldInfo  _itemIdField;             // Item.id (string)
     private static FieldInfo  _itemValueField;          // Item.value (int)
+    private static PropertyInfo _itemDurabilityProp;    // Item.durability (float 0..1, get=_params.durability) — repair ratchet
     private static Type       _directionType;           // Direction (enum)
     private static MethodInfo _dropItemsMethod;         // WGO.DropItems(List<Item>, Direction)
     private static MethodInfo _dropItemSingularMethod;  // WGO.DropItem(Item, Direction, Vector3, float, bool)
@@ -731,6 +732,7 @@ public static class ChopSync
         _itemIdField     = _itemType?.GetField("id", f);
         _itemInventoryField = _itemType?.GetField("inventory", f);  // List<Item> — the grave's furniture items
         _itemValueField  = _itemType?.GetField("value", f);
+        _itemDurabilityProp = _itemType?.GetProperty("durability", f);   // repair ratchet — AFTER _itemType (rule #2)
         // ⚠️ CHEST OPS (0x19) — these bindings MUST come STRICTLY AFTER _itemType is assigned! Incident
         // 2026-06-11: this block was above `_itemType = ...`, and EnsureReflection runs once → the methods
         // were null FOREVER → the add/remove branches silently skipped ("ops ✓", but contents didn't change; 4 tests).
@@ -2118,11 +2120,46 @@ public static class ChopSync
                 {
                     if (it == null) continue;
                     string id = _itemIdField.GetValue(it) as string;
-                    if (id != null && id.StartsWith("grave")) ids.Add(id);
+                    if (id == null || !id.StartsWith("grave")) continue;
+                    float dur = -1f; try { dur = Convert.ToSingle(_itemDurabilityProp.GetValue(it, null)); } catch { }
+                    ids.Add($"{id}:{dur:0.00}");   // include durability — repair changes THIS, not the id set
                 }
             Multiplayer.Log?.LogInfo($"[DIAG-GRAVE] uid={uid} {when}: furniture=[{string.Join(",", ids.ToArray())}]");
         }
         catch (Exception e) { Multiplayer.Log?.LogWarning($"[DIAG-GRAVE] {e.Message}"); }
+    }
+
+    // REPAIR SYNC: a positional 2-bit code of each grave part's VISUAL stage (1..3), ordered by part id. The game
+    // renders a part at stage = clamp(4 - ceil(durability*3), 1, 3) (GetNewWOPPrefabsNames, decomp 88903) — so a
+    // repair (durability up) or decay (down) that crosses a bucket changes this code, while the part-id set stays
+    // the same. We fold it into the grave's `variation`/invH so it flows into BOTH the send- and receive-side
+    // signatures (which are otherwise KEY-ONLY and would dedup a repair away). Deterministic and machine-independent
+    // (no string hashing): both sides derive the same code from the same parts+durability → echoes still suppress.
+    private static int GraveStageCode(MonoBehaviour wgo)
+    {
+        try
+        {
+            if (wgo == null || _dataField == null || _itemInventoryField == null
+                || _itemIdField == null || _itemDurabilityProp == null) return 0;
+            var data = _dataField.GetValue(wgo);
+            var inv = data != null ? _itemInventoryField.GetValue(data) as System.Collections.IList : null;
+            if (inv == null) return 0;
+            var parts = new List<KeyValuePair<string, int>>();
+            foreach (var it in inv)
+            {
+                if (it == null) continue;
+                string id = _itemIdField.GetValue(it) as string;
+                if (id == null || !id.StartsWith("grave")) continue;
+                float dur = 0f; try { dur = Convert.ToSingle(_itemDurabilityProp.GetValue(it, null)); } catch { }
+                int stage = Mathf.Clamp(4 - Mathf.CeilToInt(dur * 3f), 1, 3);
+                parts.Add(new KeyValuePair<string, int>(id, stage));
+            }
+            parts.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));   // stable order → same code on both machines
+            int code = 0;
+            for (int i = 0; i < parts.Count && i < 15; i++) code |= (parts[i].Value & 3) << (2 * i);
+            return code;   // 0 = no grave parts (empty grave)
+        }
+        catch { return 0; }
     }
 
     // HOME STRETCH — fix for "exit with a corpse in hand" (deferred bug 2026-06-10): when the carrier
@@ -2699,11 +2736,13 @@ public static class ChopSync
             bool hasBody = GraveHasBody(wgo);
             // + WORKBENCH CONTENT HASH (Phase 2 craft): the output/materials sit in the inventory, not in obj_id,
             // so a key-only signature doesn't change during a craft → dedup would mute it. The hash is in the packet (variation bits 1+).
-            // GRAVES EXCLUDED (they're has_craft too): they're covered by the body bit + key-sig — a path proven
-            // over 8 iterations; adding an inv-hash would risk echo-suppression (a return of
-            // the 2026-06-08 dupe loop) if a restore normalized the inventory in any way.
-            int invH = (!IsGraveTarget(wgo) && (IsWorkbench(wgo) || IsTrackedChest(wgo)))
-                           ? WorkbenchInvHash(wgo) : 0;   // Phase 3: chests are inv-sensitive too
+            // GRAVES: fold in the part VISUAL-STAGE code (GraveStageCode) — repair/decay changes a part's rendered
+            // stage without changing the key set, and a key-only sig would dedup it away on BOTH sides (repair
+            // wasn't syncing, 2026-07-01). It rides invH exactly like the workbench hash → same wire, same receiver
+            // sig. Safe from the old dupe loop: it tracks durability STAGE, not inventory counts a restore reorders.
+            int invH = IsGraveTarget(wgo)                       ? GraveStageCode(wgo)
+                     : (IsWorkbench(wgo) || IsTrackedChest(wgo)) ? WorkbenchInvHash(wgo)
+                     : 0;                                       // Phase 3: chests are inv-sensitive too
             string sig = GraveStageSig(objId, json) + (hasBody ? "|B" : "") + (invH != 0 ? "|w" + invH : "");
 
             // ECHO-SUPPRESSION (dupe fix): if this is EXACTLY the stage we just received
@@ -2726,6 +2765,7 @@ public static class ChopSync
 
             // Stage DEDUP: several triggers (RedrawPart/OnWorkFinished/OnCraftStateChanged) catch intermediate
             // stages with a micro json diff. Send only when the REAL stage changed → 1 send/stage (was ~14 = flicker).
+            // A repair now changes `sig` via the stage code in invH → it passes this dedup instead of being muted.
             if (_lastSentGraveSig.TryGetValue(uid, out var prev) && prev == sig) return;
             _lastSentGraveSig[uid] = sig;
 
