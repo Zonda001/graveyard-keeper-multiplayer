@@ -2704,6 +2704,71 @@ public static class ChopSync
     // shrinks across stages 13587→...→732). The reverse on the receiver — JsonUtility.
     // FromJsonOverwrite into a local Item (types/formulas stay valid).
     // 0x0D format: type(1) uid(8) x(4) y(4) variation(4) objIdLen(2) objId jsonLen(4) json
+    // ── POST-RESYNC RECONCILE ─────────────────────────────────────────────────────────────
+    // Everything queued in ReliableNet while the link was dead is gone for good (PrepareResync/Reset drop the
+    // retransmit queue by design). The 0x25/0x26 resync heals the CHANNEL, not the WORLD: live test #4
+    // (2026-07-03) — a grave repaired inside the dead window stayed broken for the other player. So after every
+    // completed resync the HOST re-broadcasts the full state of every state-synced object through the fresh
+    // stream (host-only: both sides sweeping could cross-apply diverged states). Drip-fed one object per
+    // RECONCILE_INTERVAL — a cemetery of 12KB jsons in one frame is exactly the burst that opens the GUI races.
+    private static readonly Queue<MonoBehaviour> _reconcilePending = new Queue<MonoBehaviour>();
+    private static float _reconcileTimer;
+    private const float RECONCILE_INTERVAL = 0.25f;
+
+    public static void ReconcileAfterResync()
+    {
+        EnsureReflection();
+        if (!_ready || !Connected()) return;
+        _reconcilePending.Clear();
+        foreach (var comp in ScanWgosCached())
+        {
+            var mb = comp as MonoBehaviour;
+            if (mb == null || !IsStateRepTarget(mb)) continue;
+            _reconcilePending.Enqueue(mb);
+        }
+        _reconcileTimer = 0f;
+        Multiplayer.Log?.LogWarning($"[CHOP] Post-resync reconcile: re-broadcasting {_reconcilePending.Count} object states (1 per {RECONCILE_INTERVAL}s)");
+    }
+
+    // Called every frame from SteamManager.Update (next to TickGardens).
+    public static void TickReconcile()
+    {
+        if (_reconcilePending.Count == 0) return;
+        _reconcileTimer += Time.deltaTime;
+        if (_reconcileTimer < RECONCILE_INTERVAL) return;
+        _reconcileTimer = 0f;
+
+        var wgo = _reconcilePending.Dequeue();
+        if (wgo == null) return;   // destroyed since the sweep was queued
+        try
+        {
+            long uid = Convert.ToInt64(_uniqueIdField.GetValue(wgo));
+
+            // The peer OWNS objects it's actively working on — live test #5 (2026-07-03): the sweep restored
+            // host truth over the client's in-progress grave-repair craft → "-1" artifact on the client. A
+            // claimed station re-broadcasts its own state when the craft ends, and a freshly-edited chest
+            // reconciles on the peer's GUI close — skipping here loses nothing.
+            if (_remoteCrafting.TryGetValue(uid, out var claim) &&
+                Time.realtimeSinceStartup - claim.time < CRAFT_CLAIM_TTL)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] Reconcile: uid={uid} skipped — the partner's craft claim is active");
+                return;
+            }
+            if (_lastRemoteChestOpTime.TryGetValue(uid, out var opAt) &&
+                Time.realtimeSinceStartup - opAt < CHEST_SNAPSHOT_QUIESCE)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] Reconcile: uid={uid} skipped — the partner just edited this chest");
+                return;
+            }
+
+            _lastSentGraveSig.Remove(uid);   // the state may be locally "unchanged" — force it past the stage dedup
+            _containerSnapshotPass = true;   // tracked chests: full snapshot (their 0x19 op stream may have holes)
+            OnLocalGraveStateChanged(wgo);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] Reconcile send failed: {e.Message}"); }
+        finally { _containerSnapshotPass = false; }
+    }
+
     public static void OnLocalGraveStateChanged(MonoBehaviour wgo)
     {
         if (ApplyingRemoteChop || !Connected()) return;

@@ -202,7 +202,7 @@ static class StartPlayingGameGuardPatch
 
 // ═════════════════════════════════════════════════════════════
 
-[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.1")]
+[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.2")]
 public class Multiplayer : BaseUnityPlugin
 {
     internal static ManualLogSource Log;
@@ -531,6 +531,16 @@ public class Multiplayer : BaseUnityPlugin
         //      Enable on one or both PCs, then repeat the buggy actions. See ReliableNet.CycleChaos.
         if (Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.C))
             ReliableNet.CycleChaos();
+
+        // Shift+X — kill THIS machine's ReliableNet (Stop() without a session restart): simulates the wild
+        //      zombie state (spurious lobby "left" → Stop, movement keeps flowing, gameplay sync dead) so the
+        //      degraded-link warning can be live-tested on demand. Within ~20s BOTH machines should show it.
+        //      Recovery is the real one: the client exits to the menu and re-joins.
+        if (Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.X))
+        {
+            ReliableNet.Stop();
+            Logger.LogWarning("[NET] Shift+X — ReliableNet stopped on THIS side (zombie-state simulation); expect the degraded warning on both machines");
+        }
     }
 
     // ── Spawn the other player's clone (networked) ────────────────────────────────
@@ -1659,7 +1669,7 @@ public static class SteamNetwork
     public static ulong RemoteID = 0;
     // NETWORK protocol version — checked on connect (0x01 → host rejects with 0x22 on mismatch, else builds
     // silently desync). BUMP ON ANY PACKET FORMAT CHANGE. Separate from the BepInPlugin version.
-    public const int PROTOCOL_VERSION = 2;   // v2: gameplay rides ReliableNet (0xFE/0xFF framing) — wire-incompatible with v1
+    public const int PROTOCOL_VERSION = 3;   // v3: epoch byte in 0xFE/0xFF framing + 0x25/0x26 auto-resync — wire-incompatible with v2
     // Client's coop save slot. "999999" never collides — the game numbers slots 0..1000 only
     // (GetNewSlotFilename, decomp 102766). Removed in SteamManager.OnApplicationQuit.
     public const string CoopSaveSlot = "999999";
@@ -2053,6 +2063,7 @@ public class SteamManager : MonoBehaviour
                 _logger.LogInfo($"[STEAM] Other player left (id={changedId}, state={state}) — removing clone");
                 Multiplayer.Instance?.DespawnRemotePlayer();
                 ReliableNet.Stop();        // peer gone — quit resending + block until next handshake
+                _resyncPending = false; _resyncAttempts = 0;   // nobody left to answer 0x25
                 SteamNetwork.RemoteID = 0;
                 _lastLobbyMemberCount = 0; // so PollLobbyMembers picks up a new player
             }
@@ -2118,11 +2129,7 @@ public class SteamManager : MonoBehaviour
         if (SteamNetwork.Role == NetworkRole.Host && SteamNetwork.LobbyID != 0)
         {
             _logger.LogInfo("[STEAM] Lobby already created! Opening overlay...");
-            var steamIdType = _steamMatchmaking?.Assembly.GetType("Steamworks.CSteamID");
-            var steamIdObj  = System.Activator.CreateInstance(steamIdType, SteamNetwork.LobbyID);
-            _steamFriends?.GetMethod("ActivateGameOverlayInviteDialog",
-                    BindingFlags.Public | BindingFlags.Static)
-                ?.Invoke(null, new[] { steamIdObj });
+            OpenInviteOverlay(SteamNetwork.LobbyID);
             return;
         }
 
@@ -2147,7 +2154,7 @@ public class SteamManager : MonoBehaviour
     }
 
     // Routing entry point. Three transport classes (see ReliableNet for the why):
-    //   0x06/0x07/0x08            → raw UNRELIABLE (high-freq, superseded next tick — loss is fine)
+    //   0x06/0x07/0x08, 0x25/0x26 → raw UNRELIABLE (high-freq superseded next tick / resync control beaten by repetition)
     //   0x01-0x05, 0x22, 0x23     → native Steam RELIABLE (handshake/save/version — setup + host→client, proven OK)
     //   everything else (gameplay)→ ReliableNet (TCP-lite over unreliable; Steam reliable drops client→host on SDK 1.42)
     public void SendPacket(ulong targetSteamId, byte[] data, int channel = 0)
@@ -2155,11 +2162,16 @@ public class SteamManager : MonoBehaviour
         if (data == null || data.Length == 0) return;
         byte t = data[0];
 
-        // Log service packets (not high-freq position/anim/time)
-        if (t != 0x06 && t != 0x07 && t != 0x08)
+        // Log service packets (not high-freq position/anim/time, not the 1/s resync control spam)
+        if (t != 0x06 && t != 0x07 && t != 0x08 && t != 0x25 && t != 0x26)
             _logger.LogInfo($"[P2P] SendPacket to {targetSteamId}: type=0x{t:X2} dataLen={data.Length}");
 
         if (t == 0x06 || t == 0x07 || t == 0x08)
+            SendRawDatagram(targetSteamId, data, reliable: false);
+        else if (t == 0x25 || t == 0x26)
+            // Resync control MUST ride raw unreliable: it repairs ReliableNet (can't ride what it fixes) and
+            // native reliable client→host is the proven-broken channel this whole layer exists to replace.
+            // Loss is beaten by repetition (0x25 re-sent every second until acked by 0x26).
             SendRawDatagram(targetSteamId, data, reliable: false);
         else if (t <= 0x05 || t == 0x22 || t == 0x23)
             SendRawDatagram(targetSteamId, data, reliable: true);
@@ -2368,6 +2380,32 @@ public class SteamManager : MonoBehaviour
     private int   _diagRecvOther = 0;
     private int   _diagRecvHeartbeat = 0;
 
+    // ── DEGRADED-LINK DETECTOR ──────────────────────────────────────────────────────────
+    // Zombie state seen in the wild (Nexus report 2026-07-03): raw unreliable keeps flowing (movement and
+    // time-of-day look fine) while the ReliableNet session is dead — e.g. a spurious lobby "left" event
+    // called ReliableNet.Stop() and nothing ever re-armed it (only a fresh client 0x01 does). Every gameplay
+    // sync silently stops and the players only notice much later, reporting it as many separate bugs.
+    // The 0x24 heartbeat rides ReliableNet every 2s from both sides, so "unreliable fresh + no reliable
+    // delivery for 15s" is a dependable degraded signal. Warn ON SCREEN so players restart the session.
+    private const float REL_SILENCE_WARN = 15f;
+    private float _lastReliableInTime;    // any ReliableNet-delivered inner message (heartbeat guarantees ≥1/2s)
+    private float _lastUnreliableInTime;  // any raw 0x06/0x07/0x08 arrival
+    private float _relEligibleSince;      // when the detector's preconditions became true (grace anchor)
+    private bool  _degradedWarned;
+
+    // ── AUTO-RESYNC (0x25 request / 0x26 confirm, raw unreliable, epoch byte payload) ──
+    // When the detector trips, don't just warn — rebuild the reliable layer in place: the initiator
+    // PrepareResync()s to the next epoch and asks the peer to Reset() to it; the 0x26 confirm Resume()s the
+    // initiator. Stale wire frames from the old generation are dropped by the epoch check in ReliableNet.
+    // The dialog becomes the FALLBACK for when the peer never answers (RESYNC_DIALOG_AFTER).
+    private const float RESYNC_DIALOG_AFTER = 20f;
+    private byte  _relEpoch;              // last epoch both sides agreed on (0 = the 0x01-handshake generation)
+    private bool  _resyncPending;
+    private byte  _resyncPendingEpoch;
+    private float _resyncSendTimer;
+    private int   _resyncAttempts;        // consecutive resyncs without a real recovery (episode counter)
+    private float _resyncEpisodeStartedAt;
+
     void Update()
     {
         if (!_initialized) return;
@@ -2397,7 +2435,7 @@ public class SteamManager : MonoBehaviour
                 if (pt == 0xFE || pt == 0xFF) { ReliableNet.HandleIncoming(packet); continue; }
 
                 // DIAG: classify raw arrivals (position = unreliable; native-setup = "other")
-                if (pt == 0x06 || pt == 0x07 || pt == 0x08) _diagRecvPos++;
+                if (pt == 0x06 || pt == 0x07 || pt == 0x08) { _diagRecvPos++; _lastUnreliableInTime = Time.time; }
                 else _diagRecvOther++;
                 if (pt != 0x06 && pt != 0x07 && pt != 0x08)
                     _logger.LogInfo($"[P2P] Received packet {packet.Length} bytes, type={pt}");
@@ -2422,6 +2460,8 @@ public class SteamManager : MonoBehaviour
             _diagRecvPos = _diagRecvOther = _diagRecvHeartbeat = 0;
         }
 
+        TickDegradedDetector();
+
         // Clone is spawned, but packets from the other player are gone — they left
         if (SteamNetwork.RemotePlayerSpawned &&
             Time.time - _lastRemotePacketTime > REMOTE_PACKET_TIMEOUT)
@@ -2442,6 +2482,7 @@ public class SteamManager : MonoBehaviour
 
             ChopSync.TickNpc();      // 0x20 NPC sync DISABLED via SYNC_NPC_POSITIONS flag (Stardew: NPCs are personal)
             ChopSync.TickGardens();  // host-reconcile of garden growth (host sends 0x21 for changed beds)
+            ChopSync.TickReconcile(); // post-resync world sweep (drip-fed; no-op when the queue is empty)
 
             _timeSyncTimer += Time.deltaTime;
             if (_timeSyncTimer >= TIME_SYNC_INTERVAL)
@@ -2642,6 +2683,126 @@ public class SteamManager : MonoBehaviour
         catch (System.Exception e) { _logger.LogError($"[P2P] PollLobby error: {e.Message}"); }
     }
 
+    // See the field block above REL_SILENCE_WARN for the why. Preconditions: in game with a peer AND raw
+    // unreliable arriving (<5s old) — so a peer that truly left (all packets stop → clone despawn) never
+    // trips this. Grace: silence is measured from _relEligibleSince, not from 0, so a fresh session has
+    // REL_SILENCE_WARN seconds to deliver its first reliable message before we'd ever warn.
+    private void TickDegradedDetector()
+    {
+        bool eligible = SteamNetwork.IsInGame && SteamNetwork.RemoteID != 0 &&
+                        Time.time - _lastUnreliableInTime < 5f;
+        if (!eligible) { _relEligibleSince = 0f; return; }
+        if (_relEligibleSince == 0f) _relEligibleSince = Time.time;
+
+        // Keep asking until the peer answers (0x26 clears _resyncPending). 1s cadence: 5-byte datagram,
+        // and repetition is the loss strategy for this raw-unreliable control channel.
+        if (_resyncPending)
+        {
+            _resyncSendTimer += Time.deltaTime;
+            if (_resyncSendTimer >= 1f)
+            {
+                _resyncSendTimer = 0f;
+                SendPacket(SteamNetwork.RemoteID, new byte[] { 0x25, _resyncPendingEpoch });
+            }
+        }
+
+        // Two eyes (2026-07-03 live test: Stop() keeps _recvNext, so the broken side still receives the peer
+        // fine and inbound silence fires only on the OTHER machine): inbound = peer's reliable went quiet;
+        // outbound = our own sends are blocked or unacked (ReliableNet self-reports).
+        float relSilence  = Time.time - Mathf.Max(_lastReliableInTime, _relEligibleSince);
+        bool inboundDead  = relSilence > REL_SILENCE_WARN;
+        bool outboundDead = ReliableNet.OutboundLooksDead;
+        if (inboundDead || outboundDead)
+        {
+            if (!_resyncPending)
+            {
+                if (_resyncAttempts == 0) _resyncEpisodeStartedAt = Time.time;
+                _resyncAttempts++;
+                _resyncPendingEpoch = (byte)(_relEpoch + 1);
+                _resyncPending   = true;
+                _resyncSendTimer = 1f;   // fire the first 0x25 on the next tick
+                ReliableNet.PrepareResync(_resyncPendingEpoch);
+                _logger.LogWarning("[NET] DEGRADED LINK: " +
+                    (inboundDead ? $"no reliable delivery from the peer for {relSilence:F0}s" : "inbound OK") + " | " +
+                    (outboundDead ? $"outbound dead: {ReliableNet.OutboundDeathReason}" : "outbound OK") +
+                    $" — starting auto-resync (epoch {_resyncPendingEpoch}, attempt {_resyncAttempts})");
+            }
+
+            // Fallback dialog counts the EPISODE, not the attempt (live test 2026-07-03 #3: a resync "completes"
+            // and immediately re-fires when the silence isn't cured, so a per-attempt timer never reaches 20s).
+            if (!_degradedWarned && _resyncAttempts >= 2 && Time.time - _resyncEpisodeStartedAt > RESYNC_DIALOG_AFTER)
+            {
+                _degradedWarned = true;
+                _logger.LogError($"[NET] DEGRADED LINK: still down after {_resyncAttempts} resync attempts over {Time.time - _resyncEpisodeStartedAt:F0}s — gameplay sync is DOWN (movement/time still look fine)");
+                ShowJoinError("Co-op connection problem detected!\n" +
+                              "You can still see each other move, but items, stations and world changes\n" +
+                              "have STOPPED syncing, and automatic repair isn't taking hold.\n\n" +
+                              "Fix: the joined player should exit to the main menu and re-join the host\n" +
+                              "(Steam invite or friends list -> Join Game).\n\n" +
+                              "If this keeps happening, please send BepInEx/LogOutput.log from both\n" +
+                              "players to the mod page.");
+            }
+        }
+        else if ((_degradedWarned || _resyncAttempts > 0) &&
+                 Time.time - _lastReliableInTime < 5f && !ReliableNet.OutboundLooksDead)
+        {
+            // Both directions healthy again (resync or re-join) — close the episode, re-arm for a future one.
+            _degradedWarned = false;
+            _resyncAttempts = 0;
+            _logger.LogInfo("[NET] Reliable channel recovered ✓ — degraded episode closed");
+        }
+    }
+
+    // 0x25 arrived: the peer's detector tripped and it already PrepareResync()ed to epoch e — realign to it.
+    private void OnResyncRequest(byte e)
+    {
+        if (_resyncPending && e == _resyncPendingEpoch)
+        {
+            // Both-initiators race (both detectors tripped, both bumped from the same _relEpoch). We already
+            // cleared+aligned in PrepareResync — a full Reset here could arrive AFTER the peer's post-Reset
+            // traffic (UDP reorder) and rewind _recvNext below it, redelivering duplicates. Just unblock+confirm.
+            _relEpoch = e; _resyncPending = false;
+            ReliableNet.Resume();
+            _relEligibleSince = Time.time;   // grace: give heartbeats REL_SILENCE_WARN s to cure the old silence
+            _logger.LogWarning($"[NET] Peer requested the resync we were also requesting → realigned (epoch {e}) ✓");
+            for (int i = 0; i < 3; i++)
+                SendPacket(SteamNetwork.RemoteID, new byte[] { 0x26, e });
+            if (SteamNetwork.Role == NetworkRole.Host) ChopSync.ReconcileAfterResync();
+            return;
+        }
+
+        if (e == _relEpoch)
+        {
+            // Duplicate of a request we already applied (its 0x26 got lost) — just confirm again, do NOT
+            // Reset a second time: new-generation traffic is already flowing and a rewind would desync it.
+            SendPacket(SteamNetwork.RemoteID, new byte[] { 0x26, e });
+            return;
+        }
+
+        _relEpoch = e;
+        ReliableNet.Reset(e);
+        // Grace after the realign: our own inbound-silence counter predates this fresh stream — measuring it
+        // now would instantly fire OUR detector and bump the epoch again, killing the fresh stream in turn.
+        // That exact ping-pong looped epochs 2..40+ in live test #3 (2026-07-03) until nothing could flow.
+        _relEligibleSince = Time.time;
+        _logger.LogWarning($"[NET] Peer requested reliable-layer resync → realigned to epoch {e} ✓");
+        for (int i = 0; i < 3; i++)   // burst the confirm — raw unreliable, cheap insurance
+            SendPacket(SteamNetwork.RemoteID, new byte[] { 0x26, e });
+        if (SteamNetwork.Role == NetworkRole.Host) ChopSync.ReconcileAfterResync();   // heal the WORLD, not just the channel
+    }
+
+    // 0x26 arrived: the peer realigned to our pending epoch — unblock our sending half.
+    private void OnResyncConfirm(byte e)
+    {
+        if (!_resyncPending || e != _resyncPendingEpoch) return;   // stray/stale confirm
+        _relEpoch      = e;
+        _resyncPending = false;
+        ReliableNet.Resume();
+        _relEligibleSince = Time.time;   // grace: the stale silence needs REL_SILENCE_WARN s for heartbeats to cure it
+        _logger.LogWarning($"[NET] Peer confirmed resync — reliable layer restored ✓ (epoch {e})");
+        if (SteamNetwork.Role == NetworkRole.Host) ChopSync.ReconcileAfterResync();   // heal the WORLD, not just the channel
+    }
+
     private byte[] _saveBuffer;
     private int    _saveBufferExpectedSize;
     private int    _saveChunksReceived;
@@ -2709,6 +2870,7 @@ public class SteamManager : MonoBehaviour
     private void DispatchReliableInner(byte[] inner)
     {
         if (inner == null || inner.Length == 0) return;
+        _lastReliableInTime = Time.time;
         if (inner[0] == 0x24) _diagRecvHeartbeat++; else _diagRecvOther++;
         if (Multiplayer.DebugMode && inner[0] != 0x06 && inner[0] != 0x07 && inner[0] != 0x08)
             _logger.LogInfo($"[P2P] Received(rel) {inner.Length} bytes, type={inner[0]}");
@@ -2718,6 +2880,10 @@ public class SteamManager : MonoBehaviour
     private void OnPacketReceived(byte[] data)
     {
         byte type = data[0];
+
+        // Reliable-layer resync control (raw unreliable, see TickDegradedDetector)
+        if (type == 0x25) { OnResyncRequest(data.Length >= 2 ? data[1] : (byte)0); return; }
+        if (type == 0x26) { OnResyncConfirm(data.Length >= 2 ? data[1] : (byte)0); return; }
 
         // The host save is loaded exactly once on connect. If the client is already in game, ignore a
         // repeated transfer (0x02-0x04) — else LoadSaveFromHost reloads the scene mid-game and game timers
@@ -2757,6 +2923,7 @@ public class SteamManager : MonoBehaviour
                 // Realign the reliable streams at the session (re)start — both sides reset on the 0x01 handshake
                 // (client resets right before sending it), so seq spaces agree for all gameplay that follows.
                 ReliableNet.Reset();
+                _relEpoch = 0; _resyncPending = false; _resyncAttempts = 0;   // fresh handshake supersedes any in-flight resync
                 StartCoroutine(SendSaveToClient());
             }
         }
@@ -3870,6 +4037,22 @@ public class SteamManager : MonoBehaviour
     {
         try
         {
+            // With the Steam overlay disabled, ActivateGameOverlayInviteDialog is a silent no-op: the lobby
+            // exists but the player sees nothing and thinks F11 is broken (Nexus report 2026-07-03). Tell
+            // them on screen instead — the friend can still join via the Steam friends list (desktop UI).
+            var utils = _steamFriends?.Assembly.GetType("Steamworks.SteamUtils");
+            var overlayEnabled = utils?.GetMethod("IsOverlayEnabled",
+                    BindingFlags.Public | BindingFlags.Static)
+                ?.Invoke(null, null) as bool?;
+            if (overlayEnabled == false)
+            {
+                _logger.LogWarning("[STEAM] Steam overlay is disabled — invite dialog can't open");
+                ShowJoinError("Lobby created, but the Steam Overlay is disabled, so the invite window can't open.\n" +
+                              "Your friend can still join: Steam friends list -> right-click your name -> Join Game.\n" +
+                              "To get the invite window back, enable the overlay in Steam -> Settings -> In Game.");
+                return;
+            }
+
             var steamIdType = _steamMatchmaking?.Assembly.GetType("Steamworks.CSteamID");
             var steamIdObj  = System.Activator.CreateInstance(steamIdType,
                 System.Convert.ToUInt64(lobbyId));
@@ -3932,6 +4115,7 @@ public class SteamManager : MonoBehaviour
         // Realign the reliable streams BEFORE the handshake — the host resets on receiving this 0x01, so both
         // seq spaces start at 0 for everything that follows (covers re-join without restart too).
         ReliableNet.Reset();
+        _relEpoch = 0; _resyncPending = false; _resyncAttempts = 0;   // fresh handshake supersedes any in-flight resync
 
         // 0x01 carries the protocol version [0x01][int32]: the host checks it and refuses (0x22) on mismatch,
         // otherwise different mod builds silently desync (critical for a public release).

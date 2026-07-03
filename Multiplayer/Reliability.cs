@@ -12,9 +12,12 @@ using UnityEngine;
 // primitive that demonstrably works: unreliable datagrams. In-order, ACKed, retransmitted, fragmented.
 //
 // WIRE (every frame all sent UNRELIABLE via RawSend):
-//   DATA: [0xFE][seq:uint32][more:1][payload bytes...]   more=1 → another fragment of the same message follows
-//   ACK : [0xFF][ackThrough:uint32]                      cumulative — receiver has delivered every seq ≤ ackThrough
-// 0xFE/0xFF are outside the app protocol range (0x01..0x24).
+//   DATA: [0xFE][epoch:1][seq:uint32][more:1][payload...]  more=1 → another fragment of the same message follows
+//   ACK : [0xFF][epoch:1][ackThrough:uint32]               cumulative — receiver delivered every seq ≤ ackThrough
+// 0xFE/0xFF are outside the app protocol range (0x01..0x26).
+// epoch = stream generation, bumped by the 0x25/0x26 auto-resync (see SteamManager). Frames from another
+// epoch are dropped on arrival: without this, stale in-flight fragments from before a Reset could land in
+// _reorder and later be delivered INSTEAD of the true fragment with the same seq (silent stream corruption).
 //
 // Bypass this layer (see SteamManager.SendPacket routing):
 //   - 0x06/0x07/0x08 position/anim/time → raw unreliable (superseded next tick; loss is fine)
@@ -24,7 +27,7 @@ public static class ReliableNet
 {
     const byte  TAG_DATA     = 0xFE;
     const byte  TAG_ACK      = 0xFF;
-    const int   FRAG_PAYLOAD = 1100;   // inner bytes per datagram (+6 header < Steam ~1200 unreliable cap)
+    const int   FRAG_PAYLOAD = 1100;   // inner bytes per datagram (+7 header < Steam ~1200 unreliable cap)
     const float RESEND_AFTER = 0.30f;  // retransmit an unacked fragment after this many seconds
     const float ACK_COALESCE = 0.03f;  // batch the cumulative ack instead of one per fragment
     const int   MAX_REORDER  = 8192;   // safety cap on the out-of-order buffer
@@ -74,8 +77,16 @@ public static class ReliableNet
 
     // ── Send side: our outgoing reliable stream ──
     static uint _sendSeq;
-    class Pending { public byte[] wire; public float lastSent; public int tries; }
+    class Pending { public byte[] wire; public float firstSent; public float lastSent; public int tries; }
     static readonly SortedDictionary<uint, Pending> _unacked = new SortedDictionary<uint, Pending>();
+
+    // ── Outbound-death signals (read by SteamManager's degraded-link detector) ──
+    // A side whose OUTBOUND died (post-Stop zombie, or the peer stopped acking) still receives the peer
+    // just fine, so the inbound-silence detector never fires HERE — proven by the 2026-07-03 Shift+X live
+    // test: only the OTHER machine warned. These two signals catch the local half of the breakage.
+    static float _notReadyDropSince;                       // first Send() swallowed by !_ready since Reset (0 = none)
+    public static bool   OutboundLooksDead  { get; private set; }
+    public static string OutboundDeathReason { get; private set; }
 
     // ── Recv side: the partner's incoming reliable stream ──
     static uint _recvNext;                                                         // next in-order seq to deliver
@@ -84,14 +95,19 @@ public static class ReliableNet
     static bool  _ackDue;
     static float _ackTimer;
     static bool  _ready;   // only true after a handshake Reset — blocks premature seq-0 sends before both sides align
+    static byte  _epoch;   // current stream generation (see the wire spec above)
 
-    public static void Reset()
+    public static void Reset() { Reset(0); }   // session (re)start via the 0x01 handshake → generation 0
+
+    public static void Reset(byte epoch)
     {
         _sendSeq = 0; _recvNext = 0;
         _unacked.Clear(); _reorder.Clear(); _assembly.Clear();
         _ackDue = false; _ackTimer = 0f;
         _ready = true;
-        Log?.LogInfo("[REL] reset — reliable streams realigned to 0 (session (re)start)");
+        _epoch = epoch;
+        _notReadyDropSince = 0f; OutboundLooksDead = false; OutboundDeathReason = null;
+        Log?.LogInfo($"[REL] reset — reliable streams realigned to 0 (epoch {epoch})");
     }
 
     // Peer gone: stop resending into the void and block sends until the next handshake Reset().
@@ -102,11 +118,40 @@ public static class ReliableNet
         _ready = false;
     }
 
+    // ── 0x25/0x26 auto-resync support (SteamManager drives the exchange) ──
+    // Initiator half: align to the PENDING epoch and go quiet. Receiving is fully functional (HandleIncoming
+    // ignores _ready), so the peer's post-Reset seq-0 stream is accepted+acked immediately; our own sends stay
+    // blocked until Resume() — sending seq 0 before the peer resets would desync the fresh streams.
+    public static void PrepareResync(byte pendingEpoch)
+    {
+        _sendSeq = 0; _recvNext = 0;
+        _unacked.Clear(); _reorder.Clear(); _assembly.Clear();
+        _ackDue = false; _ackTimer = 0f;
+        _ready = false;
+        _epoch = pendingEpoch;
+        _notReadyDropSince = 0f;
+        Log?.LogInfo($"[REL] resync prepared — waiting for the peer to realign (epoch {pendingEpoch})");
+    }
+
+    // Initiator half 2: the peer confirmed (0x26). ONLY unblock sending — a full Reset here would rewind
+    // _recvNext past anything the peer already delivered since ITS Reset and redeliver duplicates.
+    public static void Resume()
+    {
+        _ready = true;
+        _notReadyDropSince = 0f; OutboundLooksDead = false; OutboundDeathReason = null;
+    }
+
     // Queue a logical message: fragment it, store each fragment for retransmit, fire all now.
     public static void Send(byte[] payload)
     {
         if (payload == null || payload.Length == 0) return;
-        if (!_ready || SteamNetwork.RemoteID == 0) return;   // not past the handshake yet, or no peer — drop
+        if (!_ready || SteamNetwork.RemoteID == 0)           // not past the handshake yet, or no peer — drop
+        {
+            // Swallowing sends while a peer exists = the post-Stop zombie half; timestamp the first one
+            // so Tick can flag the outbound as dead if it goes on (Reset clears it).
+            if (!_ready && SteamNetwork.RemoteID != 0 && _notReadyDropSince == 0f) _notReadyDropSince = Time.time;
+            return;
+        }
         //  ↑ blocks any layer traffic (heartbeat/weather/time) the host might emit after setting RemoteID but
         //    BEFORE receiving 0x01 — sending seq 0 then would desync the stream when Reset() rewinds it.
         float now = Time.time;
@@ -116,12 +161,13 @@ public static class ReliableNet
             int chunk = Math.Min(FRAG_PAYLOAD, payload.Length - off);
             bool more = (off + chunk) < payload.Length;
             uint seq  = _sendSeq++;
-            var wire  = new byte[6 + chunk];
+            var wire  = new byte[7 + chunk];
             wire[0] = TAG_DATA;
-            BitConverter.GetBytes(seq).CopyTo(wire, 1);
-            wire[5] = (byte)(more ? 1 : 0);
-            Buffer.BlockCopy(payload, off, wire, 6, chunk);
-            _unacked[seq] = new Pending { wire = wire, lastSent = now, tries = 1 };
+            wire[1] = _epoch;
+            BitConverter.GetBytes(seq).CopyTo(wire, 2);
+            wire[6] = (byte)(more ? 1 : 0);
+            Buffer.BlockCopy(payload, off, wire, 7, chunk);
+            _unacked[seq] = new Pending { wire = wire, firstSent = now, lastSent = now, tries = 1 };
             WireSend(wire);
             off += chunk;
         } while (off < payload.Length);
@@ -134,8 +180,9 @@ public static class ReliableNet
 
         if (data[0] == TAG_ACK)
         {
-            if (data.Length < 5) return;
-            uint ackThrough = BitConverter.ToUInt32(data, 1);
+            if (data.Length < 6) return;
+            if (data[1] != _epoch) return;   // stale generation — ignore
+            uint ackThrough = BitConverter.ToUInt32(data, 2);
             // Drop every fragment the peer confirmed. _unacked is sorted, so we can stop at the first unconfirmed.
             var done = new List<uint>();
             foreach (var kv in _unacked) { if (kv.Key <= ackThrough) done.Add(kv.Key); else break; }
@@ -145,8 +192,9 @@ public static class ReliableNet
 
         if (data[0] == TAG_DATA)
         {
-            if (data.Length < 6) return;
-            uint seq = BitConverter.ToUInt32(data, 1);
+            if (data.Length < 7) return;
+            if (data[1] != _epoch) return;   // stale generation — never let it into _reorder (poison, see wire spec)
+            uint seq = BitConverter.ToUInt32(data, 2);
 
             if (seq < _recvNext)            { _ackDue = true; return; }   // duplicate — re-ack so the sender drops it
             if (seq == _recvNext)
@@ -168,12 +216,12 @@ public static class ReliableNet
         }
     }
 
-    // Strip the 6-byte header, append to the assembly buffer; on more=0 emit the complete inner message.
+    // Strip the 7-byte header, append to the assembly buffer; on more=0 emit the complete inner message.
     static void DeliverFragment(byte[] wire)
     {
-        int len = wire.Length - 6;
-        for (int i = 0; i < len; i++) _assembly.Add(wire[6 + i]);
-        if (wire[5] == 0)   // last fragment of this message
+        int len = wire.Length - 7;
+        for (int i = 0; i < len; i++) _assembly.Add(wire[7 + i]);
+        if (wire[6] == 0)   // last fragment of this message
         {
             var msg = _assembly.ToArray();
             _assembly.Clear();
@@ -185,9 +233,11 @@ public static class ReliableNet
     public static void Tick(float dt)
     {
         float now = Time.time;
+        float oldestUnacked = 0f;   // _unacked is sorted by seq → the first entry is the oldest fragment
         foreach (var kv in _unacked)
         {
             var p = kv.Value;
+            if (oldestUnacked == 0f) oldestUnacked = now - p.firstSent;
             if (now - p.lastSent >= RESEND_AFTER)
             {
                 WireSend(p.wire);
@@ -196,15 +246,25 @@ public static class ReliableNet
             }
         }
 
+        // Outbound health for the degraded-link detector: dead if we've been swallowing sends (post-Stop
+        // zombie) or the oldest fragment went unacked through ~40 retransmits (peer not acking).
+        if (_notReadyDropSince != 0f && now - _notReadyDropSince > 12f)
+            { OutboundLooksDead = true; OutboundDeathReason = "sends blocked — layer stopped, no new handshake"; }
+        else if (oldestUnacked > 12f)
+            { OutboundLooksDead = true; OutboundDeathReason = $"no ACKs for {oldestUnacked:F0}s"; }
+        else if (OutboundLooksDead && _notReadyDropSince == 0f && oldestUnacked < 2f)
+            { OutboundLooksDead = false; OutboundDeathReason = null; }   // acks resumed — recovered
+
         if (_ackDue && _recvNext > 0)   // _recvNext==0 → nothing delivered yet, an ack would be meaningless
         {
             _ackTimer += dt;
             if (_ackTimer >= ACK_COALESCE)
             {
                 _ackTimer = 0f; _ackDue = false;
-                var ack = new byte[5];
+                var ack = new byte[6];
                 ack[0] = TAG_ACK;
-                BitConverter.GetBytes(_recvNext - 1).CopyTo(ack, 1);
+                ack[1] = _epoch;
+                BitConverter.GetBytes(_recvNext - 1).CopyTo(ack, 2);
                 WireSend(ack);
             }
         }

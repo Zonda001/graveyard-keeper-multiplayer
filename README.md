@@ -177,6 +177,22 @@ P2P packets (first byte is the type):
 
 ## Troubleshooting
 
+### F11 does nothing
+
+The lobby **is** created — but the invite window is drawn by the **Steam Overlay**,
+so if the overlay is disabled you won't see anything. Two ways out:
+
+1. **Enable the overlay:** Steam → Settings → In Game → *Enable the Steam overlay
+   while in-game* (also check it's not disabled in the game's Properties). The mod
+   shows an in-game message when it detects this situation.
+2. **Or skip the overlay entirely:** press `F11` anyway, then your friend joins via
+   the **Steam friends list** — right-click your name → *Join Game*. This works even
+   with the overlay off on both sides.
+
+Game progress doesn't matter — you can invite from day 1. One note for a **brand-new
+game**: the HUD is hidden during the intro sequence, so the best moment to press
+`F11` is right after the game interface appears (that's early on, at the graveyard).
+
 ### The game crashes on startup — white screen, "Not responding"
 
 **Cause:** a conflict between recent NVIDIA drivers (the 32.x series, from late
