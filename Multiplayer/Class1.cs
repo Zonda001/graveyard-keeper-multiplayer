@@ -2126,6 +2126,16 @@ public class SteamManager : MonoBehaviour
     {
         if (!_initialized) { _logger.LogWarning("[STEAM] Not initialized yet!"); return; }
 
+        // The symmetric half of the dual-host guard: a CLIENT pressing F11 inside the friend's world must
+        // not hijack Role=Host mid-session (their world is the host's save — hosting it would fork it).
+        if (SteamNetwork.Role == NetworkRole.Client)
+        {
+            _logger.LogWarning("[STEAM] F11 ignored — you are in a co-op session as the GUEST (only the host creates lobbies)");
+            ShowJoinError("You are playing in your friend's world right now — F11 (host a game)\n" +
+                          "is disabled. To host your own game, first exit to the main menu.");
+            return;
+        }
+
         if (SteamNetwork.Role == NetworkRole.Host && SteamNetwork.LobbyID != 0)
         {
             _logger.LogInfo("[STEAM] Lobby already created! Opening overlay...");
@@ -2341,6 +2351,39 @@ public class SteamManager : MonoBehaviour
     private IEnumerator JoinLobbyDelayed(ulong lobbyId)
     {
         yield return new WaitForSeconds(1f);
+
+        // DUAL-HOST GUARD (ELance262's root cause, 2026-07-03): if this player pressed F11 earlier,
+        // CreateLobby already set Role=Host — and OnLobbyEntered skips the client branch for hosts, so
+        // accepting an invite "connected" two SEPARATE worlds: each played their own save, and the only
+        // things crossing were movement and time. Accepting an invite is an explicit "I want to JOIN" —
+        // an empty own lobby must yield: leave it and proceed as a clean client.
+        if (SteamNetwork.Role == NetworkRole.Host && SteamNetwork.RemoteID != 0)
+        {
+            // A host with a LIVE session keeps hosting — silently dropping their current guest would be worse.
+            _logger.LogWarning($"[STEAM] Join request ignored — already hosting an ACTIVE session (client {SteamNetwork.RemoteID})");
+            ShowJoinError("You are hosting a co-op session right now, so the invite was ignored.\n" +
+                          "To join your friend instead: exit to the main menu and accept the invite\n" +
+                          "WITHOUT pressing F11 first (F11 = host your own game).");
+            yield break;
+        }
+        if (SteamNetwork.Role == NetworkRole.Host)
+        {
+            try
+            {
+                if (SteamNetwork.LobbyID != 0)
+                {
+                    var sidType  = _steamMatchmaking?.Assembly.GetType("Steamworks.CSteamID");
+                    var ownLobby = System.Activator.CreateInstance(sidType, SteamNetwork.LobbyID);
+                    _steamMatchmaking?.GetMethod("LeaveLobby", BindingFlags.Public | BindingFlags.Static)
+                        ?.Invoke(null, new[] { ownLobby });
+                    _logger.LogInfo("[STEAM] Left own empty lobby ✓");
+                }
+                SteamNetwork.Role    = NetworkRole.None;
+                SteamNetwork.LobbyID = 0;
+                _logger.LogWarning("[STEAM] F11 was pressed earlier (empty host lobby), but an invite was accepted — switching to CLIENT ✓");
+            }
+            catch (System.Exception e) { _logger.LogError($"[STEAM] Dual-host guard error: {e.Message}"); }
+        }
 
         try
         {

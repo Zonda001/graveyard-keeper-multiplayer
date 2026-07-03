@@ -23,6 +23,11 @@ based on [Keep a Changelog](https://keepachangelog.com/).
   are refused at join with an on-screen message
 
 ### Fixed
+- **Dual-host trap**: if both players pressed `F11`, accepting an invite silently kept
+  each player in their OWN world — "connected" but seeing only each other's movement.
+  Accepting an invite now automatically switches you to guest mode (leaving your empty
+  lobby), and a guest pressing `F11` inside the host's world gets a clear message
+  instead of hijacking the session (thanks **ELance262** for pinpointing the repro!)
 - Stale packets from before a connection reset can no longer be delivered into the
   new stream (silent world-state corruption)
 - World objects your partner is actively working with (a running craft, an open chest)
