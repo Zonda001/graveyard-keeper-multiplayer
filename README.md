@@ -56,11 +56,24 @@ Already working:
 
 ## Installation
 
-1. Install **BepInEx 5.4.23.5** into the game folder
-2. Drop `Multiplayer.dll` into `Graveyard Keeper/BepInEx/plugins/`
-3. Launch the game **through Steam** (otherwise Steamworks won't initialize)
+### Step 1 — Install BepInEx (the mod loader)
 
-Both players must run the same version of `Multiplayer.dll`.
+1. Download **BepInEx 5.4.23.5 (x64)** — the file is `BepInEx_x64_5.4.23.5.zip`
+   from the [BepInEx releases page](https://github.com/BepInEx/BepInEx/releases/tag/v5.4.23.5)
+2. Extract it **directly into the game folder** — the one with
+   `Graveyard Keeper.exe` (usually
+   `C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper`).
+   After extracting you should see a `BepInEx` folder and `winhttp.dll`
+   sitting next to the game's exe
+3. **Launch the game once and quit** — this makes BepInEx generate its
+   folders (including `BepInEx\plugins`)
+
+### Step 2 — Install the mod
+
+4. Drop `Multiplayer.dll` into `Graveyard Keeper\BepInEx\plugins\`
+
+**Both** players do steps 1–4, with the **same version** of `Multiplayer.dll`.
+Launch the game **through Steam** (otherwise Steamworks won't initialize).
 
 ---
 

@@ -1,0 +1,79 @@
+[size=5][b]Graveyard Keeper — Multiplayer (2-player co-op)[/b][/size]
+
+Adds [b]2-player co-op[/b] to Graveyard Keeper. Connection is over Steam P2P — no server to set up, no port forwarding, no IP addresses. One of you hosts, the other joins through a regular Steam invite.
+
+[b]Status:[/b] beta. The core loop is fully playable together: world, building, crafting, graves, inventory. NPC villagers and dungeon mobs are not synced yet (see Known limitations).
+
+[size=4][b]What is synced[/b][/size]
+
+[list]
+[*]Both players in the same world — the host's save is transferred automatically on join
+[*]Movement, animations, day/night time (anyone sleeping advances time for both)
+[*]Tree chopping, stone breaking, mining loot, foraging, garden beds
+[*][b]Graves[/b] — digging, reburying bodies, repair; carried corpses with handoff between players
+[*][b]Building[/b] — full cycle: place → construct → demolish
+[*][b]Crafting at workstations[/b] — shared queues, live progress bar on your partner's side
+[*][b]Inventory[/b] — shared chests (both can use them at once), stockpiles, item exchange
+[*]Weather, shared story world-flags
+[*][b]Personal progress[/b] — the 2nd player has their own character save (skills, HP, techs, perks, quest journal) layered over the host's world. Shared world, personal progress — the Stardew Valley model
+[/list]
+
+[size=4][b]Installation (step by step)[/b][/size]
+
+[b]Step 1 — Install BepInEx (the mod loader):[/b]
+[list=1]
+[*]Download [b]BepInEx 5.4.23.5 (x64)[/b] — the file is [i]BepInEx_x64_5.4.23.5.zip[/i] from the [url=https://github.com/BepInEx/BepInEx/releases/tag/v5.4.23.5]BepInEx releases page[/url]
+[*]Extract it [b]directly into the game folder[/b] — the one with [i]Graveyard Keeper.exe[/i] (usually [i]C:\Program Files (x86)\Steam\steamapps\common\Graveyard Keeper[/i]). After extracting you should see a [i]BepInEx[/i] folder and [i]winhttp.dll[/i] next to the game's exe
+[*][b]Launch the game once and quit[/b] — this makes BepInEx generate its folders (including [i]BepInEx\plugins[/i])
+[/list]
+
+[b]Step 2 — Install the mod:[/b]
+[list=1]
+[*]Drop [i]Multiplayer.dll[/i] (from the Files tab) into [i]Graveyard Keeper\BepInEx\plugins\[/i]
+[/list]
+
+[b]Both[/b] players do steps 1–2, with the [b]same version[/b] of the mod. Launch the game [b]through Steam[/b] — otherwise Steamworks won't initialize.
+
+[size=4][b]How to play[/b][/size]
+
+[b]Host:[/b]
+[list=1]
+[*]Load your save
+[*]Press [b]F11[/b] — a lobby is created and the Steam invite overlay opens
+[*]Invite your friend
+[/list]
+
+[b]Client:[/b]
+[list=1]
+[*]Accept the Steam invite
+[*]The mod downloads the host's save and joins you into the world
+[/list]
+
+Game progress doesn't matter — you can invite from day 1. In a brand-new game, press F11 right after the interface appears (early on, at the graveyard).
+
+[size=4][b]F11 seems to do nothing?[/b][/size]
+
+The lobby [b]is[/b] created — the invite window is drawn by the [b]Steam Overlay[/b], so if the overlay is disabled you won't see anything. Two ways out:
+[list]
+[*]Enable the overlay: Steam → Settings → In Game → [i]Enable the Steam overlay while in-game[/i] (also check the game's Properties)
+[*]Or skip it: press F11 anyway, then your friend joins via the Steam friends list — right-click your name → [b]Join Game[/b]. Works even with the overlay off on both sides
+[/list]
+
+[size=4][b]Known limitations[/b][/size]
+
+[list]
+[*]2 players max (for now)
+[*]NPC villagers and dungeon mobs/zombies are not synced yet — you'll each see your own
+[*]Both players need the game on Steam (P2P runs through Steam networking)
+[*]DLC: a player without the DLCs can join and play fine, [b]until[/b] the host starts a paid DLC storyline — then the save won't load for them
+[/list]
+
+[size=4][b]Bug reports[/b][/size]
+
+Bug reports are the most useful thing you can give this mod right now. If something breaks, post what happened, and if possible: set [i]DebugMode = true[/i] in [i]BepInEx\config\com.denys.multiplayer.cfg[/i] and attach [i]BepInEx\LogOutput.log[/i] from both players. Logs contain no personal data beyond Steam display names.
+
+[size=4][b]Support[/b][/size]
+
+This mod is free and always will be. If you'd like to support development: [url=https://ko-fi.com/zonda]ko-fi.com/zonda[/url]. Totally optional — bug reports and testing help just as much. ❤
+
+[i]Unofficial fan mod, not affiliated with Lazy Bear Games or tinyBuild. MIT license.[/i]
