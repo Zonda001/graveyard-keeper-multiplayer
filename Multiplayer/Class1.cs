@@ -57,13 +57,22 @@ public static class PlayerControlPatch
     }
 }
 
-// DIAG (2026-06-24, temporary): client SLEEP soft-lock (freeze tied to the Gerry/first-burial intro). The client
-// went to bed but SleepGUI never reached State.Sleeping (TIME-DIAG never showed timeScale=10/stopped, no wake_up,
-// energy not restored) → hard soft-lock. SleepGUI.Open's FIRST line dereferences
-// WorldMap.GetWorldGameObjectByCustomTag("hero_bed") — if that's null on the client it NREs before the GUI opens.
-// This probe logs the bed lookup + any exception thrown by Open. Remove once root-caused.
+// SLEEP SOFT-LOCK GUARD (v0.1.3 — wild reports ×3: ELance262, SvennnDE, Nexus review 2026-07-07).
+// SleepGUI.Open's FIRST line (decomp 63894) dereferences WorldMap.GetWorldGameObjectByCustomTag("hero_bed")
+// for a purely cosmetic bed picture in the dialog. If the lookup fails, the NRE fires BEFORE the GUI opens,
+// while the player is already lying down → soft-lock (time runs, can't get up, save-on-sleep never happens).
+// The lookup can fail three ways (comparator filters at decomp 99233):
+//   (1) the bed lost its custom_tag — some recreate path didn't preserve the tag,
+//   (2) the bed exists but IsDisabled() — its parent GDPoint GameObject is inactive,
+//   (3) the bed WGO is gone entirely.
+// Strategy: healthy lookup → zero-cost pass-through. Failure → DIAG dump of every bed-like WGO (tells the
+// three cases apart from a single user log), then self-heal: re-tag the bed the player just interacted with
+// (currently_higlighted_obj, the sleep flowscript runs off that interaction) or the nearest bed-like WGO.
+// custom_tag persists in the save, so a successful re-tag heals the world FOR GOOD. If the lookup still
+// fails → skip Open and fire on_doesnt_need_sleep so the flowscript stands the player up (a refusal, not a
+// soft-lock) + an on-screen dialog (English only — the font atlas has no Cyrillic).
 [HarmonyPatch]
-public static class SleepGuiDiagPatch
+public static class SleepBedGuardPatch
 {
     static MethodBase TargetMethod()
     {
@@ -73,23 +82,220 @@ public static class SleepGuiDiagPatch
             .FirstOrDefault(m => m.Name == "Open");
     }
 
-    static void Prefix()
+    static Type _wgoType;
+    static MethodInfo _getByTag;        // WorldMap.GetWorldGameObjectByCustomTag(string, bool) — 2 params!
+                                        // (the old diag probe invoked it with 1 arg → TargetParameterCountException,
+                                        // every "diagnosis" was a swallowed warning; same class of bug as 07-01)
+    static FieldInfo _tagField, _idField, _uidField, _highlightedField;
+    static MethodInfo _isDisabledMethod;
+
+    static bool EnsureReflection()
+    {
+        if (_getByTag != null) return true;
+        var wm = AccessTools.TypeByName("WorldMap");
+        _wgoType = AccessTools.TypeByName("WorldGameObject");
+        _getByTag = wm?.GetMethod("GetWorldGameObjectByCustomTag", BindingFlags.Public | BindingFlags.Static);
+        if (_wgoType == null || _getByTag == null || _getByTag.GetParameters().Length != 2) { _getByTag = null; return false; }
+        var inst = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        var stat = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+        _tagField          = _wgoType.GetField("custom_tag", inst);
+        _idField           = _wgoType.GetField("obj_id", inst);
+        _uidField          = _wgoType.GetField("unique_id", inst) ?? _wgoType.GetField("_unique_id", inst);
+        _highlightedField  = _wgoType.GetField("currently_higlighted_obj", stat);   // game's own typo
+        _isDisabledMethod  = _wgoType.GetMethod("IsDisabled", inst);
+        return _tagField != null && _idField != null;
+    }
+
+    // The vanilla lookup, silenced (ignore_not_found_error: true), PLUS the second link of the original's
+    // chain: the found bed must have an active SpriteRenderer child, or .sprite still NREs.
+    static bool VanillaLookupWorks()
+    {
+        var bed = _getByTag.Invoke(null, new object[] { "hero_bed", true }) as Component;
+        return bed != null && bed.GetComponentInChildren<SpriteRenderer>() != null;
+    }
+
+    // A WGO that plausibly IS the hero bed. Excludes corpse trays (corpse_bed*), Euric's scenery bed,
+    // build ghosts/desks and garden beds.
+    static bool LooksLikeHeroBed(string objId)
+    {
+        if (string.IsNullOrEmpty(objId)) return false;
+        var id = objId.ToLowerInvariant();
+        return id.Contains("bed") && !id.StartsWith("corpse_bed") && id != "eurics_room_old_bed"
+            && !id.Contains("_place") && !id.Contains("builddesk") && !id.Contains("garden");
+    }
+
+    static Vector3 PlayerPos()
     {
         try
         {
-            var wm = AccessTools.TypeByName("WorldMap");
-            var getTag = wm?.GetMethod("GetWorldGameObjectByCustomTag", BindingFlags.Public | BindingFlags.Static);
-            var bed = getTag?.Invoke(null, new object[] { "hero_bed" });
-            Multiplayer.Log?.LogInfo($"[SLEEP-DIAG] SleepGUI.Open entered — hero_bed={(bed != null ? "found" : "NULL")} role={SteamNetwork.Role}");
+            var mg = AccessTools.TypeByName("MainGame");
+            var me = mg?.GetField("me", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var player = me == null ? null
+                : (AccessTools.Field(me.GetType(), "player")?.GetValue(me)
+                   ?? AccessTools.Property(me.GetType(), "player")?.GetValue(me)) as Component;
+            return player != null ? player.transform.position : Vector3.zero;
         }
-        catch (Exception e) { Multiplayer.Log?.LogWarning($"[SLEEP-DIAG] prefix: {e.Message}"); }
+        catch { return Vector3.zero; }
     }
 
-    static Exception Finalizer(Exception __exception)
+    // All scene-resident WGOs, inactive included (FindObjectsOfTypeAll also returns prefabs/assets —
+    // the scene.name filter drops those). Only runs on the rare failure path, cost is fine.
+    static List<Component> AllSceneWgos()
     {
-        if (__exception != null)
-            Multiplayer.Log?.LogError($"[SLEEP-DIAG] SleepGUI.Open THREW: {__exception.GetType().Name}: {__exception.Message}");
-        return __exception;   // rethrow — pure diagnostic, don't change behavior
+        var result = new List<Component>();
+        foreach (var o in Resources.FindObjectsOfTypeAll(_wgoType))
+        {
+            var c = o as Component;
+            if (c != null && !string.IsNullOrEmpty(c.gameObject.scene.name)) result.Add(c);
+        }
+        return result;
+    }
+
+    // DIAG: one line per bed-like WGO — separates the three failure cases in a single user log.
+    static void DumpBedCandidates(List<Component> wgos, Vector3 playerPos)
+    {
+        int shown = 0;
+        foreach (var c in wgos)
+        {
+            var id = _idField.GetValue(c) as string;
+            if (id == null || !id.ToLowerInvariant().Contains("bed")) continue;
+            if (++shown > 40) { Multiplayer.Log?.LogInfo("[SLEEP-GUARD] …more bed-like WGOs truncated"); break; }
+            string tag = _tagField.GetValue(c) as string;
+            object uid = _uidField?.GetValue(c);
+            bool disabled = false;
+            try { disabled = _isDisabledMethod != null && (bool)_isDisabledMethod.Invoke(c, null); } catch { }
+            var p = c.transform.position;
+            Multiplayer.Log?.LogInfo(
+                $"[SLEEP-GUARD] bed-like: obj_id={id} tag='{tag}' uid={uid} active={c.gameObject.activeInHierarchy} " +
+                $"disabled={disabled} parent={(c.transform.parent != null ? c.transform.parent.name : "NULL")} " +
+                $"pos=({p.x:F0},{p.y:F0}) distToPlayer={Vector3.Distance(p, playerPos):F0}");
+        }
+        if (shown == 0) Multiplayer.Log?.LogWarning("[SLEEP-GUARD] NO bed-like WGOs in the scene at all (case 3)");
+    }
+
+    // Self-heal: put the "hero_bed" tag back. Prefer the WGO the player is interacting with right now
+    // (the sleep flowscript is triggered by interacting with the bed), fall back to the nearest active
+    // bed-like WGO within one room of the player.
+    static void TryRetagBed(List<Component> wgos, Vector3 playerPos)
+    {
+        Component candidate = null;
+        try
+        {
+            var hl = _highlightedField?.GetValue(null) as Component;
+            if (hl != null && LooksLikeHeroBed(_idField.GetValue(hl) as string)) candidate = hl;
+        }
+        catch { }
+        if (candidate == null)
+        {
+            float best = 600f;   // world coords are pixels, a room is a few hundred — don't grab a bed across the map
+            foreach (var c in wgos)
+            {
+                if (!c.gameObject.activeInHierarchy) continue;               // a disabled bed won't pass the lookup anyway
+                if (!LooksLikeHeroBed(_idField.GetValue(c) as string)) continue;
+                float d = Vector3.Distance(c.transform.position, playerPos);
+                if (d < best) { best = d; candidate = c; }
+            }
+        }
+        if (candidate == null) { Multiplayer.Log?.LogWarning("[SLEEP-GUARD] no re-tag candidate found"); return; }
+        _tagField.SetValue(candidate, "hero_bed");
+        Multiplayer.Log?.LogInfo($"[SLEEP-GUARD] re-tagged obj_id={_idField.GetValue(candidate)} " +
+                                 $"uid={_uidField?.GetValue(candidate)} as hero_bed (persists via save) ✓");
+    }
+
+    // Case-3 self-heal: the bed never became a WorldGameObject because its SimplifiedWGO.Restore threw
+    // (swallowed — see RestoreMuteDiag) or the awakener Update aborted before reaching it. The bed then LOOKS
+    // fine on screen (the simplified sprite) but has no WGO behind it. Find the still-simplified bed and force
+    // Restore() ourselves; also logs every simplified bed-like so the user log shows this case explicitly.
+    static bool TryRestoreSimplifiedBed()
+    {
+        try
+        {
+            var st = AccessTools.TypeByName("SimplifiedWGO");
+            var swgoF = st?.GetField("swgo", BindingFlags.Public | BindingFlags.Instance);
+            var restoreM = st?.GetMethod("Restore", BindingFlags.Public | BindingFlags.Instance);
+            if (swgoF == null || restoreM == null) return false;
+            FieldInfo idF = null, tagF = null;
+            foreach (var o in Resources.FindObjectsOfTypeAll(st))
+            {
+                var c = o as Component;
+                if (c == null || string.IsNullOrEmpty(c.gameObject.scene.name)) continue;
+                var swgo = swgoF.GetValue(o);
+                if (swgo == null) continue;
+                if (idF == null)  idF  = swgo.GetType().GetField("obj_id", BindingFlags.Public | BindingFlags.Instance);
+                if (tagF == null) tagF = swgo.GetType().GetField("custom_tag", BindingFlags.Public | BindingFlags.Instance);
+                var id  = idF?.GetValue(swgo) as string;
+                var tag = tagF?.GetValue(swgo) as string;
+                if (tag != "hero_bed" && !LooksLikeHeroBed(id)) continue;
+                Multiplayer.Log?.LogWarning($"[SLEEP-GUARD] STILL-SIMPLIFIED bed found: obj_id={id} tag='{tag}' — forcing Restore()");
+                try
+                {
+                    restoreM.Invoke(o, null);   // our own mute Finalizer swallows a throw inside; recheck decides
+                    return true;
+                }
+                catch (Exception e) { Multiplayer.Log?.LogWarning($"[SLEEP-GUARD] forced Restore threw: {e.InnerException?.Message ?? e.Message}"); }
+            }
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[SLEEP-GUARD] simplified-bed scan failed: {e.Message}"); }
+        return false;
+    }
+
+    static void RefuseSleep(Delegate on_doesnt_need_sleep, string why)
+    {
+        Multiplayer.Log?.LogError($"[SLEEP-GUARD] sleep refused ({why}) — standing the player up instead of a soft-lock");
+        try { on_doesnt_need_sleep?.DynamicInvoke(); }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[SLEEP-GUARD] on_doesnt_need_sleep invoke failed: {e.Message}"); }
+        Multiplayer.ShowScreenDialog("Sleep cancelled: the bed object could not be found (co-op sync issue). " +
+                                     "This guard prevented a freeze. Please report it with your LogOutput.log.");
+    }
+
+    static bool Prefix(Delegate on_doesnt_need_sleep)
+    {
+        try
+        {
+            if (!EnsureReflection())
+            {
+                Multiplayer.Log?.LogWarning("[SLEEP-GUARD] reflection unavailable — passing through unguarded");
+                return true;
+            }
+            if (VanillaLookupWorks()) return true;   // healthy world → the guard costs one lookup
+
+            Multiplayer.Log?.LogWarning($"[SLEEP-GUARD] hero_bed lookup FAILED (role={SteamNetwork.Role}) — dumping + self-healing");
+            var wgos = AllSceneWgos();
+            var playerPos = PlayerPos();
+            DumpBedCandidates(wgos, playerPos);
+            if (TryRestoreSimplifiedBed() && VanillaLookupWorks())
+            {
+                Multiplayer.Log?.LogInfo("[SLEEP-GUARD] lookup healthy after forced Restore — sleeping normally ✓");
+                return true;
+            }
+            // Re-scan: a forced Restore may have just created the bed WGO (possibly with a lost tag).
+            TryRetagBed(AllSceneWgos(), playerPos);
+            if (VanillaLookupWorks())
+            {
+                Multiplayer.Log?.LogInfo("[SLEEP-GUARD] lookup healthy after re-tag — sleeping normally ✓");
+                return true;
+            }
+            RefuseSleep(on_doesnt_need_sleep, "lookup still failing after re-tag");
+            return false;
+        }
+        catch (Exception e)
+        {
+            // The guard itself broke. Do NOT pass through: the pass-through would NRE into the exact
+            // soft-lock we're guarding against. Refuse instead — sleep is lost, the session is not.
+            Multiplayer.Log?.LogError($"[SLEEP-GUARD] guard crashed: {e}");
+            RefuseSleep(on_doesnt_need_sleep, "guard crashed");
+            return false;
+        }
+    }
+
+    // Last-resort belt: if Open still threw (a failure mode the prefix didn't predict), swallow it and
+    // refuse sleep — the unhandled alternative is the known soft-lock. Log the FULL exception for recon.
+    static Exception Finalizer(Exception __exception, Delegate on_doesnt_need_sleep)
+    {
+        if (__exception == null) return null;
+        Multiplayer.Log?.LogError($"[SLEEP-GUARD] SleepGUI.Open THREW despite the guard: {__exception}");
+        RefuseSleep(on_doesnt_need_sleep, "Open threw");
+        return null;
     }
 }
 
@@ -202,7 +408,7 @@ static class StartPlayingGameGuardPatch
 
 // ═════════════════════════════════════════════════════════════
 
-[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.2")]
+[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.3")]
 public class Multiplayer : BaseUnityPlugin
 {
     internal static ManualLogSource Log;
@@ -221,6 +427,43 @@ public class Multiplayer : BaseUnityPlugin
 
     private float logTimer = 0f;
     private const float LOG_INTERVAL = 1f;
+
+    private static void DialogNoOp() { }
+
+    // On-screen dialog for guard messages (SleepBedGuardPatch etc.) — the player must SEE why an action was
+    // cancelled, not just find it in the log. Same reflection mechanics as SteamManager.ShowJoinError (that one
+    // is instance/join-specific): DialogGUI's button delegate is GJCommons.VoidDelegate from a firstpass assembly
+    // we don't reference (CS0436), so the delegate is built dynamically. English only — no Cyrillic in the atlas.
+    internal static void ShowScreenDialog(string message)
+    {
+        try
+        {
+            var guiType = AccessTools.TypeByName("GUIElements");
+            var me = guiType?.GetProperty("me", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var dialog = me?.GetType().GetField("dialog", BindingFlags.Public | BindingFlags.Instance)?.GetValue(me);
+            if (dialog == null) { Log?.LogWarning("[MP] Dialog unavailable — message only in the log"); return; }
+
+            var openM = dialog.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "Open" && m.GetParameters().Length >= 3 &&
+                                     m.GetParameters()[0].ParameterType == typeof(string) &&
+                                     m.GetParameters()[1].ParameterType == typeof(string));
+            if (openM == null) { Log?.LogWarning("[MP] DialogGUI.Open not found — message only in the log"); return; }
+
+            var ps = openM.GetParameters();
+            var noop = Delegate.CreateDelegate(ps[2].ParameterType,
+                typeof(Multiplayer).GetMethod("DialogNoOp", BindingFlags.NonPublic | BindingFlags.Static));
+
+            var args = new object[ps.Length];
+            args[0] = message;
+            args[1] = "OK";
+            args[2] = noop;
+            for (int i = 3; i < ps.Length; i++)
+                args[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
+
+            openM.Invoke(dialog, args);
+        }
+        catch (Exception e) { Log?.LogWarning($"[MP] ShowScreenDialog failed: {e.Message}"); }
+    }
 
     void Awake()
     {
@@ -4261,9 +4504,51 @@ static class EnvWeatherPatch
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared throttled reporter for the restore-pipeline mutes below. Those exceptions used to be swallowed in
+// FULL silence (the 1-FPS storm fix) — but a swallowed restore is now the prime suspect behind the whole
+// "broken WGO" family: a Restore that threw mid-way (or an awakener Update aborted mid-radius) leaves a bed
+// with no hero_bed tag (sleep soft-lock, wild reports ×3), a grave that 0x0D can't find by uid
+// ("not found, nearest:none" on EXISTING graves), desynced decor. Keep the storm muted for playability,
+// but surface 1 line / 5s with a counter + the failing obj_id — any user log then confirms/clears this.
+// ─────────────────────────────────────────────────────────────────────────────
+public static class RestoreMuteDiag
+{
+    static float _lastLog = -999f;
+    static int _swallowed;
+    static FieldInfo _swgoField, _swgoObjIdField;
+
+    public static void Report(string where, object simplifiedInstance, Exception e)
+    {
+        _swallowed++;
+        var now = Time.realtimeSinceStartup;
+        if (now - _lastLog < 5f) return;
+        _lastLog = now;
+        string objId = "?";
+        try
+        {
+            if (simplifiedInstance != null)
+            {
+                if (_swgoField == null)
+                    _swgoField = simplifiedInstance.GetType().GetField("swgo", BindingFlags.Public | BindingFlags.Instance);
+                var swgo = _swgoField?.GetValue(simplifiedInstance);
+                if (swgo != null)
+                {
+                    if (_swgoObjIdField == null)
+                        _swgoObjIdField = swgo.GetType().GetField("obj_id", BindingFlags.Public | BindingFlags.Instance);
+                    objId = _swgoObjIdField?.GetValue(swgo) as string ?? "?";
+                }
+            }
+        }
+        catch { }
+        Multiplayer.Log?.LogWarning($"[RESTORE-MUTE] {where} threw (swallowed total={_swallowed}, obj_id={objId}): " +
+                                    $"{e.GetType().Name}: {e.Message}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SimplifiedWGO.Restore throws a NullReferenceException every frame during
 // interaction (chopping, digging). This is the main cause of 1 FPS on the client.
-// The Finalizer silently swallows the exception — no logging, no overhead.
+// The Finalizer swallows the exception; RestoreMuteDiag surfaces a throttled trace.
 // ─────────────────────────────────────────────────────────────────────────────
 [HarmonyPatch]
 static class SimplifiedWGORestorePatch
@@ -4271,18 +4556,27 @@ static class SimplifiedWGORestorePatch
     static MethodBase TargetMethod() =>
         AccessTools.Method(AccessTools.TypeByName("SimplifiedWGO"), "Restore");
 
-    static Exception Finalizer(Exception __exception) => null;
+    static Exception Finalizer(object __instance, Exception __exception)
+    {
+        if (__exception != null) RestoreMuteDiag.Report("SimplifiedWGO.Restore", __instance, __exception);
+        return null;
+    }
 }
 
-// GameAwakenerEngine.Update can also throw via SimplifiedWGO —
-// we mute it too
+// GameAwakenerEngine.Update can also throw via SimplifiedWGO — we mute it too. NOTE: an aborted Update
+// means every OTHER simplified WGO in the interaction radius stays un-restored that frame — this is the
+// "object visually there but no WorldGameObject behind it" scenario (bed/grave lookups fail).
 [HarmonyPatch]
 static class GameAwakenerEnginePatch
 {
     static MethodBase TargetMethod() =>
         AccessTools.Method(AccessTools.TypeByName("GameAwakenerEngine"), "Update");
 
-    static Exception Finalizer(Exception __exception) => null;
+    static Exception Finalizer(Exception __exception)
+    {
+        if (__exception != null) RestoreMuteDiag.Report("GameAwakenerEngine.Update", null, __exception);
+        return null;
+    }
 }
 
 // Block GameAwakenerEngine from restoring our clones: on interaction it "restores" all WGOs in radius,
@@ -4327,7 +4621,11 @@ static class SimplifiedWGORestoreFilterPatch
         return true;
     }
 
-    static Exception Finalizer(Exception __exception) => null;
+    static Exception Finalizer(object __instance, Exception __exception)
+    {
+        if (__exception != null) RestoreMuteDiag.Report("SimplifiedWGO.Restore(filter)", __instance, __exception);
+        return null;
+    }
 }
 
 [HarmonyPatch]

@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.3-beta] — 2026-07-08
+
+### Fixed
+- **Sleep soft-lock** (reported by three players — thanks!): going to bed could
+  freeze the game right after the sleep fade, looking like a save that never
+  finishes. The mod now guards the bed lookup that crashed the sleep screen:
+  a healthy bed sleeps as usual, a broken one is repaired on the spot (the fix
+  persists into the save), and if repair is impossible the character simply
+  gets up with an on-screen message instead of locking up
+
+### Added
+- Diagnostic counters for silently swallowed world-object restore errors
+  (`[RESTORE-MUTE]` in the log) — groundwork for fixing gravestone/decor desync
+
 ## [0.1.2-beta] — 2026-07-03
 
 ### Added
