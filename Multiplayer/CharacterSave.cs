@@ -11,8 +11,9 @@ using HarmonyLib;
 //   • Live inventory = MainGame.me.player.data (PrepareForSave sets _inventory=player.data, decomp 104876),
 //     so we use live player.data after spawn, not save._inventory. Serialize Item.ToJSON(0); restore via
 //     JsonUtility.FromJsonOverwrite.
-//   • ⚠️ WORLD FLAGS (lock_tp/church_level/… = StorySync.IsWorldParam) live in the SAME Item — overwrite
+//   • ⚠️ WORLD FLAGS (church_level/tp_*/… = StorySync.IsWorldParam) live in the SAME Item — overwrite
 //     would clobber them with the client's stale values, so we snapshot the host's and restore them AFTER.
+//     lock_tp is NOT among them (transient cutscene lock) — it is force-cleared after the overlay instead.
 //   • Per-host file coop_character_{RemoteID}.dat — character tied to host's world; first join (no file) =
 //     stays a clone of the host, saved as the client's baseline.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -448,6 +449,15 @@ public static class ClientCharacterStore
             var setParam = pdata.GetType().GetMethod("SetParam", new[] { typeof(string), typeof(float) });
             if (setParam != null)
                 foreach (var kv in worldSnap) setParam.Invoke(pdata, new object[] { kv.Key, kv.Value });
+
+            // 3b) lock_tp is TRANSIENT (a cutscene teleport-lock, not a world gate — 0.1.4): the client's
+            // .dat may have lock_tp=1 baked in by a session that broke mid-cutscene. Never let it survive
+            // a join (the "Not yet" stuck-in-house poisoning, wild report drromaine1 2026-07-13).
+            if (setParam != null)
+            {
+                setParam.Invoke(pdata, new object[] { "lock_tp", 0f });
+                setParam.Invoke(pdata, new object[] { "lock_tp_param", 0f });
+            }
 
             // 4) Stat ceilings + toolbar = the client's.
             save.GetType().GetField("max_hp",     F).SetValue(save, maxHp);

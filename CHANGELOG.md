@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.4-beta] — 2026-08-05
+
+### Fixed
+- **The saving screen freeze / sleep freeze** (thanks to robinbodar for attaching a log — it
+  found this). When your partner picked something up, the mod deleted that item from your
+  world but left a dead entry behind in the game's internal drop list. From then on the game
+  crashed while writing the save, so the save never finished and the game hung on the saving
+  screen — which is what you saw when going to sleep. The same dead entry also broke character
+  interaction: some players suddenly couldn't build, repair or talk to NPCs, with no way to
+  recover. Both symptoms had the same cause and are fixed. A safety sweep now also runs before
+  every save, so a session that already went bad repairs itself instead of hanging
+- **Stuck indoors with "Not yet" on every exit** (reported by drromaine1). The mod was
+  syncing the game's temporary cutscene teleport-lock between players, so if the connection
+  dropped at the wrong moment the value stayed stuck in the other player's save permanently —
+  and it followed them back into singleplayer, where removing the mod didn't help because the
+  flag lives in the save file. The mod no longer syncs that flag, and it now detects and
+  clears a stuck one when the world loads, so affected saves repair themselves on first load
+
 ## [0.1.3-beta] — 2026-07-08
 
 ### Fixed

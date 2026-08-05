@@ -74,9 +74,10 @@ public static class StorySync
     private static readonly bool MIRROR_QUESTS = false;     // 0x1E — QuestSystem journal
     private static readonly bool MIRROR_NPC_TASKS = false;  // 0x1F — KnownNPC tasks
 
-    // Whitelist of WORLD params (synced via 0x1C). lock_tp confirmed in code (tp-lock node SetParam,
-    // decomp 136775); the rest by meaning of the P1 dictionary. Generous with gates: a missed gate breaks
-    // coop (friend gets no unlock), whereas an extra flag only leaks a bit of narrative (safe).
+    // Whitelist of WORLD params (synced via 0x1C), by meaning of the P1 dictionary. Generous with gates
+    // has a limit (learned 0.1.4): a missed gate breaks coop (friend gets no unlock), an extra PERSISTENT
+    // flag only leaks narrative, but an extra TRANSIENT flag (lock_tp) can poison the peer's save — see
+    // IsWorldParam below.
     private static readonly HashSet<string> _worldParams = new HashSet<string>
     {
         "church_level", "skull_digged", "take_tools_from_grave_chest",
@@ -93,13 +94,18 @@ public static class StorySync
     private static readonly List<PendingOp> _pendingOps = new List<PendingOp>();
     private const int PENDING_OPS_MAX = 512;
 
-    // A world param = in the whitelist OR the teleport-gate family (prefix "tp_" or substring "lock_tp").
+    // A world param = in the whitelist OR the teleport-gate family (prefix "tp_").
     // The rest (narrative, stats, tut_*, *_quality) is personal, NOT synced.
+    // ⚠️ lock_tp/lock_tp_param were removed in 0.1.4: lock_tp is a TRANSIENT cutscene teleport-lock
+    // (lock=1 … unlock=0), not a gate. Mirroring it meant a session drop between the peer's lock and
+    // unlock baked lock_tp=1 into the other player's save = permanently stuck ("Not yet" on every exit,
+    // wild report drromaine1 2026-07-13). SaveRepair in Class1.cs heals already-poisoned saves.
     public static bool IsWorldParam(string name)
     {
         if (string.IsNullOrEmpty(name) || name.Length > 200) return false;
+        if (name.Contains("lock_tp")) return false;   // transient cutscene lock — personal, never mirror
         if (_worldParams.Contains(name)) return true;
-        if (name.StartsWith("tp_") || name.Contains("lock_tp")) return true;   // teleport gates
+        if (name.StartsWith("tp_")) return true;      // teleport gates
         return false;
     }
 

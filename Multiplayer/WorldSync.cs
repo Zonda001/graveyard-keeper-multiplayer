@@ -4266,7 +4266,19 @@ public static class ChopSync
     }
 
     // Clean drop removal: first remove the "linked hint" (freshness indicator — else it lingers as
-    // a ghost after a raw Destroy), then destroy the GameObject itself.
+    // a ghost after a raw Destroy), then UNREGISTER from DropsList, then destroy the GameObject.
+    //
+    // ⚠️ The DropsList.drops removal is NOT optional (0.1.4, wild report robinbodar 2026-08-03).
+    // DropsList.drops is a plain List<DropResGameObject> (decomp 33861) and vanilla only ever drops an
+    // entry when is_collected is set (Update, 33889) or via RemoveAllDropsFromTheScene (33940) — neither
+    // of which a remote removal goes through. A destroyed GameObject left in that list is a Unity
+    // fake-null that then blows up on every pass over it:
+    //   • DropsList.FixedUpdate (33903) → drop.FixedUpdateMe → NRE every physics frame;
+    //   • DropsList.ToGameSave (33949) → drop.transform.position → NRE → GameSave.PrepareForSave throws
+    //     → THE SAVE NEVER COMPLETES = the game hangs on the saving screen when you sleep.
+    // That was the "sleep freeze that comes back after a few days" (0.1.3 only fixed the bed-NRE
+    // flavour): the list is poisoned by the first remote drop removal and kills every save after it.
+    // The game's own save fix-up does the correct pairing — Destroy + drops.Remove (decomp 106177).
     private static void CleanDestroyDrop(MonoBehaviour drop)
     {
         if (drop == null) return;
@@ -4277,6 +4289,13 @@ public static class ChopSync
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
         }
         try { _destroyLinkedHintMethod?.Invoke(drop, null); } catch { }
+        try
+        {
+            var dr = drop as DropResGameObject;
+            if (dr != null && DropsList.me != null && DropsList.me.drops != null)
+                DropsList.me.drops.Remove(dr);
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] DropsList unregister: {e.Message}"); }
         UnityEngine.Object.Destroy(drop.gameObject);
     }
 

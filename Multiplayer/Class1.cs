@@ -408,7 +408,7 @@ static class StartPlayingGameGuardPatch
 
 // ═════════════════════════════════════════════════════════════
 
-[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.3")]
+[BepInPlugin("com.denys.multiplayer", "Multiplayer", "0.1.4")]
 public class Multiplayer : BaseUnityPlugin
 {
     internal static ManualLogSource Log;
@@ -783,6 +783,61 @@ public class Multiplayer : BaseUnityPlugin
         {
             ReliableNet.Stop();
             Logger.LogWarning("[NET] Shift+X — ReliableNet stopped on THIS side (zombie-state simulation); expect the degraded warning on both machines");
+        }
+
+        // Shift+L — poison THIS save with lock_tp=1 (simulates the stuck cutscene teleport-lock from a broken
+        //      co-op session, the drromaine1 "Not yet" state) to live-test SaveRepair: exits should refuse;
+        //      save + exit + reload → [REPAIR] in the log and exits work again.
+        if (Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.L))
+        {
+            try
+            {
+                MainGame.me.player.data.SetParam("lock_tp", 1f);
+                Logger.LogWarning("[REPAIR-TEST] Shift+L — lock_tp=1 set; exits should say \"Not yet\". Save, exit, reload → SaveRepair should clear it ([REPAIR] in the log).");
+            }
+            catch (Exception e) { Logger.LogWarning($"[REPAIR-TEST] failed: {e.Message}"); }
+        }
+
+        // Shift+D — poison DropsList exactly the way the ≤0.1.3 CleanDestroyDrop did: destroy the nearest
+        //      drop's GameObject but LEAVE its entry in DropsList.drops. That dead entry is what hung the
+        //      save (DropsList.ToGameSave → NRE → PrepareForSave never finishes = the sleeping/saving screen
+        //      freeze, wild report robinbodar 2026-08-03). Needed because the real trigger is a REMOTE
+        //      pickup, which can't happen solo. Test chain: drop/chop something → stand next to it →
+        //      Shift+D → sleep or save. Expected with the fix: "[REPAIR] swept 1 destroyed drop(s)" and the
+        //      save completes. Without it the game would hang on the saving screen.
+        if (Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.D))
+        {
+            try
+            {
+                var list = DropsList.me?.drops;
+                if (list == null || list.Count == 0)
+                {
+                    Logger.LogWarning("[REPAIR-TEST] Shift+D — no drops on the ground; chop a tree or drop an item first");
+                }
+                else
+                {
+                    var me = MainGame.me?.player?.transform.position ?? Vector3.zero;
+                    DropResGameObject nearest = null; float bestD = float.MaxValue;
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        var d = list[i];
+                        if (d == null) continue;
+                        float dist = Vector2.Distance(d.transform.position, me);
+                        if (dist < bestD) { bestD = dist; nearest = d; }
+                    }
+                    if (nearest == null)
+                        Logger.LogWarning("[REPAIR-TEST] Shift+D — the list holds only dead entries already");
+                    else
+                    {
+                        // Deliberately the BROKEN pairing: destroy without unregistering.
+                        UnityEngine.Object.Destroy(nearest.gameObject);
+                        Logger.LogWarning($"[REPAIR-TEST] Shift+D — destroyed '{nearest.res?.id}' @ {bestD:F1} WITHOUT " +
+                            $"removing it from DropsList ({list.Count} entries). Now sleep or save: expect " +
+                            "\"[REPAIR] swept\" and a save that finishes.");
+                    }
+                }
+            }
+            catch (Exception e) { Logger.LogWarning($"[REPAIR-TEST] Shift+D failed: {e.Message}"); }
         }
     }
 
@@ -1935,8 +1990,8 @@ public static class SteamNetwork
 
     // Host is REALLY in a loaded world (not title/menu, where MainGame.me.save/player are null). CRITICAL:
     // if the host accepts a client too early, the client loads into the intro state and sends its tutorial
-    // pairs (lock_tp=1) back over 0x1C → overwrites the host world ("can't leave the house"). So we gate
-    // save/sync on this.
+    // pairs (tp_* gates; lock_tp itself is no longer mirrored since 0.1.4) back over 0x1C → overwrites the
+    // host world. So we gate save/sync on this.
     public static bool HostInWorld()
     {
         try { return MainGame.me != null && MainGame.me.save != null && MainGame.me.player != null; }
@@ -3199,7 +3254,7 @@ public class SteamManager : MonoBehaviour
                 }
                 // The host MUST be IN THE WORLD before sending the save. If the lobby is opened from the menu/title —
                 // we reject (0x23): otherwise the client loads without a position into the intro state and its
-                // tutorial pairs (lock_tp=1 etc.) over 0x1C overwrite the host world.
+                // tutorial pairs (tp_* gates etc.) over 0x1C overwrite the host world.
                 if (!SteamNetwork.HostInWorld())
                 {
                     SendPacket(SteamNetwork.RemoteID, new byte[] { 0x23 });
@@ -4751,6 +4806,68 @@ public static class TutorialGUIBlockAllPatch
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Save repair (0.1.4). Mod versions ≤0.1.3 mirrored "lock_tp" over 0x1C, but lock_tp is a TRANSIENT
+// cutscene teleport-lock (Flow_LockTeleports, decomp 136775), not a world gate: a session drop between
+// the peer's lock(1) and unlock(0) left lock_tp=1 in the other player's save forever — every exit says
+// "Not yet", and uninstalling the mod doesn't help (wild report: drromaine1, Nexus 2026-07-13).
+// Vanilla can't save mid-cutscene and OnGameStartedPlaying runs BEFORE FlowScriptEngine.StartAllBehaviours
+// (load chain, decomp 61573/61577), so lock_tp=1 at this point is always that stale leak — safe to clear.
+// ─────────────────────────────────────────────────────────────────────────────
+public static class SaveRepair
+{
+    public static void ClearStuckTeleportLock()
+    {
+        try
+        {
+            if (MainGame.me == null || MainGame.me.player == null || MainGame.me.player.data == null) return;
+            var data = MainGame.me.player.data;
+            if (data.GetParam("lock_tp") < 0.5f) return;
+            data.SetParam("lock_tp", 0f);
+            data.SetParam("lock_tp_param", 0f);
+            Multiplayer.Log?.LogWarning("[REPAIR] stale lock_tp=1 found in the save at world start — cleared " +
+                "(stuck cutscene teleport-lock from a broken co-op session; exits work again)");
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[REPAIR] lock_tp check failed: {e.Message}"); }
+    }
+
+    // Destroyed-but-still-listed drops poison DropsList.drops: DropsList.ToGameSave (decomp 33949) reads
+    // drop.transform.position on a Unity fake-null → GameSave.PrepareForSave throws → the save never
+    // completes and the game hangs on the saving screen (the sleep freeze; wild report robinbodar
+    // 2026-08-03). CleanDestroyDrop no longer creates such entries, but this sweep is the safety net:
+    // it rescues a session already poisoned by an older build, and covers any path we haven't found.
+    public static int SweepDeadDrops()
+    {
+        try
+        {
+            var list = DropsList.me?.drops;
+            if (list == null) return 0;
+            int removed = 0;
+            for (int i = list.Count - 1; i >= 0; i--)
+                if (list[i] == null) { list.RemoveAt(i); removed++; }
+            if (removed > 0)
+                Multiplayer.Log?.LogWarning($"[REPAIR] swept {removed} destroyed drop(s) out of DropsList " +
+                    "before saving — they would have crashed the save and hung the saving screen");
+            return removed;
+        }
+        catch (Exception e) { Multiplayer.Log?.LogWarning($"[REPAIR] drop sweep failed: {e.Message}"); return 0; }
+    }
+}
+
+// Last line of defence for the save: sweep dead drops immediately before the game serializes the world.
+// GameSave.PrepareForSave (decomp 104870) calls WorldMap.ToGameSave → DropsList.ToGameSave, which is
+// exactly where the fake-null blows up — so this prefix runs on the frame that would otherwise crash.
+[HarmonyPatch]
+public static class PrepareForSaveDropSweepPatch
+{
+    static MethodBase TargetMethod() =>
+        AccessTools.TypeByName("GameSave")
+            ?.GetMethod("PrepareForSave",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+    static void Prefix() => SaveRepair.SweepDeadDrops();
+}
+
 [HarmonyPatch]
 public static class OnGameStartedPlayingPatch
 {
@@ -4780,6 +4897,9 @@ public static class OnGameStartedPlayingPatch
 
     static void Postfix(object __instance)
     {
+        // Any world start (single, host, client) — heal a stuck teleport-lock before flow scripts run.
+        SaveRepair.ClearStuckTeleportLock();
+
         // The host also starts sending its position
         if (SteamNetwork.Role == NetworkRole.Host)
         {
