@@ -3,9 +3,16 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.1.4-beta] — 2026-08-05
+## [0.1.4-beta] — 2026-08-10
 
 ### Fixed
+- **The game hanging on the loading screen when you leave to the main menu.** Same dead entry as
+  the freeze below, but through a different door: on the way out the game deletes every dropped
+  item from the scene, and it does that without checking whether the item is still there. One dead
+  entry threw, which aborted the shutdown halfway — and the step that hides the loading overlay
+  never ran, so the game sat on that screen forever. Nothing was wrong with your save: the crash
+  happened before anything was written to disk. Found while testing 0.1.4, so it never reached a
+  release with the other fixes
 - **The saving screen freeze / sleep freeze** (thanks to robinbodar for attaching a log — it
   found this). When your partner picked something up, the mod deleted that item from your
   world but left a dead entry behind in the game's internal drop list. From then on the game
@@ -20,6 +27,21 @@ based on [Keep a Changelog](https://keepachangelog.com/).
   and it followed them back into singleplayer, where removing the mod didn't help because the
   flag lives in the save file. The mod no longer syncs that flag, and it now detects and
   clears a stuck one when the world loads, so affected saves repair themselves on first load
+
+### Changed
+- **Large transfers no longer flood the connection.** When you join, the host's world is sent in
+  one burst of a few thousand packets. That could overflow the connection's send buffer, and the
+  mod would then mistake the silence it caused itself for a dead link and restart the transfer —
+  occasionally looping forever on "Waiting for player". Data now goes out through a fixed window
+  and follows as the other side confirms receipt, and a link only counts as dead when confirmations
+  actually stop arriving. Live-tested on a 3 MB world
+- The game no longer keeps running at full speed in the background while you sit in the menu with
+  no session — only while multiplayer is actually up
+
+### Added
+- Diagnostics for bug reports: outgoing traffic volume (flagged in the log when abnormal), the
+  build timestamp of the loaded DLL, and a trace around saving and exiting — the last one turned a
+  freeze that left no log trace at all into a one-line answer
 
 ## [0.1.3-beta] — 2026-07-08
 

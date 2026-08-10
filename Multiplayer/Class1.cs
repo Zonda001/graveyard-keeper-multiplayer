@@ -428,6 +428,41 @@ public class Multiplayer : BaseUnityPlugin
     private float logTimer = 0f;
     private const float LOG_INTERVAL = 1f;
 
+    // Whatever runInBackground was before the mod touched it — restored whenever no session is up, so the
+    // background-render cost exists only for as long as multiplayer actually needs it. See Awake for why.
+    internal static bool _origRunInBackground;
+    private static bool _bgApplied;
+    private static bool _bgLogged;   // force one report even when nothing needs changing (see below)
+
+    // Called every frame from SteamManager.Update. A session "exists" from the moment a lobby is created or
+    // joined — not from the first packet: a player who alt-tabs while WAITING for the friend to accept must
+    // still be awake to receive the join, otherwise the fix would break the very case it must not.
+    internal static void UpdateBackgroundPolicy()
+    {
+        bool sessionUp = SteamNetwork.LobbyID != 0 || SteamNetwork.RemoteID != 0 || SteamNetwork.IsConnected;
+        bool want      = sessionUp || _origRunInBackground;
+
+        // Report the FIRST evaluation unconditionally. Reporting only on change hid the one state that
+        // actually had to be verified — "already false, nothing to do" — and left us unable to tell a
+        // working fix from a no-op. If the game ships with Run In Background enabled in its Player
+        // Settings, _orig is true, `want` is permanently true, and this whole policy changes nothing:
+        // that has to be visible in the log, not inferred.
+        if (!_bgLogged)
+        {
+            _bgLogged = true;
+            Log?.LogWarning($"[MP] runInBackground policy: game default was {_origRunInBackground} → " +
+                            $"now {want} (session={sessionUp}). " +
+                            (_origRunInBackground
+                                ? "Game default is ON — the mod cannot make it sleep; policy is a NO-OP."
+                                : "Game default is OFF — the game will sleep unfocused unless a session is up."));
+        }
+
+        if (want == _bgApplied && Application.runInBackground == want) return;
+        Application.runInBackground = want;
+        _bgApplied = want;
+        Log?.LogInfo($"[MP] runInBackground → {want} (session={sessionUp})");
+    }
+
     private static void DialogNoOp() { }
 
     // On-screen dialog for guard messages (SleepBedGuardPatch etc.) — the player must SEE why an action was
@@ -474,9 +509,33 @@ public class Multiplayer : BaseUnityPlugin
             "per-tick diagnostic logging. Leave OFF for normal play — these are dev tools that can disrupt a live game.").Value;
         if (DebugMode) Logger.LogWarning("[MP] DebugMode ON — dev keybinds + verbose diagnostics enabled");
 
-        // Without this Unity halts the game loop when the window is inactive → the mod stops sending/receiving
-        // packets and sync "freezes" for a player who switched windows. runInBackground keeps the loop running.
-        Application.runInBackground = true;
+        // Build stamp. The version string alone is not enough to tell builds apart: the committed 0.1.4 and the
+        // working-tree 0.1.4 differ in the network layer yet report the same number, and "was the new DLL even
+        // loaded?" already cost us one wasted diagnostic round. The DLL's own write time answers that without
+        // anyone having to remember to bump a constant, and it lands in every bug reporter's log for free.
+        try
+        {
+            var loc = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            Logger.LogInfo($"[MP] build {System.IO.File.GetLastWriteTime(loc):yyyy-MM-dd HH:mm:ss}");
+        }
+        catch (Exception e) { Logger.LogWarning($"[MP] build stamp unavailable: {e.Message}"); }
+
+        // Unity halts the game loop when the window loses focus → the mod would stop sending/receiving packets
+        // and sync "freezes" for a player who alt-tabbed. runInBackground prevents that, but it used to be set
+        // here, once, for the whole process — which kept the game fully rendering forever, including in the
+        // menu with no session at all.
+        //
+        // That was expensive in a way the task manager does not show (tester report 2026-08-10). His Discord
+        // screen share degraded and voice broke up while he merely sat in the GK menu, at 4% CPU / 16% GPU.
+        // The cost is not load, it is BITRATE: unfocused and un-paused, the animated menu (waterfall, fog,
+        // lit windows) is a full-motion 720p30 video for the capture encoder, so Go Live streamed several
+        // Mbit/s off his uplink around the clock, and voice — sharing that uplink — was what broke.
+        // Confirmed by elimination: mod without the stream is fine, stream without the mod is fine, together
+        // they are not. Minecraft is fine because nothing there keeps a background window rendering.
+        //
+        // So: keep the game awake only while a session exists or is being set up. Remember whatever the game
+        // itself wanted so restoring never overrides the game's own choice.
+        _origRunInBackground = Application.runInBackground;
 
         try
         {
@@ -2503,6 +2562,8 @@ public class SteamManager : MonoBehaviour
             var sendType = reliable ? _cachedSendReliable : _cachedSendUnreliable;
             _cachedSendP2PPacket.Invoke(null,
                 new object[] { _cachedRemoteSteamId, data, (uint)data.Length, sendType, 0 });
+            _txDatagrams++;
+            _txBytes += data.Length;
             return true;
         }
         catch (System.Exception e) { _logger.LogError($"[P2P] Send error: {e.Message}"); return false; }
@@ -2721,6 +2782,13 @@ public class SteamManager : MonoBehaviour
     private int   _diagRecvOther = 0;
     private int   _diagRecvHeartbeat = 0;
 
+    // TX side (bandwidth diagnostic, wild report 2026-08-10 — a tester's whole connection degraded while
+    // the mod ran, Discord voice included, even with him sitting in the menu). Counted in SendRawDatagram,
+    // the single choke point every datagram passes through, so this is the ground truth for what we put on
+    // the uplink — ReliableNet's own counters then break the same traffic down into new/retx/ack.
+    private int  _txDatagrams = 0;
+    private long _txBytes     = 0;
+
     // ── DEGRADED-LINK DETECTOR ──────────────────────────────────────────────────────────
     // Zombie state seen in the wild (Nexus report 2026-07-03): raw unreliable keeps flowing (movement and
     // time-of-day look fine) while the ReliableNet session is dead — e.g. a spurious lobby "left" event
@@ -2749,6 +2817,10 @@ public class SteamManager : MonoBehaviour
 
     void Update()
     {
+        // Before the _initialized gate: the policy must also hold while Steam is still starting up, and
+        // "no session yet" is exactly the state it needs to enforce.
+        Multiplayer.UpdateBackgroundPolicy();
+
         if (!_initialized) return;
 
         // ── Cached RunCallbacks — no assembly lookup every frame ──────────
@@ -2799,6 +2871,27 @@ public class SteamManager : MonoBehaviour
             if (SteamNetwork.RemoteID != 0 && Multiplayer.DebugMode)
                 _logger.LogInfo($"[NET-DIAG] recv last 2s: pos(unrel)={_diagRecvPos} hb={_diagRecvHeartbeat} other(rel)={_diagRecvOther} | lastHbSeqIn={_heartbeatSeqIn} hbSeqOut={_heartbeatSeqOut}");
             _diagRecvPos = _diagRecvOther = _diagRecvHeartbeat = 0;
+
+            // TX report. Deliberately NOT gated on RemoteID or IsInGame: the reported symptom is a link
+            // saturated while the player sits in the MENU, so the one case that must never be silent is
+            // "we are still sending although nothing is happening".
+            // With DebugMode it prints every window; without it, only when the traffic is actually abnormal
+            // — a retransmit storm then leaves a trace in an ordinary player's log too, instead of being
+            // invisible until someone happens to run a packet sniffer.
+            float kbPerSec = _txBytes / 2048f;   // bytes over a 2s window → KB/s
+            bool  stormy   = kbPerSec > 50f || ReliableNet.TxRetx > ReliableNet.TxNew * 2 + 10;
+            if (_txDatagrams > 0 && (Multiplayer.DebugMode || stormy))
+            {
+                string line =
+                    $"[TX-DIAG] sent last 2s: {_txDatagrams} dgram, {kbPerSec:F1} KB/s | " +
+                    $"rel new={ReliableNet.TxNew} retx={ReliableNet.TxRetx} ack={ReliableNet.TxAck} " +
+                    $"maxTries={ReliableNet.TxMaxTries} | unacked={ReliableNet.UnackedCount} queued={ReliableNet.QueuedCount} | " +
+                    $"inGame={SteamNetwork.IsInGame} remote={(SteamNetwork.RemoteID != 0 ? "set" : "none")}";
+                if (stormy) _logger.LogWarning(line + "  ← ABNORMAL");
+                else        _logger.LogInfo(line);
+            }
+            _txDatagrams = 0; _txBytes = 0;
+            ReliableNet.ResetTxStats();
         }
 
         TickDegradedDetector();
@@ -4848,6 +4941,10 @@ public static class SaveRepair
             if (removed > 0)
                 Multiplayer.Log?.LogWarning($"[REPAIR] swept {removed} destroyed drop(s) out of DropsList " +
                     "before saving — they would have crashed the save and hung the saving screen");
+            else if (Multiplayer.DebugMode)
+                // Silence used to be ambiguous: "the prefix never ran" and "it ran and found nothing" looked
+                // identical in the log, so a hang could not be attributed. Now the clean case is on record too.
+                Multiplayer.Log?.LogInfo($"[REPAIR] drop sweep ran — {list.Count} live drop(s), nothing dead");
             return removed;
         }
         catch (Exception e) { Multiplayer.Log?.LogWarning($"[REPAIR] drop sweep failed: {e.Message}"); return 0; }
@@ -4866,6 +4963,58 @@ public static class PrepareForSaveDropSweepPatch
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
 
     static void Prefix() => SaveRepair.SweepDeadDrops();
+
+    // Exit trace. Two hangs leave no trace at all in the log — exiting a house (undiagnosed since July) and
+    // exiting to the menu (2026-08-10, host froze on the loading screen). Both are shaped like "a save that
+    // never finishes", and this is the method whose failure produces exactly that. Bracketing it turns an
+    // untraceable freeze into a one-line answer: an ENTER with no DONE means the world serialization is
+    // where it died, and everything after this point in the game's own code becomes the suspect.
+    static void Postfix() => Multiplayer.Log?.LogWarning("[SAVE-TRACE] GameSave.PrepareForSave DONE ✓");
+}
+
+// Second doorway into the same poison, found live 2026-08-10 (host froze on the loading screen after
+// pressing exit-to-menu; reproduced deterministically with Shift+D, clean without it).
+//
+// InGameMenuGUI.ReturnToMainMenu (decomp 60391) → SavesGUI.StopPlayingGame (61595) → DropsList
+// .RemoveAllDropsFromTheScene (33940), which is:
+//     for (i…) UnityEngine.Object.Destroy(drops[i].gameObject);
+// — no null check, so one dead entry throws on .gameObject and takes StopPlayingGame down with it. Look at
+// what that costs in ReturnToMainMenu: StopPlayingGame() is the FIRST call, and LoadingGUI.Hide() is the
+// fourth. The exception skips the rest, the loading overlay is never hidden, and the game sits on it forever
+// — no crash, no log line, which is why this hang left no trace at all.
+//
+// This is the same fake-null root as the save hang and the FixedUpdateMe spam, just through a third door.
+// Patching the method (not its caller) covers every call site — the game calls it from two places.
+[HarmonyPatch]
+public static class RemoveAllDropsSweepPatch
+{
+    static MethodBase TargetMethod() =>
+        AccessTools.Method(AccessTools.TypeByName("DropsList"), "RemoveAllDropsFromTheScene");
+
+    static void Prefix() => SaveRepair.SweepDeadDrops();
+}
+
+// The other half of the bracket, plus the exit path itself: which of the two even started.
+[HarmonyPatch]
+public static class SaveTraceEnterPatch
+{
+    static MethodBase TargetMethod() =>
+        AccessTools.TypeByName("GameSave")
+            ?.GetMethod("PrepareForSave",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+    [HarmonyPriority(Priority.First)]
+    static void Prefix() => Multiplayer.Log?.LogWarning("[SAVE-TRACE] GameSave.PrepareForSave ENTER");
+}
+
+[HarmonyPatch]
+public static class MenuExitTracePatch
+{
+    static MethodBase TargetMethod() =>
+        AccessTools.Method(AccessTools.TypeByName("InGameMenuGUI"), "ReturnToMainMenu");
+
+    static void Prefix()  => Multiplayer.Log?.LogWarning("[SAVE-TRACE] ReturnToMainMenu ENTER");
+    static void Postfix() => Multiplayer.Log?.LogWarning("[SAVE-TRACE] ReturnToMainMenu DONE ✓");
 }
 
 [HarmonyPatch]

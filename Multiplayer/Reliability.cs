@@ -31,6 +31,13 @@ public static class ReliableNet
     const float RESEND_AFTER = 0.30f;  // retransmit an unacked fragment after this many seconds
     const float ACK_COALESCE = 0.03f;  // batch the cumulative ack instead of one per fragment
     const int   MAX_REORDER  = 8192;   // safety cap on the out-of-order buffer
+    const int   SEND_WINDOW  = 96;     // max fragments in flight (~106KB). A multi-MB payload burst-sent all
+                                       // at once overflows Steam's per-connection send buffer: SendP2PPacket
+                                       // starts returning false for EVERYTHING including other systems' packets,
+                                       // and our own ACKs never come back — the detector then reads the
+                                       // self-inflicted silence as a dead link and a resync wipes the payload.
+                                       // Fragments beyond the window wait in _sendQueue and follow as ACKs
+                                       // free slots. (Proven in the BFTG port: 3MB save / ~2800 fragments.)
 
     // Injected once by SteamManager at init
     public static Action<byte[]>     RawSend;    // send one datagram UNRELIABLE to RemoteID
@@ -63,28 +70,55 @@ public static class ReliableNet
                         $"(dropped {_chaosDropped}/{_chaosSent} datagrams so far)");
     }
 
+    // ── TX accounting (bandwidth diagnostic, wild report 2026-08-10) ──────────────────────
+    // A tester's whole connection degraded while the mod ran — Discord voice broke up — and it happened
+    // even while he sat in the MENU, which neither the save transfer (one-shot) nor 0x06 (IsInGame only)
+    // can explain. Retransmits are the suspect: Tick() runs always and re-sends every unacked fragment
+    // every RESEND_AFTER with no backoff, so a peer that stops acking makes us hammer the link forever.
+    // A plain byte total can't show that — a retransmit storm and a legitimate bulk transfer look
+    // identical on the scale. So each datagram is classified where it is sent.
+    public static int  TxNew      { get; private set; }   // fragments put on the wire for the first time
+    public static int  TxRetx     { get; private set; }   // re-sends of a fragment already sent
+    public static int  TxAck      { get; private set; }   // cumulative-ack datagrams
+    public static long TxBytes    { get; private set; }   // total bytes handed to Steam (all three kinds)
+    public static int  TxMaxTries { get; private set; }   // worst per-fragment try count seen this window
+    public static int  UnackedCount => _unacked.Count;
+    public static int  QueuedCount  => _sendQueue.Count;
+
+    public static void ResetTxStats() { TxNew = TxRetx = TxAck = 0; TxBytes = 0; TxMaxTries = 0; }
+
+    const int TX_NEW = 0, TX_RETX = 1, TX_ACK = 2;
+
     // Every outgoing datagram funnels through here. When chaos is on, silently swallow a fraction of them so the
     // reliability layer must retransmit — reproducing the real bursty, delayed delivery of a lossy link.
-    static void WireSend(byte[] wire)
+    static void WireSend(byte[] wire, int kind)
     {
         if (ChaosEnabled)
         {
             _chaosSent++;
             if (_chaosRng.NextDouble() < ChaosDropRate) { _chaosDropped++; return; }   // "lost" — never hits the wire
         }
+        // Counted after the chaos gate: this measures what actually reaches the uplink, which is the
+        // number the bandwidth question is about.
+        if      (kind == TX_RETX) TxRetx++;
+        else if (kind == TX_ACK)  TxAck++;
+        else                      TxNew++;
+        TxBytes += wire.Length;
         RawSend?.Invoke(wire);
     }
 
     // ── Send side: our outgoing reliable stream ──
     static uint _sendSeq;
-    class Pending { public byte[] wire; public float firstSent; public float lastSent; public int tries; }
+    class Pending { public uint seq; public byte[] wire; public float firstSent; public float lastSent; public int tries; }
     static readonly SortedDictionary<uint, Pending> _unacked = new SortedDictionary<uint, Pending>();
+    static readonly Queue<Pending> _sendQueue = new Queue<Pending>();   // built but not yet on the wire
 
     // ── Outbound-death signals (read by SteamManager's degraded-link detector) ──
     // A side whose OUTBOUND died (post-Stop zombie, or the peer stopped acking) still receives the peer
     // just fine, so the inbound-silence detector never fires HERE — proven by the 2026-07-03 Shift+X live
     // test: only the OTHER machine warned. These two signals catch the local half of the breakage.
     static float _notReadyDropSince;                       // first Send() swallowed by !_ready since Reset (0 = none)
+    static float _lastOutboundProgressAt;                  // last time the peer's cumulative ack advanced our window
     public static bool   OutboundLooksDead  { get; private set; }
     public static string OutboundDeathReason { get; private set; }
 
@@ -102,18 +136,19 @@ public static class ReliableNet
     public static void Reset(byte epoch)
     {
         _sendSeq = 0; _recvNext = 0;
-        _unacked.Clear(); _reorder.Clear(); _assembly.Clear();
+        _unacked.Clear(); _sendQueue.Clear(); _reorder.Clear(); _assembly.Clear();
         _ackDue = false; _ackTimer = 0f;
         _ready = true;
         _epoch = epoch;
         _notReadyDropSince = 0f; OutboundLooksDead = false; OutboundDeathReason = null;
+        _lastOutboundProgressAt = Time.time;
         Log?.LogInfo($"[REL] reset — reliable streams realigned to 0 (epoch {epoch})");
     }
 
     // Peer gone: stop resending into the void and block sends until the next handshake Reset().
     public static void Stop()
     {
-        _unacked.Clear(); _reorder.Clear(); _assembly.Clear();
+        _unacked.Clear(); _sendQueue.Clear(); _reorder.Clear(); _assembly.Clear();
         _ackDue = false; _ackTimer = 0f;
         _ready = false;
     }
@@ -125,7 +160,7 @@ public static class ReliableNet
     public static void PrepareResync(byte pendingEpoch)
     {
         _sendSeq = 0; _recvNext = 0;
-        _unacked.Clear(); _reorder.Clear(); _assembly.Clear();
+        _unacked.Clear(); _sendQueue.Clear(); _reorder.Clear(); _assembly.Clear();
         _ackDue = false; _ackTimer = 0f;
         _ready = false;
         _epoch = pendingEpoch;
@@ -139,9 +174,10 @@ public static class ReliableNet
     {
         _ready = true;
         _notReadyDropSince = 0f; OutboundLooksDead = false; OutboundDeathReason = null;
+        _lastOutboundProgressAt = Time.time;
     }
 
-    // Queue a logical message: fragment it, store each fragment for retransmit, fire all now.
+    // Queue a logical message: fragment it, enqueue the fragments; the send window paces them onto the wire.
     public static void Send(byte[] payload)
     {
         if (payload == null || payload.Length == 0) return;
@@ -154,7 +190,6 @@ public static class ReliableNet
         }
         //  ↑ blocks any layer traffic (heartbeat/weather/time) the host might emit after setting RemoteID but
         //    BEFORE receiving 0x01 — sending seq 0 then would desync the stream when Reset() rewinds it.
-        float now = Time.time;
         int off = 0;
         do
         {
@@ -167,10 +202,26 @@ public static class ReliableNet
             BitConverter.GetBytes(seq).CopyTo(wire, 2);
             wire[6] = (byte)(more ? 1 : 0);
             Buffer.BlockCopy(payload, off, wire, 7, chunk);
-            _unacked[seq] = new Pending { wire = wire, firstSent = now, lastSent = now, tries = 1 };
-            WireSend(wire);
+            _sendQueue.Enqueue(new Pending { seq = seq, wire = wire });
             off += chunk;
         } while (off < payload.Length);
+        PumpSendQueue(Time.time);
+    }
+
+    // Move queued fragments onto the wire while the in-flight window has room. Queued wires
+    // always carry the current epoch: Reset/PrepareResync/Stop clear the queue along with _unacked.
+    static void PumpSendQueue(float now)
+    {
+        // An idle→busy transition re-anchors the progress clock: a stale timestamp from the
+        // last burst must not count against the fresh one.
+        if (_unacked.Count == 0 && _sendQueue.Count > 0) _lastOutboundProgressAt = now;
+        while (_sendQueue.Count > 0 && _unacked.Count < SEND_WINDOW)
+        {
+            var p = _sendQueue.Dequeue();
+            p.firstSent = now; p.lastSent = now; p.tries = 1;
+            _unacked[p.seq] = p;
+            WireSend(p.wire, TX_NEW);
+        }
     }
 
     // A 0xFE/0xFF datagram arrived. Returns nothing — delivers reassembled messages via OnDeliver, acks via RawSend.
@@ -187,6 +238,11 @@ public static class ReliableNet
             var done = new List<uint>();
             foreach (var kv in _unacked) { if (kv.Key <= ackThrough) done.Add(kv.Key); else break; }
             for (int i = 0; i < done.Count; i++) _unacked.Remove(done[i]);
+            if (done.Count > 0)
+            {
+                _lastOutboundProgressAt = Time.time;
+                PumpSendQueue(Time.time);   // freed window slots — let queued fragments follow
+            }
             return;
         }
 
@@ -233,26 +289,31 @@ public static class ReliableNet
     public static void Tick(float dt)
     {
         float now = Time.time;
-        float oldestUnacked = 0f;   // _unacked is sorted by seq → the first entry is the oldest fragment
+        PumpSendQueue(now);   // covers the Resume() case: queue drained even with no fresh ACK or Send
         foreach (var kv in _unacked)
         {
             var p = kv.Value;
-            if (oldestUnacked == 0f) oldestUnacked = now - p.firstSent;
             if (now - p.lastSent >= RESEND_AFTER)
             {
-                WireSend(p.wire);
+                WireSend(p.wire, TX_RETX);
                 p.lastSent = now;
                 p.tries++;
+                if (p.tries > TxMaxTries) TxMaxTries = p.tries;
             }
         }
 
         // Outbound health for the degraded-link detector: dead if we've been swallowing sends (post-Stop
-        // zombie) or the oldest fragment went unacked through ~40 retransmits (peer not acking).
+        // zombie) or the peer's cumulative ack has not advanced our window for a long stretch. The yardstick
+        // must be ACK PROGRESS, not the age of the oldest fragment: during a windowed bulk transfer a
+        // fragment legitimately waits many seconds behind the queue on a slow-but-alive link, and reading
+        // that age as death produced resync → transfer restart → repeat, an infinite join loop under
+        // sustained packet loss (proven in the BFTG port under 35% chaos).
+        float ackStall = _unacked.Count > 0 ? now - _lastOutboundProgressAt : 0f;
         if (_notReadyDropSince != 0f && now - _notReadyDropSince > 12f)
             { OutboundLooksDead = true; OutboundDeathReason = "sends blocked — layer stopped, no new handshake"; }
-        else if (oldestUnacked > 12f)
-            { OutboundLooksDead = true; OutboundDeathReason = $"no ACKs for {oldestUnacked:F0}s"; }
-        else if (OutboundLooksDead && _notReadyDropSince == 0f && oldestUnacked < 2f)
+        else if (ackStall > 12f)
+            { OutboundLooksDead = true; OutboundDeathReason = $"no ACK progress for {ackStall:F0}s"; }
+        else if (OutboundLooksDead && _notReadyDropSince == 0f && ackStall < 2f)
             { OutboundLooksDead = false; OutboundDeathReason = null; }   // acks resumed — recovered
 
         if (_ackDue && _recvNext > 0)   // _recvNext==0 → nothing delivered yet, an ack would be meaningless
@@ -265,7 +326,7 @@ public static class ReliableNet
                 ack[0] = TAG_ACK;
                 ack[1] = _epoch;
                 BitConverter.GetBytes(_recvNext - 1).CopyTo(ack, 2);
-                WireSend(ack);
+                WireSend(ack, TX_ACK);
             }
         }
     }
