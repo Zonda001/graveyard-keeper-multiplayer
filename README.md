@@ -13,6 +13,25 @@ single-player game). Connection is over Steam P2P — no separate server.
 
 ---
 
+## ⚠️ Back up your save first
+
+**Please copy your save folder before playing with this mod, and ideally use a
+separate save rather than your main run.** This is a beta written and tested by
+one person and two friends — it has broken saves before, in ways that followed
+the player back into singleplayer, where removing the mod didn't help because
+the damage lives in the save file.
+
+Saves are here:
+
+```
+%USERPROFILE%\AppData\LocalLow\Lazy Bear Games\Graveyard Keeper
+```
+
+Paste that into the Explorer address bar, copy the whole folder somewhere safe,
+and you can always roll back.
+
+---
+
 ## Features
 
 Already working:

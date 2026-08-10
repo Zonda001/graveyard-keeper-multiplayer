@@ -4,6 +4,12 @@ Adds [b]2-player co-op[/b] to Graveyard Keeper. Connection is over Steam P2P —
 
 [b]Status:[/b] beta. The core loop is fully playable together: world, building, crafting, graves, inventory. NPC villagers and dungeon mobs are not synced yet (see Known limitations).
 
+[size=4][b]⚠ Back up your save first[/b][/size]
+
+[b]Please copy your save folder before playing with this mod, and ideally use a separate save rather than your main run.[/b] This is a beta written and tested by one person and two friends — it has broken saves before, in ways that followed the player back into singleplayer, where removing the mod didn't help because the damage lives in the save file.
+
+Saves are here: [i]%USERPROFILE%\AppData\LocalLow\Lazy Bear Games\Graveyard Keeper[/i] — paste that into the Explorer address bar, copy the whole folder somewhere safe, and you can always roll back.
+
 [size=4][b]What is synced[/b][/size]
 
 [list]
@@ -66,14 +72,21 @@ The lobby [b]is[/b] created — the invite window is drawn by the [b]Steam Overl
 [*]NPC villagers and dungeon mobs/zombies are not synced yet — you'll each see your own
 [*]Both players need the game on Steam (P2P runs through Steam networking)
 [*]DLC: a player without the DLCs can join and play fine, [b]until[/b] the host starts a paid DLC storyline — then the save won't load for them
+[*]Rare: if both players grab the very last item of the same stack in a chest at the exact same moment, 1 item can duplicate
 [/list]
 
 [size=4][b]Bug reports[/b][/size]
 
-Bug reports are the most useful thing you can give this mod right now. If something breaks, post what happened, and if possible: set [i]DebugMode = true[/i] in [i]BepInEx\config\com.denys.multiplayer.cfg[/i] and attach [i]BepInEx\LogOutput.log[/i] from both players. Logs contain no personal data beyond Steam display names.
+Bug reports are the most useful thing you can give this mod right now. Two places to post one — the comments here, or GitHub issues: [url=https://github.com/Zonda001/graveyard-keeper-multiplayer/issues]github.com/Zonda001/graveyard-keeper-multiplayer/issues[/url] (there's a bug-report template there, and long logs paste better than in a comment). There is no Discord.
+
+Whichever you pick: say what happened, and if possible set [i]DebugMode = true[/i] in [i]BepInEx\config\com.denys.multiplayer.cfg[/i] and attach [i]BepInEx\LogOutput.log[/i] from both players. Logs contain no personal data beyond Steam display names.
 
 [size=4][b]Support[/b][/size]
 
 This mod is free and always will be. If you'd like to support development: [url=https://ko-fi.com/zonda]ko-fi.com/zonda[/url]. Totally optional — bug reports and testing help just as much. ❤
 
-[i]Unofficial fan mod, not affiliated with Lazy Bear Games or tinyBuild. MIT license.[/i]
+[size=4][b]Source code[/b][/size]
+
+Everything is open, MIT: [url=https://github.com/Zonda001/graveyard-keeper-multiplayer]github.com/Zonda001/graveyard-keeper-multiplayer[/url]
+
+[i]Unofficial fan mod, not affiliated with Lazy Bear Games or tinyBuild.[/i]
