@@ -28,7 +28,8 @@ public static class ReliableNet
     const byte  TAG_DATA     = 0xFE;
     const byte  TAG_ACK      = 0xFF;
     const int   FRAG_PAYLOAD = 1100;   // inner bytes per datagram (+7 header < Steam ~1200 unreliable cap)
-    const float RESEND_AFTER = 0.30f;  // retransmit an unacked fragment after this many seconds
+    const float RESEND_AFTER = 0.30f;  // delay before the FIRST retransmit of an unacked fragment
+    const float RESEND_MAX   = 4.00f;  // ceiling once the delay has doubled its way up (see RetransmitDelay)
     const float ACK_COALESCE = 0.03f;  // batch the cumulative ack instead of one per fragment
     const int   MAX_REORDER  = 8192;   // safety cap on the out-of-order buffer
     const int   SEND_WINDOW  = 96;     // max fragments in flight (~106KB). A multi-MB payload burst-sent all
@@ -73,8 +74,10 @@ public static class ReliableNet
     // ── TX accounting (bandwidth diagnostic, wild report 2026-08-10) ──────────────────────
     // A tester's whole connection degraded while the mod ran — Discord voice broke up — and it happened
     // even while he sat in the MENU, which neither the save transfer (one-shot) nor 0x06 (IsInGame only)
-    // can explain. Retransmits are the suspect: Tick() runs always and re-sends every unacked fragment
-    // every RESEND_AFTER with no backoff, so a peer that stops acking makes us hammer the link forever.
+    // can explain. That particular report was later cleared: a control run with the mod AND BepInEx removed
+    // lagged identically, so the mod was innocent there. But the suspicion it raised was real and is fixed
+    // separately below (RetransmitDelay) — Tick() used to re-send every unacked fragment every RESEND_AFTER
+    // with no backoff and no ceiling, so a peer that stopped acking made us hammer the link forever.
     // A plain byte total can't show that — a retransmit storm and a legitimate bulk transfer look
     // identical on the scale. So each datagram is classified where it is sent.
     public static int  TxNew      { get; private set; }   // fragments put on the wire for the first time
@@ -122,6 +125,29 @@ public static class ReliableNet
     public static bool   OutboundLooksDead  { get; private set; }
     public static string OutboundDeathReason { get; private set; }
 
+    // ── RETRANSMIT BACKOFF ────────────────────────────────────────────────────────────────────────
+    // Fixed 0.30s forever was a storm generator. With a full window (SEND_WINDOW=96) and a peer that has
+    // stopped acking, that is ~320 datagrams/s of pure retransmit — roughly 350 KB/s — sustained for as
+    // long as the situation lasts, and Tick() runs in the menu too. The degraded-link detector only calls
+    // it dead after 12s, and a resync can take longer, so this is not a brief spike.
+    //
+    // The delay doubles per attempt up to RESEND_MAX: 0.30 → 0.60 → 1.20 → 2.40 → 4.00s. A dead peer now
+    // costs ~24 datagrams/s instead of ~320, while the FIRST retransmit is untouched, so ordinary loss
+    // recovery behaves exactly as before.
+    //
+    // The important half is where the backoff is CLEARED: any ACK that advances the window resets every
+    // remaining fragment to attempt 1. That is what separates "the link is alive and one packet was lost"
+    // — retry briskly, the head fragment is blocking the whole in-order stream — from "nobody is home".
+    // Backing off on the first kind would slow down exactly the lossy links this layer exists to survive.
+    static float RetransmitDelay(int tries)
+    {
+        // tries is 1 while the fragment has only been sent once, so attempt 1 waits RESEND_AFTER.
+        int steps = Math.Min(tries - 1, 10);          // clamped well before 1<<31 overflows
+        return Math.Min(RESEND_AFTER * (1 << steps), RESEND_MAX);
+    }
+
+    static bool _backoffCapLogged;   // one line per stall, not one per fragment per tick
+
     // ── Recv side: the partner's incoming reliable stream ──
     static uint _recvNext;                                                         // next in-order seq to deliver
     static readonly Dictionary<uint, byte[]> _reorder = new Dictionary<uint, byte[]>();  // buffered future fragments
@@ -140,6 +166,7 @@ public static class ReliableNet
         _ackDue = false; _ackTimer = 0f;
         _ready = true;
         _epoch = epoch;
+        _backoffCapLogged = false;
         _notReadyDropSince = 0f; OutboundLooksDead = false; OutboundDeathReason = null;
         _lastOutboundProgressAt = Time.time;
         Log?.LogInfo($"[REL] reset — reliable streams realigned to 0 (epoch {epoch})");
@@ -164,6 +191,7 @@ public static class ReliableNet
         _ackDue = false; _ackTimer = 0f;
         _ready = false;
         _epoch = pendingEpoch;
+        _backoffCapLogged = false;
         _notReadyDropSince = 0f;
         Log?.LogInfo($"[REL] resync prepared — waiting for the peer to realign (epoch {pendingEpoch})");
     }
@@ -173,6 +201,7 @@ public static class ReliableNet
     public static void Resume()
     {
         _ready = true;
+        _backoffCapLogged = false;
         _notReadyDropSince = 0f; OutboundLooksDead = false; OutboundDeathReason = null;
         _lastOutboundProgressAt = Time.time;
     }
@@ -241,6 +270,11 @@ public static class ReliableNet
             if (done.Count > 0)
             {
                 _lastOutboundProgressAt = Time.time;
+                // The peer is demonstrably alive, so whatever is still unacked is ordinary loss, not a dead
+                // link: drop back to the fast retransmit delay instead of staying in a backoff earned
+                // during an earlier stall.
+                foreach (var kv in _unacked) kv.Value.tries = 1;
+                _backoffCapLogged = false;
                 PumpSendQueue(Time.time);   // freed window slots — let queued fragments follow
             }
             return;
@@ -290,16 +324,25 @@ public static class ReliableNet
     {
         float now = Time.time;
         PumpSendQueue(now);   // covers the Resume() case: queue drained even with no fresh ACK or Send
+        bool atCap = false;
         foreach (var kv in _unacked)
         {
             var p = kv.Value;
-            if (now - p.lastSent >= RESEND_AFTER)
+            if (now - p.lastSent >= RetransmitDelay(p.tries))
             {
                 WireSend(p.wire, TX_RETX);
                 p.lastSent = now;
                 p.tries++;
                 if (p.tries > TxMaxTries) TxMaxTries = p.tries;
+                if (RetransmitDelay(p.tries) >= RESEND_MAX) atCap = true;
             }
+        }
+        if (atCap && !_backoffCapLogged)
+        {
+            _backoffCapLogged = true;
+            Log?.LogWarning($"[REL] retransmit backoff at its {RESEND_MAX:F1}s ceiling — the peer has not acked " +
+                            $"for a while ({_unacked.Count} unacked, {_sendQueue.Count} queued). Throttling until " +
+                            "an ACK arrives; nothing is dropped.");
         }
 
         // Outbound health for the degraded-link detector: dead if we've been swallowing sends (post-Stop
