@@ -814,7 +814,15 @@ public static class ChopSync
             Multiplayer.Log?.LogWarning("[CHOP] Reflection not initialized — chop sync disabled");
     }
 
-    public static void Reset() { _pendingDestroys.Clear(); _pendingDrops.Clear(); }
+    // Everything here is world state tied to ONE session. _pendingBigPickups used to survive a disconnect
+    // and could then act on the next world loaded in the same process.
+    public static void Reset()
+    {
+        _pendingDestroys.Clear();
+        _pendingDrops.Clear();
+        _pendingGraves.Clear();
+        _pendingBigPickups.Clear();
+    }
 
     // Objects whose DESTRUCTION we sync (packets 0x09 hit, 0x0A destroy):
     // trees (tree*) and ground stones (stone_N). Mine veins (steep_*) do NOT belong here —
@@ -3375,18 +3383,25 @@ public static class ChopSync
     // (FromWGO — with this machine's valid formulas/refs), swap only item_data/obj_id/variation with the
     // received ones, null out item (so restore rebuilds _data from item_data), then RestoreFromSerializedObject.
     // The echo-guard mutes the back-broadcast (restore triggers RedrawPart → the Postfix exits early).
-    public static void ApplyRemoteGraveState(long uid, float x, float y,
-                                             string objId, int variation, string json)
+    // Returns TRUE when the packet is dealt with — applied, or deliberately skipped by a guard.
+    // Returns FALSE only for "the target isn't in the world right now" (zone not loaded), which is the one
+    // recoverable case and the only one that goes into the retry queue. Every other early exit is a
+    // decision, not a failure: re-running the owner guard or the monotonicity guard later would re-apply
+    // exactly the restore they exist to block (runaway re-drop on co-dig). fromRetry mirrors
+    // ApplyRemoteGardenState — it stops the retry pass from re-queuing what it just pulled off the queue.
+    public static bool ApplyRemoteGraveState(long uid, float x, float y,
+                                             string objId, int variation, string json,
+                                             bool fromRetry = false)
     {
         EnsureReflection();
-        if (!_ready || !GraveStateReflectionReady()) return;
+        if (!_ready || !GraveStateReflectionReady()) return true;   // reflection is one-shot — retrying won't help
 
         // Corruption guard: do NOT apply an empty state (an empty one already wiped _data →
         // "No data" / empty pits, live test 2026-06-07). Better nothing.
         if (string.IsNullOrEmpty(json))
         {
             Multiplayer.Log?.LogWarning($"[CHOP] 0x0D: json EMPTY for uid={uid} — skipping (don't corrupt the grave)");
-            return;
+            return true;   // a corrupt packet stays corrupt — never queue it
         }
 
         // TERMINAL-STATE RECONCILIATION (fix for a stuck "-1" on co-dig, 2026-06-08):
@@ -3403,7 +3418,7 @@ public static class ChopSync
         if (!isTerminal
             && _lastLocalGraveDigTime.TryGetValue(uid, out var dugAt)
             && UnityEngine.Time.realtimeSinceStartup - dugAt < GRAVE_OWNER_WINDOW)
-            return;  // I'm the active digger of this grave → don't apply the other's restore (rehydration → dupe)
+            return true;  // I'm the active digger of this grave → don't apply the other's restore (rehydration → dupe)
 
         var target = FindWgoByUniqueId(uid);
         if (target == null)
@@ -3411,9 +3426,18 @@ public static class ChopSync
             target = FindTargetNear(x, y, out float dist, IsGraveTarget);
             if (target == null || dist > POSITION_EPSILON)
             {
-                Multiplayer.Log?.LogWarning($"[CHOP] 0x0D: grave uid={uid} @({x:F1},{y:F1}) not found " +
-                    $"(nearest: {(target != null ? dist.ToString("F1") : "none")})");
-                return;
+                // Was a dead end until now: 24 grave/building states went on the floor in a single session
+                // of Lexus125's log (2026-08-17), every one of them only because the partner was working
+                // somewhere this machine had not loaded. Queue it, the way beds/destroys/loot already are.
+                if (!fromRetry)
+                {
+                    EnqueuePendingGrave(uid, x, y, objId, variation, json);
+                    Multiplayer.Log?.LogWarning($"[CHOP] 0x0D: grave uid={uid} @({x:F1},{y:F1}) not found " +
+                        $"(nearest: {(target != null ? dist.ToString("F1") : "none")}) — queued ({_pendingGraves.Count})");
+                }
+                // The retry pass stays silent on failure: a zone the players never revisit would otherwise
+                // print this line every 2s per object and bury the next real bug in a wall of noise.
+                return false;
             }
         }
 
@@ -3426,7 +3450,7 @@ public static class ChopSync
         // workbench has the same inventory → future WorkbenchInvHash converges.
         int invH = variation >> 1;
         string sig = GraveStageSig(objId, json) + (((variation & 1) != 0) ? "|B" : "") + (invH != 0 ? "|w" + invH : "");
-        if (_lastAppliedGraveSig.TryGetValue(uid, out var prevSig) && prevSig == sig) return;
+        if (_lastAppliedGraveSig.TryGetValue(uid, out var prevSig) && prevSig == sig) return true;   // already applied
 
         // MONOTONICITY GUARD (dupe fix 2026-06-08) — NOW ONLY DURING ACTIVE CONTEST (reverse-sync fix 2026-06-10).
         // Used to act unconditionally (digging = irreversible), dropping any "backward" state as stale-echo — else
@@ -3445,9 +3469,9 @@ public static class ChopSync
             if (!string.IsNullOrEmpty(localJson))
             {
                 int inRank = GraveObjRank(objId), locRank = GraveObjRank(localObjId);
-                if (inRank < locRank) return;                                  // obj_id "backward" — stale/echo
+                if (inRank < locRank) return true;                             // obj_id "backward" — stale/echo
                 if (inRank == locRank && !GraveParts(json).IsSubsetOf(GraveParts(localJson)))
-                    return;                                                    // adds parts back — rehydration
+                    return true;                                               // adds parts back — rehydration
             }
         }
         catch (Exception e) { Multiplayer.Log?.LogWarning($"[CHOP] 0x0D monotonicity guard failed (applying anyway): {e.Message}"); }
@@ -3460,8 +3484,8 @@ public static class ChopSync
             // _params/inventory update, OnAfterDeserialize rebuilds nested data), swap obj_id (grave_ground→empty
             // transitions). RestoreFromSerializedObject applies the state + rebuilds the visual in one call.
             var sw = _fromWgoMethod.Invoke(null, new object[] { target });
-            if (sw == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: FromWGO(receiver) = null"); return; }
-            if (_fromJsonOverwriteMethod == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: JsonUtility.FromJsonOverwrite missing"); return; }
+            if (sw == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: FromWGO(receiver) = null"); return true; }
+            if (_fromJsonOverwriteMethod == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: JsonUtility.FromJsonOverwrite missing"); return true; }
             var item = _swItemField.GetValue(sw);
             if (item != null)
             {
@@ -3471,7 +3495,7 @@ public static class ChopSync
             {
                 // Fallback path: pour directly into the target's live _data.
                 var data = _dataField.GetValue(target);
-                if (data == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: target's _data = null"); return; }
+                if (data == null) { Multiplayer.Log?.LogWarning("[CHOP] 0x0D: target's _data = null"); return true; }
                 _fromJsonOverwriteMethod.Invoke(null, new object[] { json, data });
                 _swItemField.SetValue(sw, data);
             }
@@ -3509,6 +3533,53 @@ public static class ChopSync
         }
         catch (Exception e) { Multiplayer.Log?.LogError($"[CHOP] 0x0D RestoreFromSerializedObject failed: {e.Message}"); }
         finally { ApplyingRemoteChop = false; }
+        return true;
+    }
+
+    // ── 0x0D RETRY QUEUE ──────────────────────────────────────────────────────────────────
+    // Same shape as _pendingGardens, deliberately: dedup by uid, bounded, cleared on disconnect. No TTL,
+    // and that is the difference from _pendingBigPickups: this queue finds its target by unique_id, so a
+    // stale entry can only ever touch the one grave it was cut from, and a newer state for that uid
+    // overwrites it in place. 0x0D carries a FULL state snapshot, so keeping only the newest loses
+    // nothing — replaying the history would just walk the same stages to the same result.
+    private class PendingGrave
+    {
+        public long uid; public float x, y;
+        public string objId; public int variation; public string json;
+    }
+    private static readonly List<PendingGrave> _pendingGraves = new List<PendingGrave>();
+    private const int PENDING_GRAVE_MAX = 128;
+
+    private static void EnqueuePendingGrave(long uid, float x, float y, string objId, int variation, string json)
+    {
+        var existing = _pendingGraves.FirstOrDefault(g => g.uid == uid);
+        if (existing != null)
+        {
+            existing.x = x; existing.y = y;
+            existing.objId = objId; existing.variation = variation; existing.json = json;
+            return;   // fresher state of the same grave replaces the older one
+        }
+        if (_pendingGraves.Count < PENDING_GRAVE_MAX)
+            _pendingGraves.Add(new PendingGrave
+            {
+                uid = uid, x = x, y = y, objId = objId, variation = variation, json = json
+            });
+        else
+            Multiplayer.Log?.LogWarning($"[CHOP] 0x0D queue full ({PENDING_GRAVE_MAX}) — uid={uid} dropped");
+    }
+
+    // From SteamManager.Update (retry timer, every 2s): the zone finished loading → apply.
+    public static void RetryPendingGraves()
+    {
+        for (int i = _pendingGraves.Count - 1; i >= 0; i--)
+        {
+            var g = _pendingGraves[i];
+            if (ApplyRemoteGraveState(g.uid, g.x, g.y, g.objId, g.variation, g.json, fromRetry: true))
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] 0x0D retry: grave uid={g.uid} applied ✓ ({_pendingGraves.Count - 1} left)");
+                _pendingGraves.RemoveAt(i);
+            }
+        }
     }
 
     // Parse a 0x0D packet → ApplyRemoteGraveState.
@@ -4454,9 +4525,15 @@ public static class ChopSync
     // (mirrors/own) are skipped — they're driven by 0x10/0x14. Zone not loaded (partner far — live test:
     // wood at base, host in the quarry) → into the QUEUE with retry, remove when our player approaches and
     // the chunk wakes (RetryPendingDestroys pattern).
-    private class PendingBigPickup { public string id; public Vector2 pos; }
+    // TTL, unlike the 0x0D queue above, because this one matches FUZZILY: by item id and position within
+    // BIG_MATCH_RADIUS. An entry that never resolves is therefore live ammunition — mine a fresh log near
+    // where an unresolved one was queued and TryRemoveBigCopy happily deletes the new drop instead. Nothing
+    // expired it and Reset() did not clear it either, so it outlived the session that created it. Letting an
+    // unclaimed entry lapse costs at most one lingering duplicate copy, which is the old fail-open behaviour.
+    private class PendingBigPickup { public string id; public Vector2 pos; public float queuedAt; }
     private static readonly List<PendingBigPickup> _pendingBigPickups = new List<PendingBigPickup>();
     private const int PENDING_BIG_MAX = 64;
+    private const float PENDING_BIG_TTL = 120f;
 
     public static void ApplyRemoteBigPickup(string id, float x, float y)
     {
@@ -4469,7 +4546,10 @@ public static class ChopSync
         if (_pendingBigPickups.Count < PENDING_BIG_MAX &&
             !_pendingBigPickups.Any(p => p.id == id && Vector2.Distance(p.pos, pos) < 1f))
         {
-            _pendingBigPickups.Add(new PendingBigPickup { id = id, pos = pos });
+            _pendingBigPickups.Add(new PendingBigPickup
+            {
+                id = id, pos = pos, queuedAt = Time.realtimeSinceStartup
+            });
             Multiplayer.Log?.LogInfo($"[CHOP] 0x1B: copy '{id}' @({x:F1},{y:F1}) not found — queued (zone not loaded?)");
         }
     }
@@ -4480,6 +4560,13 @@ public static class ChopSync
         for (int i = _pendingBigPickups.Count - 1; i >= 0; i--)
         {
             var p = _pendingBigPickups[i];
+            if (Time.realtimeSinceStartup - p.queuedAt > PENDING_BIG_TTL)
+            {
+                Multiplayer.Log?.LogInfo($"[CHOP] 0x1B: queued copy '{p.id}' expired after {PENDING_BIG_TTL:F0}s " +
+                    "— dropping it rather than risk deleting an unrelated drop later");
+                _pendingBigPickups.RemoveAt(i);
+                continue;
+            }
             if (TryRemoveBigCopy(p.id, p.pos.x, p.pos.y))
             {
                 Multiplayer.Log?.LogInfo($"[CHOP] 0x1B retry: copy '{p.id}' removed ✓");
@@ -4488,12 +4575,17 @@ public static class ChopSync
         }
     }
 
+    // How far from the broadcast position we still call it "the same drop". Wide on purpose (save-drops
+    // sit still, but the two machines' copies are not pixel-identical) — which is exactly why the queue
+    // feeding this needs a TTL.
+    private const float BIG_MATCH_RADIUS = 64f;
+
     private static bool TryRemoveBigCopy(string id, float x, float y)
     {
         try
         {
             DropResGameObject best = null;
-            float bestD = 64f;
+            float bestD = BIG_MATCH_RADIUS;
             foreach (var dr in UnityEngine.Object.FindObjectsOfType<DropResGameObject>())
             {
                 if (dr == null || dr.res == null || dr.res.id != id) continue;

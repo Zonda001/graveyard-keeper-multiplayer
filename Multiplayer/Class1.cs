@@ -2500,10 +2500,12 @@ public class SteamManager : MonoBehaviour
             if (_steamInitTimedOut)
             {
                 _logger.LogWarning("[STEAM] F11 ignored — Steam never initialized (see the startup error)");
+                // The dialog centres text and wraps it on its own, so hard breaks mid-sentence only make
+                // the centred edge ragged (live check 2026-08-27). Break between thoughts, not inside one.
                 ShowJoinError("Steam never started up, so co-op can't run.\n\n" +
-                              "Usually this means the game folder has no steam_appid.txt.\n" +
-                              "Create a file called steam_appid.txt next to 'Graveyard Keeper.exe',\n" +
-                              "put this single line in it:\n\n599140\n\n" +
+                              "Usually this means the game folder has no steam_appid.txt. " +
+                              "Create that file next to 'Graveyard Keeper.exe' and put this single line in it:" +
+                              "\n\n599140\n\n" +
                               "Save it, then restart the game.");
             }
             else
@@ -2993,6 +2995,7 @@ public class SteamManager : MonoBehaviour
                 ChopSync.RetryPendingDrops();
                 ChopSync.RetryPendingBigPickups();
                 ChopSync.RetryPendingGardens();
+                ChopSync.RetryPendingGraves();
             }
         }
     }
