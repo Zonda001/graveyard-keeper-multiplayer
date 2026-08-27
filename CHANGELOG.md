@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+- **`F11` doing nothing at all, with no explanation anywhere on screen.** If Steam never
+  finished starting up, pressing `F11` wrote a line into the log file and gave up silently, so
+  the only thing the player saw was a key that didn't work — and several people reasonably
+  concluded the mod was broken. `F11` now opens an on-screen message instead: either "Steam is
+  still starting up, try again in a few seconds", or, if Steam gave up entirely, the actual fix —
+  create `steam_appid.txt` next to `Graveyard Keeper.exe` containing `599140`, then restart.
+  The startup log line says the same thing now. Root cause diagnosed by **Winstonnn002** on
+  Nexus, who found it on his own after the standard overlay-and-reinstall advice got him nowhere
+
 ## [0.1.4-beta] — 2026-08-10
 
 ### Fixed

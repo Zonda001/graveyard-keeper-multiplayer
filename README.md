@@ -225,6 +225,32 @@ Game progress doesn't matter — you can invite from day 1. One note for a **bra
 game**: the HUD is hidden during the intro sequence, so the best moment to press
 `F11` is right after the game interface appears (that's early on, at the graveyard).
 
+### F11 does nothing — and there's no message either
+
+If pressing `F11` produces nothing at all — no invite window, no on-screen message,
+no reaction — then Steam itself may never have initialised. Check
+`BepInEx/LogOutput.log` for:
+
+```
+[STEAM] Steam did not initialize within 60 seconds!
+```
+
+The usual cause is a missing `steam_appid.txt`: without it Steamworks can't tell which
+app it belongs to, so it never starts and the mod waits forever. Create a file called
+`steam_appid.txt` next to `Graveyard Keeper.exe`, containing the single line:
+
+```
+599140
+```
+
+Save it, then restart the game.
+
+This isn't needed on every setup — plenty of installs work fine without the file — but
+when Steam fails to come up, it's the first thing to try.
+
+*(Diagnosed by Winstonnn002 on Nexus, after the usual overlay-and-reinstall advice led
+nowhere. The mod now says this on screen instead of only writing it to the log.)*
+
 ### The game crashes on startup — white screen, "Not responding"
 
 **Cause:** a conflict between recent NVIDIA drivers (the 32.x series, from late

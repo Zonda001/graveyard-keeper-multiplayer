@@ -2140,6 +2140,11 @@ public class SteamManager : MonoBehaviour
     public static SteamManager Instance;
     private bool _initialized = false;
 
+    // Steam never came up within the 60s budget. Kept as state (not just a log line) because the only
+    // moment the player notices is when they press F11 and nothing happens — that's where the
+    // explanation has to appear, and by then InitDelayed has long since given up.
+    private bool _steamInitTimedOut = false;
+
     private System.Type _steamMatchmaking;
     private System.Type _steamNetworking;
     private System.Type _steamUser;
@@ -2373,7 +2378,13 @@ public class SteamManager : MonoBehaviour
                 _logger.LogInfo($"[STEAM] Not ready yet ({inner.Message}), waiting...");
             }
         }
-        _logger.LogError("[STEAM] Steam did not initialize within 60 seconds!");
+        // The usual cause is a missing steam_appid.txt: without it Steamworks cannot tell which app it
+        // belongs to, SteamAPI_Init keeps failing, and the mod waits forever (Winstonnn002 diagnosed this
+        // on Nexus 2026-08-22 after the standard "enable the overlay / reinstall" advice got him nowhere).
+        _steamInitTimedOut = true;
+        _logger.LogError("[STEAM] Steam did not initialize within 60 seconds! F11 will do nothing. " +
+                         "Most likely cause: no steam_appid.txt in the game folder — create it next to " +
+                         "'Graveyard Keeper.exe' containing the single line 599140, then restart the game.");
     }
 
     private void OnLobbyChatUpdateRaw(object param)
@@ -2481,7 +2492,27 @@ public class SteamManager : MonoBehaviour
 
     public void CreateLobby()
     {
-        if (!_initialized) { _logger.LogWarning("[STEAM] Not initialized yet!"); return; }
+        // SILENT-F11 FIX (Nexus, several reports culminating in Winstonnn002's 2026-08-22 diagnosis): this
+        // used to warn into the log and return, so the player pressed F11, saw nothing at all, and concluded
+        // the mod was broken. The log line nobody reads is now a dialog, and it names the actual fix.
+        if (!_initialized)
+        {
+            if (_steamInitTimedOut)
+            {
+                _logger.LogWarning("[STEAM] F11 ignored — Steam never initialized (see the startup error)");
+                ShowJoinError("Steam never started up, so co-op can't run.\n\n" +
+                              "Usually this means the game folder has no steam_appid.txt.\n" +
+                              "Create a file called steam_appid.txt next to 'Graveyard Keeper.exe',\n" +
+                              "put this single line in it:\n\n599140\n\n" +
+                              "Save it, then restart the game.");
+            }
+            else
+            {
+                _logger.LogWarning("[STEAM] Not initialized yet!");
+                ShowJoinError("Steam is still starting up — give it a few seconds and press F11 again.");
+            }
+            return;
+        }
 
         // The symmetric half of the dual-host guard: a CLIENT pressing F11 inside the friend's world must
         // not hijack Role=Host mid-session (their world is the host's save — hosting it would fork it).
