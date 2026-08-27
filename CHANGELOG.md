@@ -6,6 +6,25 @@ based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] — test builds are versioned 0.1.5
 
 ### Fixed
+- **World changes made where you weren't standing could be lost for good.** When your partner
+  worked on a grave, a building or a workbench in a zone your machine hadn't loaded, the state
+  update was written to the log and thrown away. In one session of a tester's log that was 24
+  discarded updates, plus 7 chest operations. They now wait in a queue and apply when you reach
+  that zone — the same treatment felled trees, dropped loot and garden beds already had. Only the
+  one recoverable case is queued: a guard that deliberately declines an update still declines it,
+  because replaying those later would re-create the duplication bugs the guards exist to prevent
+- **A queued cleanup could delete a freshly mined resource.** When a partner picks up a big item
+  (log, boulder, ore) that both machines had their own copy of, the other side removes its copy by
+  matching item id and position. If the zone wasn't loaded the request waited — with nothing to
+  expire it, and it even survived a disconnect into the next world loaded in the same session. A
+  request left over from earlier could then match a brand-new drop mined near that spot and delete
+  it. Those requests now expire after two minutes, and both queues are cleared when a session ends
+- **The mod could flood the connection when the other player stopped responding.** An unacknowledged
+  packet was re-sent every 0.30s indefinitely, which with a full send window is roughly 320
+  datagrams a second — around 346 KB/s of pure retransmission for as long as the stall lasted, and
+  it ran on the main menu too. The retry delay now backs off to a four-second ceiling, about 24
+  datagrams a second. Normal packet loss is unaffected: any acknowledgement that gets through
+  resets the backoff, so a working-but-lossy connection still recovers at full speed
 - **`F11` doing nothing at all, with no explanation anywhere on screen.** If Steam never
   finished starting up, pressing `F11` wrote a line into the log file and gave up silently, so
   the only thing the player saw was a key that didn't work — and several people reasonably
