@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [Unreleased] — test builds are versioned 0.1.5
 
 ### Fixed
 - **`F11` doing nothing at all, with no explanation anywhere on screen.** If Steam never
