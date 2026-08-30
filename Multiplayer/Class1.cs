@@ -2534,6 +2534,10 @@ public class SteamManager : MonoBehaviour
         }
 
         SteamNetwork.Role = NetworkRole.Host;
+        // Re-arm the P2P failure message for this hosting attempt. The client re-arms it in LoadGameAsClient;
+        // the host has no equivalent hook, so without this a host who failed once stays silent for every later
+        // session until the game is restarted.
+        _p2pFailWarned = false;
 
         try
         {
@@ -2640,6 +2644,7 @@ public class SteamManager : MonoBehaviour
             string name = err == 0 ? "None" : err == 1 ? "NotRunningApp" : err == 2 ? "NoRightsToApp"
                         : err == 3 ? "DestinationNotLoggedIn" : err == 4 ? "Timeout" : "Unknown";
             _logger.LogError($"[P2P-FAIL] Session with {System.Convert.ToUInt64(rawId ?? 0UL)} FAILED — error={err}({name})");
+            ShowP2PFailure(err);
         }
         catch (System.Exception e) { _logger.LogError($"[P2P-FAIL] handler error: {e.Message}"); }
     }
@@ -2648,6 +2653,39 @@ public class SteamManager : MonoBehaviour
     private object[] _readAvailArgs = new object[] { (uint)0, 0 };
     private object _readSteamIdObj;
     private FieldInfo _steamIdField;
+
+    // Steam just told us the session with the peer is dead. Until now that went to the log only, so the
+    // player saw a partner who never appeared and no reason anywhere (Nexus, lounard 2026-08-30: "his
+    // character stay stuck and nothing happened"). Say it on screen, once per session, and name the cause
+    // per error code - "timeout" with no explanation is the same silence in a longer sentence.
+    private void ShowP2PFailure(int err)
+    {
+        if (_p2pFailWarned) return;
+        _p2pFailWarned = true;
+
+        string reason;
+        switch (err)
+        {
+            case 1:
+                reason = "The other player isn't running Graveyard Keeper (or not the same copy of it).\n" +
+                         "Both of you need the game running before the invite.";
+                break;
+            case 2:
+                reason = "The other player's Steam account doesn't own Graveyard Keeper,\n" +
+                         "so Steam refuses to connect you.";
+                break;
+            default:
+                reason = "Steam could not open a direct connection between your two PCs.\n\n" +
+                         "This mod has no servers of its own - it uses Steam's own connection,\n" +
+                         "so whatever blocks that blocks co-op. Most common causes:\n" +
+                         "  - a VPN running on EITHER PC (turn it off on both and retry)\n" +
+                         "  - mobile / 4G / 5G internet, or an ISP behind carrier-grade NAT\n" +
+                         "  - a router in strict or symmetric NAT mode\n\n" +
+                         "It is enough for ONE of you to be affected.";
+                break;
+        }
+        ShowJoinError("Co-op connection failed.\n\n" + reason);
+    }
 
     public byte[] ReadPacket(int channel = 0)
     {
@@ -3271,6 +3309,23 @@ public class SteamManager : MonoBehaviour
         if (SteamNetwork.Role == NetworkRole.Host) ChopSync.ReconcileAfterResync();   // heal the WORLD, not just the channel
     }
 
+    // The peer's P2P session died and we told the player once. Session-scoped: a fresh join re-arms it
+    // (LoadGameAsClient), because the same two players retrying deserve the message again.
+    private bool _p2pFailWarned;
+
+    // JOIN WATCHDOG: set when the host answers our 0x01 in any way at all - the save header (0x02), or a
+    // refusal (0x22 version / 0x23 not-in-world). Those refusals already explain themselves on screen; this
+    // flag exists so the watchdog stays quiet for them and fires ONLY on total silence.
+    private bool _hostReplied;
+
+    // Join generation. A retry inside CLIENT_JOIN_TIMEOUT leaves the previous watchdog still counting; without
+    // this it would time out mid-way through the NEW attempt and show its dialog over a join that is fine.
+    private int _joinGeneration;
+
+    // How long the client waits for that answer before saying so. The host replies within a second once the
+    // 0x01 lands, so anything past this is not slowness - it's a packet that never arrived.
+    private const float CLIENT_JOIN_TIMEOUT = 30f;
+
     private byte[] _saveBuffer;
     private int    _saveBufferExpectedSize;
     private int    _saveChunksReceived;
@@ -3398,6 +3453,7 @@ public class SteamManager : MonoBehaviour
         else if (type == 0x22)
         {
             // The host refused due to a version mismatch — do NOT load the save (otherwise a silent desync).
+            _hostReplied = true;
             int hostVer = data.Length >= 5 ? System.BitConverter.ToInt32(data, 1) : 0;
             SteamNetwork.IsLoadingAsClient = false;
             _logger.LogError($"[VERSION] INCOMPATIBLE: you have protocol v{SteamNetwork.PROTOCOL_VERSION}, the host has v{hostVer}. Update the mod to the SAME version on both. Join cancelled.");
@@ -3409,11 +3465,13 @@ public class SteamManager : MonoBehaviour
             // otherwise we'd end up in the intro state and overwrite the host world. The host will enter the world and
             // invite again.
             SteamNetwork.IsLoadingAsClient = false;
+            _hostReplied = true;
             _logger.LogError("[JOIN] The host is NOT in their world yet — join cancelled. Let the host enter their world first, then invite again.");
             ShowJoinError("The host hasn't entered their world yet. Join cancelled.\nAsk them to enter the game, then join again.\n\n(This is not a mod bug.)");
         }
         else if (type == 0x02)
         {
+            _hostReplied = true;
             _saveBufferExpectedSize = System.BitConverter.ToInt32(data, 1);
             _saveBuffer = new byte[_saveBufferExpectedSize];
             _saveChunksReceived = 0;
@@ -4590,8 +4648,50 @@ public class SteamManager : MonoBehaviour
         var req = new byte[5];
         req[0] = 0x01;
         System.Buffer.BlockCopy(System.BitConverter.GetBytes(SteamNetwork.PROTOCOL_VERSION), 0, req, 1, 4);
+        _hostReplied   = false;   // re-armed per join attempt, not per process
+        _p2pFailWarned = false;
+        _joinGeneration++;
         SendPacket(SteamNetwork.RemoteID, req);
+        StartCoroutine(WatchClientJoin());
         _logger.LogInfo($"[CLIENT] Save request sent to host (protocol v{SteamNetwork.PROTOCOL_VERSION}) ✓");
+    }
+
+    // The client used to wait for the host's save FOREVER: LoadGameAsClient locks movement, sends 0x01 and
+    // ends. If that packet never reaches the host - a P2P session that never came up, a peer that quit - there
+    // was no timeout, no message and no unlock, so the player stood frozen with a mod that looked broken
+    // (Nexus, lounard 2026-08-30). Refusals were never the silent case: 0x22 and 0x23 explain themselves and
+    // set _hostReplied, so this fires ONLY when nothing at all came back.
+    //
+    // Fail-open on purpose, same as ReleaseClientLockWhenSeen: an unlocked player who can walk to the menu
+    // beats a frozen one, and there is no session left to protect from a desync anyway.
+    private IEnumerator WatchClientJoin()
+    {
+        int   mine   = _joinGeneration;
+        float waited = 0f;
+        while (!_hostReplied && waited < CLIENT_JOIN_TIMEOUT && _joinGeneration == mine)
+        {
+            waited += 0.5f;
+            yield return new WaitForSeconds(0.5f);
+        }
+        if (_hostReplied || _joinGeneration != mine) yield break;
+
+        SteamNetwork.IsLoadingAsClient    = false;
+        SteamNetwork.ClientMovementLocked = false;
+        _logger.LogError($"[JOIN] No answer from the host after {CLIENT_JOIN_TIMEOUT:F0}s - the save request " +
+                         "never got through. Movement unlocked (fail-open). Usual cause: the direct Steam " +
+                         "connection between the two PCs was never established (VPN / mobile internet / strict NAT).");
+
+        // If Steam already reported the session dead, ShowP2PFailure said it better and more precisely - don't
+        // stack a second dialog on top of it.
+        if (_p2pFailWarned) yield break;
+        ShowJoinError("Joining failed - the host never answered.\n\n" +
+                      "Your game asked the host for their world and got nothing back for " +
+                      $"{CLIENT_JOIN_TIMEOUT:F0} seconds.\n\n" +
+                      "Check, in this order:\n" +
+                      "  - the host must be INSIDE their world, not on the main menu\n" +
+                      "  - a VPN on EITHER PC will block the connection - turn it off on both\n" +
+                      "  - mobile / 4G / 5G internet on either side often cannot connect at all\n\n" +
+                      "Then have the host invite you again. You can move now.");
     }
 
     private void FetchHostSteamID()

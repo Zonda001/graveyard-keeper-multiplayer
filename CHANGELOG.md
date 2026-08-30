@@ -6,6 +6,18 @@ based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] — test builds are versioned 0.1.5
 
 ### Fixed
+- **Joining a friend could leave you standing frozen with nothing on screen at all.** If Steam could
+  not open the direct connection between the two PCs, the mod said nothing anywhere: the guest's character
+  stayed locked in place, the two players never saw each other, and there was no message, no timeout and no
+  hint that the connection was the problem — several people reasonably concluded the mod was broken.
+  Two things changed. When Steam reports the connection dead, the mod now says so on screen and names the
+  likely cause (a VPN on either PC, mobile/4G internet, or a router behind carrier-grade NAT — one side is
+  enough), or, for the other error codes, that the partner isn't running the game or doesn't own it. And if
+  the host simply never answers, the guest no longer waits forever: after 30 seconds it explains what
+  happened, lists what to check in order, and unlocks movement so you can walk back to the menu instead of
+  being stuck. The existing connection-problem warning never covered this case — it only arms once packets
+  are already arriving, so a connection that never came up was invisible to it. Reported with a log by
+  **lounard** on Nexus
 - **World changes made where you weren't standing could be lost for good.** When your partner
   worked on a grave, a building or a workbench in a zone your machine hadn't loaded, the state
   update was written to the log and thrown away. In one session of a tester's log that was 24
