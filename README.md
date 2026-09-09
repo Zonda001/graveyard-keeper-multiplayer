@@ -303,9 +303,9 @@ for build setup, the (2-player) testing workflow, and code layout.
 
 ## Support
 
-This mod is free and always will be. If you'd like to support development, you can
-buy me a coffee: **[ko-fi.com/zonda](https://ko-fi.com/zonda)**. Totally optional —
-bug reports and testing help just as much. ❤️
+This mod is free and always will be, and I don't take donations. If you want to
+help, the useful things are a bug report with a log attached, or testing a build
+before it ships. Both are worth more here than money.
 
 ---
 
