@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — test builds are versioned 0.1.5.x (currently 0.1.5.1)
+## [0.1.5.1] - 2026-09-09
 
 ### Fixed
 - **Joining a friend could leave you standing frozen with nothing on screen at all.** If Steam could
