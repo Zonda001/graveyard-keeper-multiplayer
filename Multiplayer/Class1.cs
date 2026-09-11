@@ -500,6 +500,54 @@ public class Multiplayer : BaseUnityPlugin
         catch (Exception e) { Log?.LogWarning($"[MP] ShowScreenDialog failed: {e.Message}"); }
     }
 
+    // Stitch (the reliability layer, https://github.com/Zonda001/stitch) ships INSIDE this DLL as an
+    // embedded resource rather than as a second file in plugins\. Reason is the update path, not elegance:
+    // the install instructions say "copy Multiplayer.dll", and everyone updating from an earlier build
+    // replaces exactly that one file. A second DLL sitting next to it would be missed by most of them and
+    // the mod would die at startup with a missing-assembly error. One file in, one file out.
+    //
+    // This lives in a STATIC constructor so the handler is registered before anything in the mod can touch
+    // a Stitch type — the first touch is ReliableNet's static init, which happens much later, during Steam
+    // setup. Nothing in this method references Stitch, so the JIT has no reason to resolve it early either.
+    static System.Reflection.Assembly _stitch;
+
+    static Multiplayer()
+    {
+        AppDomain.CurrentDomain.AssemblyResolve += (sender, args) =>
+        {
+            if (new System.Reflection.AssemblyName(args.Name).Name != "Stitch") return null;
+            if (_stitch != null) return _stitch;
+
+            try
+            {
+                var self = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var stream = self.GetManifestResourceStream("Stitch.dll"))
+                {
+                    if (stream == null) return null;
+
+                    var bytes = new byte[stream.Length];
+                    int read = 0;
+                    while (read < bytes.Length)
+                    {
+                        int n = stream.Read(bytes, read, bytes.Length - read);
+                        if (n <= 0) break;
+                        read += n;
+                    }
+                    if (read != bytes.Length) return null;
+
+                    _stitch = System.Reflection.Assembly.Load(bytes);
+                    return _stitch;
+                }
+            }
+            catch (Exception e)
+            {
+                // No Logger yet at static-init time, so this is the only channel that always works.
+                UnityEngine.Debug.LogError("[MP] embedded Stitch failed to load: " + e);
+                return null;
+            }
+        };
+    }
+
     void Awake()
     {
         Log = Logger;

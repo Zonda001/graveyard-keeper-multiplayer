@@ -59,6 +59,10 @@
         <Reference Include="Steamworks.NET">
           <HintPath>lib\Steamworks.NET.dll</HintPath>
         </Reference>
+        <Reference Include="Stitch">
+          <HintPath>lib\Stitch.dll</HintPath>
+          <Private>False</Private>
+        </Reference>
         <Reference Include="System"/>
         <Reference Include="System.Core"/>
         <Reference Include="System.Data"/>
@@ -101,6 +105,12 @@
         <Compile Include="Reliability.cs"/>
         <Compile Include="WorldSync.cs"/>
         <Compile Include="Properties\AssemblyInfo.cs"/>
+    </ItemGroup>
+    <ItemGroup>
+        <!-- Shipped inside Multiplayer.dll, not beside it: see the static ctor in Class1.cs. -->
+        <EmbeddedResource Include="lib\Stitch.dll">
+            <LogicalName>Stitch.dll</LogicalName>
+        </EmbeddedResource>
     </ItemGroup>
     <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
 
